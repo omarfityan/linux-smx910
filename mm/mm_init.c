@@ -32,6 +32,7 @@
 #include <linux/vmstat.h>
 #include <linux/kexec_handover.h>
 #include <linux/hugetlb.h>
+#include <linux/fbdbg.h>
 #include "internal.h"
 #include "slab.h"
 #include "shuffle.h"
@@ -2717,6 +2718,10 @@ void __init mm_core_init(void)
 	 */
 	kho_memory_init();
 
+	/* smoke dropped (octal encoder EMPIRICALLY validated via
+	 * the 0o531 readout). 0x5c0000-0x680000 reused for the start_kernel deep
+	 * marks (init/main.c). The 3 mm bracket marks below stay as a regression
+	 * check (mm_core_init must still complete). */
 	memblock_free_all();
 	mem_init();
 	kmem_cache_init();
@@ -2729,6 +2734,9 @@ void __init mm_core_init(void)
 	ptlock_cache_init();
 	pgtable_cache_init();
 	debug_objects_mem_init();
+	/* bracket (wide pitch, clean top FB region, overwrites M11/M12/done
+	 * slot). Deepest lit mark = death between it and the next call. */
+	fbdbg_stripe(0x2c0000, 0xff0000ff);   /* before vmalloc_init (blue) */
 	vmalloc_init();
 	/* If no deferred init page_ext now, as vmap is fully initialized */
 	if (!deferred_struct_pages)
@@ -2738,6 +2746,8 @@ void __init mm_core_init(void)
 	/* Should be run after espfix64 is set up. */
 	pti_init();
 	kmsan_init_runtime();
+	fbdbg_stripe(0x300000, 0xffff8000);   /* before mm_cache_init (orange) */
 	mm_cache_init();
 	execmem_init();
+	fbdbg_stripe(0x580000, 0xff00ff00);   /* mm_core_init done (green) */
 }
