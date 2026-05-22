@@ -1,0 +1,10 @@
+# Built-in initramfs contents for the boot-probe userspace.
+# Consumed by CONFIG_INITRAMFS_SOURCE; the kernel's usr/gen_init_cpio builds the
+# cpio at compile time -- INCLUDING the device nodes -- without needing root or
+# fakeroot. Paths in `file` lines are relative to the kernel source root.
+dir  /dev       0755 0 0
+nod  /dev/mem   0600 0 0 c 1 1
+nod  /dev/kmsg  0600 0 0 c 1 11
+dir  /proc      0755 0 0
+dir  /sys       0755 0 0
+file /kmsgfb    ubuntu-tab/boot-probes/kmsgfb 0755 0 0
