@@ -1,3 +1,54 @@
+arm64: configs: add ubuntu-tab-x910_defconfig (per-device defconfig)
+
+Add per-device defconfig for Samsung Galaxy Tab S9 Ultra (SM-X910) per
+ubuntu-tab project. Layered atop arm64 mainline defconfig with the
+following deltas (produced via `make ARCH=arm64 savedefconfig` after
+applying our scripts/config edits):
+
+  * RFT-120 NAMING-FIX corrections (per R13 ADR-0024 D5):
+    - CONFIG_KEYBOARD_GPIO=m (was =y in v7.0.6 default; we want
+      modular for fast-cycle hot-reload)
+    - CONFIG_QCOM_FASTRPC=m (already default; verified)
+    - CONFIG_QCOM_WDT=m (already default; verified)
+    - CONFIG_QCOM_Q6V5_PAS=m (already default; verified)
+    - CONFIG_FASTRPC and CONFIG_INPUT_GPIO_KEYS old names already
+      removed from mainline at v7.0.6 (rename complete)
+  * Module-signing posture (per R15 ADR-0022 D5 + R13 ADR-0024 D6):
+    CONFIG_MODULE_SIG=y (built with signing capability)
+    CONFIG_MODULE_SIG_FORCE=n (unsigned modules permitted; DKMS-OOT)
+    CONFIG_LOCKDOWN_LSM=n (no lockdown LSM activation)
+    CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"
+  * Per-track ADR-mandated knobs (=m for fast-cycle module hot-reload
+    per ADR-0027 D9):
+    CONFIG_ATH12K + CONFIG_ATH12K_PCI (R23 D1 Wi-Fi)
+    CONFIG_BT_QCA + CONFIG_BT_HCIUART_QCA (R23 D2 BT;
+      BT_HCIUART_QCA normalized to its valid bool value by olddefconfig)
+    CONFIG_TOUCHSCREEN_GOODIX_BERLIN_CORE + _I2C + _SPI=m (R20 D3)
+    CONFIG_IIO_ST_LSM6DSX + CONFIG_AK09911 + CONFIG_STK3310=m (R17 D1)
+    CONFIG_BTRFS_FS=y (R15 D4 rootfs)
+    CONFIG_DM_CRYPT=m (LUKS2 prep per R21 D8)
+
+NOT enabled at milestone-1:
+  * CONFIG_REGULATOR_MAX77816 (R12 D5: driver does NOT exist in
+    mainline; ~200-400 LoC port required; deferred to M2+ post-first-
+    boot OOT work)
+  * CONFIG_KEYBOARD_STM32_POGO_V3 (R12: fresh driver; deferred to M2+)
+  * cs35l45 audio knobs (R01: deferred to M2+)
+
+Empirical at v7.0.6 mainline (advisor #1 sess-67 gotcha #5 verification):
+3 of 4 RFT-120 corrections were already default-correct in arm64
+mainline defconfig (only KEYBOARD_GPIO needed the y→m flip). This
+validates that mainline has converged on R13 D5's locked-in values
+naturally over the time between Phase-2 web research and Phase-5
+execution.
+
+Quilt-ordering critical-fix workflow: defconfig authored at the target
+path; moved aside temporarily; quilt new + quilt add (records absent
+baseline); moved back; quilt refresh (captures the file as added).
+1890 added lines in patch.
+
+Signed-off-by: ubuntu-tab project <omarfityan@outlook.com>
+
 Index: ubuntu-tab-x910/arch/arm64/configs/ubuntu-tab-x910_defconfig
 ===================================================================
 --- /dev/null
