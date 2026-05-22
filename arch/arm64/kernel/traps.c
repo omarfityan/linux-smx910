@@ -29,6 +29,7 @@
 #include <linux/kasan.h>
 #include <linux/ubsan.h>
 #include <linux/cfi.h>
+#include <linux/fbdbg.h>
 
 #include <asm/atomic.h>
 #include <asm/bug.h>
@@ -207,6 +208,15 @@ void die(const char *str, struct pt_regs *regs, long err)
 {
 	int ret;
 	unsigned long flags;
+
+	/* catch oopses that don't go through die_kernel_fault. If regs is
+	 * present, regs->pc is a precise PC -> white-leader fault emit. If regs is
+	 * NULL there is no PC, so route to the red-leader panic emit (coarse) so the
+	 * decoder does NOT trust a bogus address as a precise PC. Latched. */
+	if (regs)
+		fbdbg_emit_fault(regs->pc);
+	else
+		fbdbg_emit_panic(0);
 
 	raw_spin_lock_irqsave(&die_lock, flags);
 
