@@ -53,7 +53,7 @@ Index: ubuntu-tab-x910/arch/arm64/configs/ubuntu-tab-x910_defconfig
 ===================================================================
 --- /dev/null
 +++ ubuntu-tab-x910/arch/arm64/configs/ubuntu-tab-x910_defconfig
-@@ -0,0 +1,1889 @@
+@@ -0,0 +1,1895 @@
 +CONFIG_SYSVIPC=y
 +CONFIG_POSIX_MQUEUE=y
 +CONFIG_AUDIT=y
@@ -1070,6 +1070,8 @@ Index: ubuntu-tab-x910/arch/arm64/configs/ubuntu-tab-x910_defconfig
 +CONFIG_DRM_ZYNQMP_DPSUB_AUDIO=y
 +CONFIG_FB=y
 +CONFIG_FB_EFI=y
++CONFIG_FB_SIMPLE=y
++CONFIG_FRAMEBUFFER_CONSOLE=y
 +CONFIG_BACKLIGHT_PWM=m
 +CONFIG_BACKLIGHT_APPLE_DWI=m
 +CONFIG_BACKLIGHT_QCOM_WLED=m
@@ -1892,7 +1894,9 @@ Index: ubuntu-tab-x910/arch/arm64/configs/ubuntu-tab-x910_defconfig
 +CONFIG_EFIVAR_FS=y
 +CONFIG_UBIFS_FS=m
 +CONFIG_SQUASHFS=y
-+CONFIG_PSTORE_RAM=m
++CONFIG_PSTORE=y
++CONFIG_PSTORE_RAM=y
++CONFIG_PSTORE_CONSOLE=y
 +CONFIG_NFS_FS=y
 +CONFIG_NFS_V4=y
 +CONFIG_NFS_V4_2=y
@@ -1928,6 +1932,8 @@ Index: ubuntu-tab-x910/arch/arm64/configs/ubuntu-tab-x910_defconfig
 +CONFIG_DMA_RESTRICTED_POOL=y
 +CONFIG_CMA_SIZE_MBYTES=32
 +CONFIG_PRINTK_TIME=y
++CONFIG_LOG_BUF_SHIFT=22
++CONFIG_PANIC_ON_OOPS=y
 +CONFIG_DEBUG_KERNEL=y
 +CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
 +CONFIG_DEBUG_INFO_REDUCED=y

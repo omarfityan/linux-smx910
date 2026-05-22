@@ -31,7 +31,7 @@ Index: ubuntu-tab-x910/arch/arm64/boot/dts/qcom/sm8550-samsung-gts9-common.dtsi
 ===================================================================
 --- /dev/null
 +++ ubuntu-tab-x910/arch/arm64/boot/dts/qcom/sm8550-samsung-gts9-common.dtsi
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,136 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Samsung Galaxy Tab S9 family common DTSI
@@ -107,6 +107,25 @@ Index: ubuntu-tab-x910/arch/arm64/boot/dts/qcom/sm8550-samsung-gts9-common.dtsi
 +		 * approach: subtract from sm8550.dtsi defaults + add Tab S9
 +		 * family-specific regions.
 +		 */
++
++		/*
++		 * sess-81 Candidate-A instrumentation (advisor #1 reconciled
++		 * lead). pstore/ramoops crash-capture region — O.1 research-
++		 * grounded Sony Xperia-1V shape (commit 39c596304e44), NO
++		 * no-map (keeps a linear map so the sess-80 stock-rooted-
++		 * Android readback can dd it). 0xa5000000 = OnePlus-11/kalama
++		 * proven kernel-available persistent-debug sub-band. The
++		 * boot.img cmdline ramoops.* args drive registration at
++		 * postcore_initcall=2 (before qcom_scm subsys=4); reserves+maps.
++		 */
++		ramoops@a5000000 {
++			compatible = "ramoops";
++			reg = <0x0 0xa5000000 0x0 0x240000>;
++			console-size = <0x1c0000>;
++			record-size = <0x20000>;
++			pmsg-size = <0x40000>;
++			ecc-size = <16>;
++		};
 +	};
 +};
 +
@@ -127,4 +146,25 @@ Index: ubuntu-tab-x910/arch/arm64/boot/dts/qcom/sm8550-samsung-gts9-common.dtsi
 +&uart14 {
 +	status = "okay";
 +	/* BT serdev child node lives in leaf x910.dts per R23 ADR-0016 D2 */
++};
++
++&xo_board {
++	/* SoC XO root: mainline sm8550.dtsi leaves it board-supplied. */
++	clock-frequency = <76800000>;
++};
++
++&sleep_clk {
++	clock-frequency = <32764>;
++};
++
++&scm {
++	/*
++	 * sess-81 Step-2, Candidate-A (I.1 Option alpha; label corrected
++	 * to &scm per sess-81 B — sm8550.dtsi `firmware` node is
++	 * unlabelled, `scm:` is). Disable the SCM SMC-gateway DT node.
++	 * CONFIG_QCOM_SCM stays =y (driver compiles, no enabled node ->
++	 * no probe -> SMC calls unavailable). PSCI is a separate
++	 * top-level node (independent) -> CPU bringup/idle UNAFFECTED.
++	 */
++	status = "disabled";
 +};
