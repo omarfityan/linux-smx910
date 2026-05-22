@@ -1,0 +1,10 @@
+linux-@KVER@-@KVENDOR@ (@KVER@+@KVENDOR@-0) UNRELEASED; urgency=medium
+
+  * Initial @KVER@ release for ubuntu-tab on SM-X910 (Samsung Galaxy Tab S9 Ultra Wi-Fi).
+  * Mobian per-device kernel-deb pattern adapted from
+    salsa.debian.org/Mobian-team/devices/kernels/qcom-linux.
+  * Source = kernel.org stable/linux at v7.0.6 (linux-7.0.y HEAD); SHA
+    5d83f95062a860326fd9c69a9d7a1f01063270c1. debian/patches/@KVENDOR@/*.patch series.
+  * v0 scope: build-only milestone; no first-boot validation in this version.
+
+ -- ubuntu-tab project <omarfityan@outlook.com>  Thu, 14 May 2026 00:00:00 +0300

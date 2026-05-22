@@ -1,0 +1,70 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/pkg-info.mk
+include /usr/share/dpkg/architecture.mk
+
+srctree ?= .
+
+KVER=7.0
+KVENDOR=ubuntu-tab-x910
+KREL=$(KVER)-$(KVENDOR)
+
+ifneq ($(filter cross,$(DEB_BUILD_PROFILES)),)
+  export ARCH=${DEB_HOST_ARCH}
+  export CROSS_COMPILE=${DEB_HOST_GNU_TYPE}-
+endif
+
+BUILD=$(MAKE) KERNELRELEASE=$(KREL) KBUILD_BUILD_VERSION=$(DEB_VERSION)
+GENERATED_FILES= \
+	debian/changelog \
+	debian/control \
+	debian/copyright \
+	debian/gbp.conf \
+	debian/watch
+
+ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+	NUMJOBS = $(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+	BUILD += -j$(NUMJOBS)
+else
+	BUILD += -j$(shell nproc)
+endif
+
+debian/%: debian/%.in
+	sed -e 's/@KREL@/$(KREL)/g' \
+	    -e 's/@KVER@/$(KVER)/g' \
+	    -e 's/@KVENDOR@/$(KVENDOR)/g' \
+		$< > $@
+
+.config: arch/arm64/configs/$(KVENDOR)_defconfig
+	$(BUILD) $(KVENDOR)_defconfig
+
+build-arch: .config
+	$(BUILD) -f $(srctree)/Makefile
+
+binary-indep:
+build-indep:
+
+binary-arch: $(GENERATED_FILES) build-arch
+	for package in $(shell dh_listpackages); do \
+		dh_prep -p$$package; \
+		$(BUILD) -f $(srctree)/Makefile run-command \
+		         KBUILD_RUN_COMMAND="$(srctree)/scripts/package/builddeb $$package"; \
+		dh_installdeb -p$$package; \
+		dh_gencontrol -p$$package; \
+		dh_install -p$$package; \
+		dh_installdocs -p$$package; \
+		dh_installchangelogs -p$$package; \
+		dh_compress -p$$package; \
+		dh_builddeb -p$$package; \
+	done
+
+clean: $(GENERATED_FILES)
+	rm -rf .config debian/*tmp debian/files debian/linux-*
+	$(BUILD) clean
+
+binary: binary-arch
+build: build-arch
+
+init-pkg:
+	rm -f $(GENERATED_FILES)
+	debian/rules clean

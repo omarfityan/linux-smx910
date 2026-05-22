@@ -83,11 +83,6 @@ modules.order
 /rpmbuild/
 
 #
-# Debian directory (make deb-pkg)
-#
-/debian/
-
-#
 # Snap directory (make snap-pkg)
 #
 /snap/
@@ -184,3 +179,23 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# ubuntu-tab additions
+# Debian-package build artefacts
+debian/files
+debian/*.substvars
+debian/*.debhelper.log
+debian/*.debhelper
+debian/linux-image-*/
+debian/linux-headers-*/
+debian/tmp/
+.pc/
+
+# Cache + working artifacts
+build.log
+build-cross.log
+
+# Sensitive material (AVB private keys generated at M2; pre-emptive guard)
+keys/
+*.pem
+*.key

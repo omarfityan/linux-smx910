@@ -1,0 +1,48 @@
+Patches origin
+--------------
+
+The ubuntu-tab-x910 kernel deb is the per-device kernel package for SM-X910
+(Samsung Galaxy Tab S9 Ultra Wi-Fi). It follows the Mobian per-device
+kernel-deb pattern (see https://salsa.debian.org/Mobian-team/devices/kernels/
+qcom-linux for the canonical example).
+
+Kernel base
+-----------
+
+kernel.org stable/linux at v7.0.6 (linux-7.0.y HEAD); SHA
+5d83f95062a860326fd9c69a9d7a1f01063270c1. Tracking branch
+upstream-branch = linux-7.0.y (gbp.conf).
+
+Patch sources
+-------------
+
+debian/patches/ubuntu-tab-x910/ contains all device- and SoC-layer patches
+applied at build time via quilt (debian/source/format = 3.0 (quilt)).
+
+  * 0001-arm64-dts-qcom-add-Samsung-Galaxy-Tab-S9-Ultra-X910.patch
+    Leaf DTS for SM-X910 (SKU-keyed filename sm8550-samsung-x910.dts per
+    DEC-196). Bootstrap source = Samsung downstream gts9uwifi_eur_open_w00_r03
+    .dts SHA 74a08fac2da9984d315616b1e77e00307dfa551d (SoC-plumbing + regulators
+    + PCIe-enablement layer; mainline-cleaned). Bucket-B device-DTS off-tree.
+
+  * 0002-arm64-dts-qcom-add-Samsung-Galaxy-Tab-S9-family-common-dtsi.patch
+    Factored sm8550-samsung-gts9-common.dtsi for Tab S9 family-shared content
+    per DEC-119 + DEC-196 + RFT-116. Bucket-A SoC-layer (intended for upstream
+    submission via Konrad Dybcio funnel; see ADR-0027 D4 + R13 ADR-0024 D2).
+
+  * 0003-arm64-configs-add-ubuntu-tab-x910-defconfig.patch
+    Per-device defconfig arch/arm64/configs/ubuntu-tab-x910_defconfig.
+    Includes the 4 RFT-120 NAMING-FIX corrections (CONFIG_FASTRPC ->
+    CONFIG_QCOM_FASTRPC; CONFIG_INPUT_GPIO_KEYS -> CONFIG_KEYBOARD_GPIO;
+    CONFIG_QCOM_WDT=m; CONFIG_QCOM_Q6V5_PAS=m) per R13 ADR-0024 D5 + R14
+    ADR-0020 D5 + module-signing posture per R15 ADR-0022 D5 + the =m configs
+    for fast-cycle module hot-reload per ADR-0027 D9.
+
+Sess-67 milestone-1 build-only scope
+-------------------------------------
+
+This is the first build of the ubuntu-tab-x910 kernel deb. Milestone-1 covers
+build env + leaf DTS + factored common.dtsi + defconfig + first dpkg-buildpackage
+attempt + .deb validation. No boot.img, no Thor flash, no first-boot smoke —
+those are milestone-2 (gated on milestone-1 closing cleanly per advisor sess-66
+#1; destructive-gate-adjacent per binding-constraint #6).

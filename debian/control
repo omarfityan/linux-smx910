@@ -1,0 +1,36 @@
+Source: linux-7.0-ubuntu-tab-x910
+Section: kernel
+Priority: optional
+Maintainer: ubuntu-tab project <omarfityan@outlook.com>
+Build-Depends:
+ bc,
+ bison,
+ cpio,
+ debhelper-compat (=13),
+ flex | flex:native,
+ kmod,
+ libssl-dev:native,
+ rsync,
+Standards-Version: 4.6.1
+Homepage: https://github.com/TBD/ubuntu-tab
+Vcs-Git: https://github.com/TBD/ubuntu-tab-x910-kernel.git
+Vcs-Browser: https://github.com/TBD/ubuntu-tab-x910-kernel
+Rules-Requires-Root: no
+
+Package: linux-image-7.0-ubuntu-tab-x910
+Architecture: arm64
+Depends:
+ initramfs-tools | linux-initramfs-tool,
+ kmod,
+ linux-base,
+Provides: wireguard-modules (= 1.0.0)
+Description: Linux 7.0 for ubuntu-tab-x910 devices
+ The linux kernel, modules and corresponding other files for
+ ubuntu-tab-x910 devices.
+
+Package: linux-headers-7.0-ubuntu-tab-x910
+Architecture: arm64
+Description: Linux kernel headers for ubuntu-tab-x910 devices
+ This package provides kernel header files for the ubuntu-tab-x910 kernel.
+ .
+ This is useful for people who need to build external modules

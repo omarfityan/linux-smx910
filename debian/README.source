@@ -1,0 +1,6 @@
+Crossbuilding
+-------------
+
+To crossbuild the kernel package install the amd64 cross toolchain and use
+
+  dpkg-buildpackage -a arm64 -us -uc -rfakeroot -b -Pcross,nocheck
