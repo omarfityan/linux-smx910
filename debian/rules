@@ -3,6 +3,18 @@
 include /usr/share/dpkg/pkg-info.mk
 include /usr/share/dpkg/architecture.mk
 
+# Wire ccache: prepend the Debian ccache symlink farm to PATH so
+# $(CROSS_COMPILE)gcc resolves to /usr/lib/ccache/aarch64-linux-gnu-gcc
+# (symlink -> /usr/bin/ccache -> real aarch64-linux-gnu-gcc).
+export PATH := /usr/lib/ccache:$(PATH)
+
+# Deterministic kernel-banner strings so version-timestamp.o caches
+# (without this, init/Makefile:57 calls live `LC_ALL=C date` which forces
+# one cache-miss per build for version-timestamp.o specifically).
+export KBUILD_BUILD_TIMESTAMP := $(shell dpkg-parsechangelog -SDate)
+export KBUILD_BUILD_USER      := ubuntu-tab
+export KBUILD_BUILD_HOST      := ubuntu-tab-builder
+
 srctree ?= .
 
 KVER=7.0
