@@ -1,0 +1,130 @@
+arm64: dts: qcom: add Samsung Galaxy Tab S9 family common dtsi
+
+Add factored sm8550-samsung-gts9-common.dtsi for Tab S9 family-shared
+content (SoC-plumbing + minimum PMIC includes matching sm8550-samsung-q5q
+subset at v7.0.6 + reserved-memory baseline + console + BT serdev parent
+UART). Per DEC-119 + DEC-196 + RFT-116 (~800-1000 LoC target scope
+anchored against mainline precedents msm8916-samsung-a2015 + sony-nagara
++ q5q + lemans-ride).
+
+For ubuntu-tab milestone-1, this is a skeleton; full body iterative
+across milestone-1 follow-on + milestone-2 first-boot driver-binding
+refinements. Per-SKU leaf DTS files (sm8550-samsung-x710.dts X710 base
++ sm8550-samsung-x810.dts X810 mid + sm8550-samsung-x910.dts X910 Ultra)
+#include this file.
+
+PMIC includes at skeleton subset: pm8550 + pm8550vs + pmk8550 (matches
+sm8550-samsung-q5q.dts; minimum sufficient for clean dtc compile).
+Additional PMICs (pm8550b, pm8550ve, pm8010) deferred to M2+ when
+regulator nodes are authored that need them. pmr735d.dtsi not in v7.0.6
+mainline (verified empirically); when needed, either wait for upstream
+via konrad.dybcio@oss.qualcomm.com funnel or author a local patch in
+the ubuntu-tab-x910 series.
+
+Bootstrap source: Samsung downstream gts9uwifi_eur_open_w00_r03.dts SHA
+74a08fac (SoC-plumbing + regulators + PCIe-enablement layer; mainline-
+cleaned).
+
+Signed-off-by: ubuntu-tab project <omarfityan@outlook.com>
+
+Index: ubuntu-tab-x910/arch/arm64/boot/dts/qcom/sm8550-samsung-gts9-common.dtsi
+===================================================================
+--- /dev/null
++++ ubuntu-tab-x910/arch/arm64/boot/dts/qcom/sm8550-samsung-gts9-common.dtsi
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*
++ * Samsung Galaxy Tab S9 family common DTSI
++ * Shared SoC-plumbing + family-common bindings for:
++ *   - SM-X710 (Tab S9 base 11" Wi-Fi; codename gts9wifi)
++ *   - SM-X810 (Tab S9+ mid; codename gts9plus)
++ *   - SM-X910 (Tab S9 Ultra Wi-Fi; codename gts9uwifi — this project's target)
++ *
++ * Per:
++ * - ADR-0020 (R14) D1 + D2 factor-out common.dtsi architecture
++ * - DEC-119 (sess-27) single per-board DTS + factor common.dtsi
++ * - DEC-196 (sess-46) SKU-keyed leaf filenames + codename in compatible
++ * - RFT-116 (sess-40) common.dtsi LoC ~800-1000 anchored against mainline
++ *   precedents (msm8916-samsung-a2015 + sony-nagara + q5q + lemans-ride)
++ *
++ * Bootstrap source: Samsung downstream gts9uwifi_eur_open_w00_r03.dts
++ * SHA 74a08fac (SoC-plumbing + regulators + PCIe-enablement layer; q5q
++ * mainline NOT useful Wi-Fi/BT precedent per RFT-164; useful at
++ * SoC-plumbing layer only).
++ */
++
++#include "sm8550.dtsi"
++#include "pm8550.dtsi"
++#include "pm8550vs.dtsi"
++#include "pmk8550.dtsi"
++/*
++ * Skeleton PMIC subset matches sm8550-samsung-q5q.dts (Z-Fold5) at v7.0.6
++ * mainline — minimum set sufficient to compile without un-instantiated
++ * regulator references.
++ *
++ * Iterative additions at M2+/M3+ as regulator nodes get authored:
++ *   - pm8550b.dtsi (USB-PD-class PMIC)
++ *   - pm8550ve.dtsi (note: requires `#define PMK8550VE_SID <N>` before
++ *     #include in the LEAF .dts per qcom convention; e.g. sm8550-qrd.dts
++ *     uses SID 5; the includer parameterizes the SID at use time)
++ *   - pm8010.dtsi (peripheral PMIC)
++ *
++ * pmr735d.dtsi NOT IN v7.0.6 mainline (verified empirically at sess-67
++ * M1.5.3). Samsung uses pmr735d for Snapdragon power-regulator complex.
++ * Iterative authoring at M2+: either (a) wait for upstream pmr735d.dtsi
++ * via konrad.dybcio@oss.qualcomm.com funnel + linux-arm-msm list, or
++ * (b) author a local pmr735d.dtsi patch in the ubuntu-tab-x910 series
++ * if first-boot regulator dependencies surface as blockers.
++ */
++
++/ {
++	#address-cells = <2>;
++	#size-cells = <2>;
++
++	aliases {
++		serial0 = &uart7;     /* console UART; pinctrl placeholder */
++		serial1 = &uart14;    /* BT serdev parent per DEC-177 / RFT-119 */
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/*
++		 * Reserved-memory regions are derived from Samsung downstream
++		 * and mainline-cleaned. Full region layout extracted from
++		 * gts9uwifi_eur_open_w00_r03.dts SHA 74a08fac at iterative
++		 * authoring; for milestone-1 skeleton, leave empty so dtc
++		 * compiles.
++		 *
++		 * RFT-159 (sess-13 round-2): SoC dtsi default reserved-memory
++		 * map wrong; q5q deletes 5 reserved-memory regions. Apply same
++		 * approach: subtract from sm8550.dtsi defaults + add Tab S9
++		 * family-specific regions.
++		 */
++	};
++};
++
++/*
++ * Family-common peripheral enables.
++ *
++ * For milestone-1 skeleton, only the load-bearing UART (console + BT serdev
++ * parent) bindings are present. Full bindings (Wi-Fi/BT PCIe per R23 D1 + D2
++ * + D4, Wacom EMR per RFT-118 family-wide, touchscreen common parent bus per
++ * R20 D3, sensor bus parents per R17 D1, etc.) land at iterative authoring
++ * sess-67+ as needed for each driver to bind.
++ */
++
++&uart7 {
++	status = "okay";
++};
++
++&uart14 {
++	status = "okay";
++	/* BT serdev child node lives in leaf x910.dts per R23 ADR-0016 D2 */
++};
