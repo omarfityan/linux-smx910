@@ -1,2 +1,3 @@
 ubuntu-tab-x910/0001-arm64-dts-qcom-add-Samsung-Galaxy-Tab-S9-Ultra-X910.patch
 ubuntu-tab-x910/0002-arm64-dts-qcom-add-Samsung-Galaxy-Tab-S9-family-common-dtsi.patch
+ubuntu-tab-x910/0003-arm64-configs-add-ubuntu-tab-x910-defconfig.patch
