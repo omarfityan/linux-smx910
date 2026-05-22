@@ -88,14 +88,27 @@ void __init map_range(phys_addr_t *pte, u64 start, u64 end, phys_addr_t pa,
 	}
 }
 
+/*
+ * gts9u bootloader splash framebuffer (cont_splash carveout) physical base
+ * and a 2 MiB window covering it. Identity-mapping it into the init idmap lets
+ * the post-__enable_mmu head.S breadcrumbs (M4/M5, MMU-on) reach the FB
+ * with a raw str while TTBR0 still holds this idmap, before __pi_early_map_kernel
+ * switches to the kernel mapping. Normal-NC matches the MMU-off regime the
+ * pre-MMU markers paint under and the C-layer ioremap_wc() in init/main.c.
+ */
+#define GTS9U_SPLASH_FB_BASE	0xb8000000UL
+#define GTS9U_SPLASH_FB_SIZE	0x800000UL
+
 asmlinkage phys_addr_t __init create_init_idmap(pgd_t *pg_dir, ptdesc_t clrmask)
 {
 	phys_addr_t ptep = (phys_addr_t)pg_dir + PAGE_SIZE; /* MMU is off */
 	pgprot_t text_prot = PAGE_KERNEL_ROX;
 	pgprot_t data_prot = PAGE_KERNEL;
+	pgprot_t fb_prot = __pgprot(PROT_NORMAL_NC);
 
 	pgprot_val(text_prot) &= ~clrmask;
 	pgprot_val(data_prot) &= ~clrmask;
+	pgprot_val(fb_prot) &= ~clrmask;
 
 	/* MMU is off; pointer casts to phys_addr_t are safe */
 	map_range(&ptep, (u64)_stext, (u64)__initdata_begin,
@@ -103,6 +116,11 @@ asmlinkage phys_addr_t __init create_init_idmap(pgd_t *pg_dir, ptdesc_t clrmask)
 		  (pte_t *)pg_dir, false, 0);
 	map_range(&ptep, (u64)__initdata_begin, (u64)_end,
 		  (phys_addr_t)__initdata_begin, data_prot, IDMAP_ROOT_LEVEL,
+		  (pte_t *)pg_dir, false, 0);
+
+	map_range(&ptep, GTS9U_SPLASH_FB_BASE,
+		  GTS9U_SPLASH_FB_BASE + GTS9U_SPLASH_FB_SIZE,
+		  (phys_addr_t)GTS9U_SPLASH_FB_BASE, fb_prot, IDMAP_ROOT_LEVEL,
 		  (pte_t *)pg_dir, false, 0);
 
 	return ptep;

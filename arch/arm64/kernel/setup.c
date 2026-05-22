@@ -32,6 +32,8 @@
 #include <linux/sched/task.h>
 #include <linux/scs.h>
 #include <linux/mm.h>
+#include <linux/io.h>
+#include <linux/fbdbg.h>
 
 #include <asm/acpi.h>
 #include <asm/fixmap.h>
@@ -278,8 +280,131 @@ u64 cpu_logical_map(unsigned int cpu)
 	return __cpu_logical_map[cpu];
 }
 
+/*
+ * dense-ladder raw-FB breadcrumb. Same mechanism
+ * as init/main.c's FBDBG_STRIPE_RAW: a raw str to the splash FB via the still-
+ * live init idmap (TTBR0). Valid only up to cpu_uninstall_idmap() below (line
+ * ~320). Inline asm bypasses instrumentation; clobbers x9/x10/x11.
+ */
+#define FBDBG_STRIPE_RAW(off, color)					\
+	asm volatile(							\
+		"mov	x9, %0\n"					\
+		"mov	w10, %w1\n"					\
+		"mov	w11, #16384\n"					\
+		"1:	str	w10, [x9], #4\n"			\
+		"	subs	w11, w11, #1\n"				\
+		"	b.ne	1b\n"					\
+		"	dsb	sy\n"					\
+		:: "r"(0xb8000000UL + (off)), "r"((u32)(color))		\
+		: "x9", "x10", "x11", "memory")
+
+/*
+ * framebuffer breadcrumb for setup_arch's BACK HALF
+ * Past cpu_uninstall_idmap() (~line 350) the TTBR0 idmap is gone, so the
+ * FBDBG_STRIPE_RAW raw str no longer reaches the splash FB. This maps the FB
+ * through the TTBR1 fixmap via early_memremap_prot() with PROT_NORMAL_NC -- the
+ * SAME memory attribute the proven M0-M13 idmap writes used (arm64 ioremap_wc
+ * == PROT_NORMAL_NC). Valid throughout setup_arch (early_ioremap_init() ran;
+ * early_ioremap_reset() is later, after our last checkpoint). Full ioremap_wc
+ * is NOT usable here -- it needs vmalloc_init(), which runs in mm_core_init()
+ * AFTER setup_arch returns. Paints a distinct-offset 64 KB stripe so the
+ * deepest lit stripe localizes the death.
+ */
+/* Non-static + __ref so the fault/panic hooks (fault.c/traps.c/panic.c) can
+ * call it; they run during boot, before init memory is freed, so calling the
+ * __init early_memremap_prot from non-__init context is intentional. */
+void __ref fbdbg_stripe(unsigned long off, u32 color)
+{
+	u32 *fb = early_memremap_prot(0xb8000000UL + off, 0x10000,
+				      PROT_NORMAL_NC);
+	unsigned int i;
+
+	if (!fb)
+		return;
+	for (i = 0; i < 0x10000 / sizeof(u32); i++)
+		fb[i] = color;
+	dsb(sy);
+	early_memunmap(fb, 0x10000);
+}
+
+static atomic_t fbdbg_in_emit = ATOMIC_INIT(0);  /* recursion guard */
+static int fbdbg_emitted;                         /* first-emitter latch */
+
+/* octal codec: 8 M/E-proven colors -> octal digits 0..7 (white is
+ * reserved for the leader). Wide pitch 0x40000 (the codec's 0x20000
+ * bloom-merged under the camera; 0x40000 decoded cleanly all session). */
+static const u32 fbdbg_oct[8] = {
+	0xffff00ff, /*0 magenta*/ 0xff00ffff, /*1 cyan  */ 0xffffff00, /*2 yellow*/
+	0xff00ff00, /*3 green  */ 0xffff0000, /*4 red   */ 0xffff8000, /*5 orange*/
+	0xff8000ff, /*6 violet */ 0xff0000ff, /*7 blue  */
+};
+
+/* paint `n` octal digits of `val`, MSB-first, at base + k*0x40000. */
+void __ref fbdbg_emit_octal(unsigned long base, u64 val, int n)
+{
+	int k;
+
+	for (k = 0; k < n; k++)
+		fbdbg_stripe(base + (unsigned long)k * 0x40000UL,
+				 fbdbg_oct[(val >> (3 * (n - 1 - k))) & 0x7]);
+}
+
+/* fault: white leader @0x040000 + 9 octal digits of the faulting PC's LINK
+ * address (elr - kaslr_offset(), low 27 bits; text caps ~36 MiB above _text)
+ * @0x080000. Latched (first emitter wins); recursion-guarded. Ordering
+ * invariant (do NOT reorder): set the `emitted` latch only AFTER the full
+ * paint; a fault re-entering mid-paint sees emitted==0 but in_emit==1 and
+ * skips via the guard. Set latch THEN clear guard. */
+void __ref fbdbg_emit_fault(unsigned long elr)
+{
+	if (READ_ONCE(fbdbg_emitted))
+		return;
+	if (atomic_xchg(&fbdbg_in_emit, 1))
+		return;
+	fbdbg_stripe(0x040000, 0xffffffff);                  /* white = fault */
+	fbdbg_emit_octal(0x080000,
+			  (elr - kaslr_offset()) & 0x7ffffffUL, 9);
+	WRITE_ONCE(fbdbg_emitted, 1);
+	atomic_set(&fbdbg_in_emit, 0);
+}
+
+/* panic / NULL-regs oops: red leader @0x040000 (coarse retaddr, NOT a precise
+ * PC) + the same 9-digit field. Same slots; the latch picks one. */
+void __ref fbdbg_emit_panic(unsigned long retaddr)
+{
+	if (READ_ONCE(fbdbg_emitted))
+		return;
+	if (atomic_xchg(&fbdbg_in_emit, 1))
+		return;
+	fbdbg_stripe(0x040000, 0xffff0000);                  /* red = panic */
+	fbdbg_emit_octal(0x080000,
+			  (retaddr - kaslr_offset()) & 0x7ffffffUL, 9);
+	WRITE_ONCE(fbdbg_emitted, 1);
+	atomic_set(&fbdbg_in_emit, 0);
+}
+
+/* WARN site. Yellow leader @0x040000 + 9 octal digits of the
+ * WARN caller's LINK address. Shares the latch (first emitter wins) so the
+ * FIRST WARN's site is captured; with panic_on_warn dropped the kernel then
+ * continues and the deeper bracket marks show how far it gets. */
+void __ref fbdbg_emit_warn(unsigned long caller)
+{
+	if (READ_ONCE(fbdbg_emitted))
+		return;
+	if (atomic_xchg(&fbdbg_in_emit, 1))
+		return;
+	fbdbg_stripe(0x040000, 0xffffff00);                  /* yellow = WARN */
+	fbdbg_emit_octal(0x080000,
+			  (caller - kaslr_offset()) & 0x7ffffffUL, 9);
+	WRITE_ONCE(fbdbg_emitted, 1);
+	atomic_set(&fbdbg_in_emit, 0);
+}
+
 void __init __no_sanitize_address setup_arch(char **cmdline_p)
 {
+	/* M11 green @ FB+0x2c0000: entered setup_arch. */
+	FBDBG_STRIPE_RAW(0x2c0000, 0xff00ff00);
+
 	setup_initial_init_mm(_text, _etext, _edata, _end);
 
 	*cmdline_p = boot_command_line;
@@ -290,6 +415,10 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	early_ioremap_init();
 
 	setup_machine_fdt(__fdt_pointer);
+
+	/* M12 magenta @ FB+0x300000: device tree parsed (setup_machine_fdt
+	 * returned) -- the prime-suspect checkpoint for a board-data death. */
+	FBDBG_STRIPE_RAW(0x300000, 0xffff00ff);
 
 	/*
 	 * Initialise the static keys early as they may be enabled by the
@@ -313,11 +442,23 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 */
 	local_daif_restore(DAIF_PROCCTX_NOIRQ);
 
+	/* M13 violet @ FB+0x340000: setup_arch reached idmap-teardown --
+	 * the LAST raw-FB-reachable point (cpu_uninstall_idmap below drops the idmap;
+	 * past here only ioremap_wc reaches the FB, e.g. paint_splash blue@1065). */
+	FBDBG_STRIPE_RAW(0x340000, 0xff8000ff);
+
 	/*
 	 * TTBR0 is only used for the identity mapping at this stage. Make it
 	 * point to zero page to avoid speculatively fetching new entries.
 	 */
 	cpu_uninstall_idmap();
+
+	/* E0 white @ FB+0x380000: idmap teardown survived. FIRST
+	 * early_memremap stripe -- also the mechanism check: if M13 (raw idmap)
+	 * lit but E0 dark, suspect the fixmap-FB write mechanism, NOT a device
+	 * death (3rd Lesson #53 caveat: Normal-NC FB write via the TTBR1 fixmap
+	 * is unobserved on this device; same PA + same attribute as M0-M13). */
+	fbdbg_stripe(0x380000, 0xffffffff);
 
 	xen_early_init();
 	efi_init();
@@ -329,9 +470,18 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 			   FW_BUG "Booted with MMU enabled!");
 	}
 
+	/* E1 orange @ FB+0x3c0000: xen_early_init + efi_init done. */
+	fbdbg_stripe(0x3c0000, 0xffff8000);
+
 	arm64_memblock_init();
 
+	/* E2 red @ FB+0x400000: arm64_memblock_init done. */
+	fbdbg_stripe(0x400000, 0xffff0000);
+
 	paging_init();
+
+	/* E3 yellow @ FB+0x440000: paging_init done [PRIME suspect]. */
+	fbdbg_stripe(0x440000, 0xffffff00);
 
 	acpi_table_upgrade();
 
@@ -341,11 +491,27 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	if (acpi_disabled)
 		unflatten_device_tree();
 
+	/* E4 magenta @ FB+0x480000: acpi_*_table + (if acpi_disabled)
+	 * unflatten_device_tree done [PRIME suspect]. CONDITIONAL: E4 lit does
+	 * NOT prove unflatten ran unless acpi_disabled (Qualcomm DT boot ⇒
+	 * acpi_disabled likely true; verify cmdline if E3 lit + E4 dark). */
+	fbdbg_stripe(0x480000, 0xffff00ff);
+
 	bootmem_init();
+
+	/* E5 cyan @ FB+0x4c0000: bootmem_init done. */
+	fbdbg_stripe(0x4c0000, 0xff00ffff);
 
 	kasan_init();
 
+	/* E6 green @ FB+0x500000: kasan_init done. */
+	fbdbg_stripe(0x500000, 0xff00ff00);
+
 	request_standard_resources();
+
+	/* E7 violet @ FB+0x540000: request_standard_resources done --
+	 * the deepest stripe before early_ioremap_reset() drops early_ioremap. */
+	fbdbg_stripe(0x540000, 0xff8000ff);
 
 	early_ioremap_reset();
 

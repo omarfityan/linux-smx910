@@ -74,8 +74,12 @@
  * segments, and may appear misaligned wrt the swapper block size. This means
  * we need 3 additional pages. The DT could straddle a swapper block boundary,
  * so it may need 2.
+ *
+ * +3 reserves headroom for the extra page-table page(s) consumed by the
+ * framebuffer MMIO identity mapping added in create_init_idmap() (one 2 MiB
+ * block in a region disjoint from the kernel image needs at most a fresh L2).
  */
-#define EARLY_IDMAP_EXTRA_PAGES		3
+#define EARLY_IDMAP_EXTRA_PAGES		6
 #define EARLY_IDMAP_EXTRA_FDT_PAGES	2
 #else
 #define EARLY_SEGMENT_EXTRA_PAGES	0

@@ -26,6 +26,7 @@
 #include <linux/pkeys.h>
 #include <linux/preempt.h>
 #include <linux/hugetlb.h>
+#include <linux/fbdbg.h>
 
 #include <asm/acpi.h>
 #include <asm/bug.h>
@@ -303,6 +304,11 @@ static bool __kprobes is_spurious_el1_translation_fault(unsigned long addr,
 static void die_kernel_fault(const char *msg, unsigned long addr,
 			     unsigned long esr, struct pt_regs *regs)
 {
+	/* paint the faulting PC's link addr (octal) to the splash FB
+	 * before anything else, so a kernel memory abort reports its exact line
+	 * even pre-console. White leader = precise PC. */
+	fbdbg_emit_fault(regs->pc);
+
 	bust_spinlocks(1);
 
 	pr_alert("Unable to handle kernel %s at virtual address %016lx\n", msg,

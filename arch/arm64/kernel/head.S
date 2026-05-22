@@ -86,12 +86,40 @@ SYM_CODE_START(primary_entry)
 	bl	record_mmu_state
 	bl	preserve_boot_args
 
+	/* pre-MMU FB breadcrumb (Option B LOCK):
+	 * Paint a magenta 64-KiB strip onto bootloader splash FB at PA
+	 * 0xb8000000. arm64 boot protocol (Documentation/arch/arm64/booting.rst
+	 * + ARM ARM B2.6.7) mandates MMU off at entry; with SCTLR_ELx.M=0,
+	 * data accesses are Normal Non-cacheable Non-shareable, so dsb sy
+	 * alone suffices for FB-coherent write. x19/x20/x21 callee-saved
+	 * across primary_entry are untouched; x9-x11 are caller-saved scratch. */
+	movz	x9, #0xb800, lsl #16		/* x9 = 0x00000000_b8000000 */
+	movz	w10, #0xffff, lsl #16		/* w10 = 0xffff0000 */
+	movk	w10, #0x00ff			/* w10 = 0xffff00ff opaque magenta ARGB */
+	mov	w11, #16384			/* 16384 words = 65536 B visible strip */
+1:	str	w10, [x9], #4
+	subs	w11, w11, #1
+	b.ne	1b
+	dsb	sy				/* ensure writes reach DDR */
+
 	adrp	x1, early_init_stack
 	mov	sp, x1
 	mov	x29, xzr
 	adrp	x0, __pi_init_idmap_pg_dir
 	mov	x1, xzr
 	bl	__pi_create_init_idmap
+
+	/* M1 cyan breadcrumb: pre-MMU FB strip at
+	 * PA 0xb8040000. Survived __pi_create_init_idmap. x9/x10/x11 scratch only;
+	 * x0 (idmap end, used below) + x19 untouched; MMU still off (str+dsb ok). */
+	movz	x9, #0xb804, lsl #16		/* FB+0x40000 */
+	movz	w10, #0xff00, lsl #16
+	movk	w10, #0xffff			/* w10 = 0xff00ffff opaque cyan */
+	mov	w11, #16384
+2:	str	w10, [x9], #4
+	subs	w11, w11, #1
+	b.ne	2b
+	dsb	sy
 
 	/*
 	 * If the page tables have been populated with non-cacheable
@@ -120,6 +148,18 @@ SYM_CODE_START(primary_entry)
 	bl	init_kernel_el			// w0=cpu_boot_mode
 	mov	x20, x0
 
+	/* M2 yellow breadcrumb: pre-MMU FB strip at
+	 * PA 0xb8080000. Survived init_kernel_el. x9/x10/x11 scratch only;
+	 * x19/x20/x21 untouched; MMU still off (str+dsb ok). */
+	movz	x9, #0xb808, lsl #16		/* FB+0x80000 */
+	movz	w10, #0xffff, lsl #16
+	movk	w10, #0xff00			/* w10 = 0xffffff00 opaque yellow */
+	mov	w11, #16384
+3:	str	w10, [x9], #4
+	subs	w11, w11, #1
+	b.ne	3b
+	dsb	sy
+
 	/*
 	 * The following calls CPU setup code, see arch/arm64/mm/proc.S for
 	 * details.
@@ -127,6 +167,22 @@ SYM_CODE_START(primary_entry)
 	 * the TCR will have been set.
 	 */
 	bl	__cpu_setup			// initialise processor
+
+	/* M3 green breadcrumb: pre-MMU FB strip at
+	 * PA 0xb80c0000. Survived __cpu_setup; LAST point before __primary_switch
+	 * -> __enable_mmu turns the MMU ON (FB unreachable after). x9/x10/x11
+	 * scratch ONLY -- x0 holds the SCTLR value consumed by __enable_mmu's
+	 * set_sctlr_el1 x0 and MUST stay untouched; x19/x20/x21 untouched; MMU
+	 * still off here (str+dsb ok). Green present => death is at/after MMU-enable. */
+	movz	x9, #0xb80c, lsl #16		/* FB+0xc0000 */
+	movz	w10, #0xff00, lsl #16
+	movk	w10, #0xff00			/* w10 = 0xff00ff00 opaque green */
+	mov	w11, #16384
+4:	str	w10, [x9], #4
+	subs	w11, w11, #1
+	b.ne	4b
+	dsb	sy
+
 	b	__primary_switch
 SYM_CODE_END(primary_entry)
 
@@ -225,6 +281,20 @@ SYM_FUNC_START_LOCAL(__primary_switched)
 	msr	vbar_el1, x8			// vector table address
 	isb
 
+	/* M7 orange breadcrumb (dense ladder): FB strip at PA 0xb81c0000,
+	 * AFTER vbar_el1 is set -> from here a CPU fault routes to the kernel
+	 * exception vectors (no longer a silent reset). Orange present => survived
+	 * init_cpu_task (stack/SCS/per-cpu) + vbar install. x9/x10/x11 scratch ONLY;
+	 * x19/x20/x21 live (untouched); MMU on, idmap-FB still mapped. */
+	movz	x9, #0xb81c, lsl #16		/* FB+0x1c0000 */
+	movz	w10, #0xffff, lsl #16
+	movk	w10, #0x8000			/* w10 = 0xffff8000 opaque orange */
+	mov	w11, #16384
+8:	str	w10, [x9], #4
+	subs	w11, w11, #1
+	b.ne	8b
+	dsb	sy
+
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
 
@@ -242,6 +312,21 @@ SYM_FUNC_START_LOCAL(__primary_switched)
 #endif
 	mov	x0, x20
 	bl	finalise_el2			// Prefer VHE if possible
+
+	/* M8 white breadcrumb (dense ladder): FB strip at PA 0xb8200000,
+	 * AFTER finalise_el2, immediately before bl start_kernel -> the LAST asm
+	 * breadcrumb before C. White present => survived all of __primary_switched
+	 * (FDT save, kimage_voffset, set_cpu_boot_mode_flag, finalise_el2). x9/x10/x11
+	 * scratch ONLY; x0 (=x20, consumed by finalise_el2) dead; sp/x29/x30 on the
+	 * stack frame untouched; MMU on, idmap-FB still mapped. */
+	movz	x9, #0xb820, lsl #16		/* FB+0x200000 */
+	movn	w10, #0				/* w10 = 0xffffffff opaque white */
+	mov	w11, #16384
+9:	str	w10, [x9], #4
+	subs	w11, w11, #1
+	b.ne	9b
+	dsb	sy
+
 	ldp	x29, x30, [sp], #16
 	bl	start_kernel
 	ASM_BUG()
@@ -510,12 +595,61 @@ SYM_FUNC_START_LOCAL(__primary_switch)
 	adrp	x2, __pi_init_idmap_pg_dir
 	bl	__enable_mmu
 
+	/* M4 white breadcrumb: FIRST post-MMU FB
+	 * strip at PA 0xb8100000. The MMU is now ON (set_sctlr_el1 inside
+	 * __enable_mmu); TTBR0 still holds __pi_init_idmap_pg_dir, whose idmap
+	 * now identity-maps the FB (create_init_idmap), so this str translates
+	 * VA==PA 0xb8100000 -> the splash carveout. White present => the kernel
+	 * survived the MMU-enable instant + the return from __enable_mmu (the
+	 * classic mainline-on-new-board idmap/TCR fault point). x9/x10/x11
+	 * scratch ONLY; x20 (boot status) + x21 (FDT) live, untouched; MMU-on
+	 * Normal-NC + dsb reaches the FB (matches the pre-MMU regime + ioremap_wc). */
+	movz	x9, #0xb810, lsl #16		/* FB+0x100000 */
+	movn	w10, #0				/* w10 = 0xffffffff opaque white */
+	mov	w11, #16384
+5:	str	w10, [x9], #4
+	subs	w11, w11, #1
+	b.ne	5b
+	dsb	sy
+
 	adrp	x1, early_init_stack
 	mov	sp, x1
 	mov	x29, xzr
 	mov	x0, x20				// pass the full boot status
 	mov	x1, x21				// pass the FDT
+
+	/* M5 violet breadcrumb: SECOND post-MMU FB
+	 * strip at PA 0xb8140000, immediately before __pi_early_map_kernel (which
+	 * switches TTBR0 off this idmap -> the FB becomes unreachable to a raw str
+	 * after this point; deeper markers are a linear-map concern).
+	 * Violet present => survived to the entry of __pi_early_map_kernel.
+	 * x9/x10/x11 scratch ONLY -- x0 (boot status) + x1 (FDT) are the args for
+	 * the imminent bl and MUST stay untouched; x20/x21 live; MMU on (str+dsb ok). */
+	movz	x9, #0xb814, lsl #16		/* FB+0x140000 */
+	movz	w10, #0xff80, lsl #16
+	movk	w10, #0x00ff			/* w10 = 0xff8000ff opaque violet */
+	mov	w11, #16384
+6:	str	w10, [x9], #4
+	subs	w11, w11, #1
+	b.ne	6b
+	dsb	sy
+
 	bl	__pi_early_map_kernel		// Map and relocate the kernel
+
+	/* M6 red breadcrumb (dense ladder): FB strip
+	 * at PA 0xb8180000, AFTER __pi_early_map_kernel returns. This is the LPA2
+	 * remap + swapper-build + relocate path (remap_idmap_for_lpa2 recreates the
+	 * idmap via the SAME create_init_idmap, so the FB stays mapped; TTBR0 is
+	 * left at init_idmap_pg_dir on return). Red present => the kernel survived
+	 * map_fdt + the LPA2-fallback remap + map_kernel. x9/x10/x11 scratch ONLY;
+	 * x0/x8 (set just below for the br) are NOT yet live here; MMU on, idmap-FB. */
+	movz	x9, #0xb818, lsl #16		/* FB+0x180000 */
+	movz	w10, #0xffff, lsl #16		/* w10 = 0xffff0000 opaque red */
+	mov	w11, #16384
+7:	str	w10, [x9], #4
+	subs	w11, w11, #1
+	b.ne	7b
+	dsb	sy
 
 	ldr	x8, =__primary_switched
 	adrp	x0, KERNEL_START		// __pa(KERNEL_START)
