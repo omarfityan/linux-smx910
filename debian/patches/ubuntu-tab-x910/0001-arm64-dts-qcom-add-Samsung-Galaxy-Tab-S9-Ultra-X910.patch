@@ -1,0 +1,84 @@
+arm64: dts: qcom: add Samsung Galaxy Tab S9 Ultra (SM-X910)
+
+Add leaf DTS for Samsung Galaxy Tab S9 Ultra Wi-Fi (SM-X910 / gts9uwifi).
+This skeleton is the minimum needed for the kernel build to succeed at
+ubuntu-tab milestone-1; full body (panel topology, cs35l45 audio,
+charging IC nodes, touchscreen, keyboard cover) is iterative authoring
+post-first-boot per the project's per-track ADRs and fast-cycle module
+hot-reload loop.
+
+The leaf file name is SKU-keyed (sm8550-samsung-x910.dts) per the qcom
+DTS naming convention (cf. DEC-196 R07-W3 + arm/qcom.yaml enum
+extension samsung,gts9 + samsung,gts9plus + samsung,gts9u).
+
+The factored sm8550-samsung-gts9-common.dtsi for Tab S9 family-common
+content is in a companion patch in this series.
+
+Signed-off-by: ubuntu-tab project <omarfityan@outlook.com>
+
+Index: ubuntu-tab-x910/arch/arm64/boot/dts/qcom/Makefile
+===================================================================
+--- ubuntu-tab-x910.orig/arch/arm64/boot/dts/qcom/Makefile
++++ ubuntu-tab-x910/arch/arm64/boot/dts/qcom/Makefile
+@@ -334,6 +334,7 @@ dtb-$(CONFIG_ARCH_QCOM)	+= sm8550-hdk.dt
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8550-mtp.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8550-qrd.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8550-samsung-q5q.dtb
++dtb-$(CONFIG_ARCH_QCOM)	+= sm8550-samsung-x910.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8550-sony-xperia-yodo-pdx234.dtb
+ 
+ sm8650-hdk-display-card-dtbs	:= sm8650-hdk.dtb sm8650-hdk-display-card.dtbo
+Index: ubuntu-tab-x910/arch/arm64/boot/dts/qcom/sm8550-samsung-x910.dts
+===================================================================
+--- /dev/null
++++ ubuntu-tab-x910/arch/arm64/boot/dts/qcom/sm8550-samsung-x910.dts
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*
++ * Samsung Galaxy Tab S9 Ultra (Wi-Fi, SM-X910 / gts9uwifi)
++ * Qualcomm Snapdragon 8 Gen 2 (SM8550 / Kalama)
++ *
++ * Per:
++ * - ADR-0020 (R14) leaf DTS authoring + factored common.dtsi
++ * - ADR-0024 (R13) kernel rebase discipline
++ * - ADR-0025 (R06) panel topology block reference (driver authoring at M2+)
++ * - ADR-0021 (R20) touchscreen Goodix Berlin on &i2c4
++ * - ADR-0019 (R12) keyboard cover stm32_pogo on &i2c15
++ * - ADR-0017 (R02) charging stack sm5714 + sm5440 + sec_direct_charger
++ * - ADR-0016 (R23) Wi-Fi/BT WCN7850/QCA2066 (kiwi) PCI17cb:1107
++ *
++ * Bootstrap source: Samsung downstream gts9uwifi_eur_open_w00_r03.dts
++ * SHA 74a08fac2da9984d315616b1e77e00307dfa551d (SoC-plumbing + regulators
++ * + PCIe-enablement layer; mainline-cleaned).
++ */
++
++/dts-v1/;
++
++#include "sm8550-samsung-gts9-common.dtsi"
++
++/ {
++	model = "Samsung Galaxy Tab S9 Ultra (Wi-Fi)";
++	compatible = "samsung,gts9u", "qcom,sm8550";
++
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		framebuffer: framebuffer@0 {
++			compatible = "simple-framebuffer";
++			reg = <0x0 0x0 0x0 0x0>; /* set by ABL at boot */
++			status = "disabled"; /* enabled by ABL via stdout-path */
++		};
++	};
++};
++
++/*
++ * X910-specific overrides start here. For milestone-1, this skeleton
++ * is intentionally minimal — enough to compile + reference the factored
++ * common.dtsi. Full body (panel topology block, cs35l45 4-amp single-bus on
++ * &qupv3_hub_i2c6, R02 charging IC nodes, R20 touchscreen Goodix Berlin on
++ * &i2c4, R12 stm32_pogo on &i2c15) is iterative authoring across milestone-1
++ * follow-on + milestone-2 first-boot driver-binding refinements per
++ * ADR-0027 D9 fast-cycle module hot-reload loop for OOT drivers.
++ */

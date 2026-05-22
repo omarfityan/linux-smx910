@@ -1,0 +1,5 @@
+# ubuntu-tab project-local quilt config
+# Configures quilt to use debian/patches/ matching Mobian's per-device kernel-deb layout
+QUILT_PATCHES=debian/patches
+QUILT_SERIES=series
+QUILT_REFRESH_ARGS="-p ab --no-timestamps --no-index"

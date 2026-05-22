@@ -39,7 +39,6 @@
 *.mod.c
 *.o
 *.o.*
-*.patch
 *.pyc
 *.rlib
 *.rmeta
@@ -111,6 +110,7 @@ modules.order
 !.kunitconfig
 !.mailmap
 !.pylintrc
+!.quiltrc
 !.rustfmt.toml
 
 #
@@ -122,10 +122,6 @@ modules.order
 
 # stgit generated dirs
 patches-*
-
-# quilt's files
-patches
-series
 
 # ctags files
 tags
