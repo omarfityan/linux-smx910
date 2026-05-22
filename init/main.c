@@ -117,6 +117,9 @@
 
 #include <kunit/test.h>
 
+#include <linux/io.h>
+#include <linux/fbdbg.h>
+
 static int kernel_init(void *);
 
 /*
@@ -1003,11 +1006,67 @@ static void __init print_kernel_cmdline(const char *cmdline)
 		pr_notice("%s%s\n", KERNEL_CMDLINE_PREFIX, cmdline);
 }
 
+/*
+ * dense-ladder raw-FB breadcrumb. Paints a strip
+ * to the splash FB at PA 0xb8000000+off via a raw str, reaching it through the
+ * still-live init idmap (TTBR0) which create_init_idmap maps for the FB. Valid
+ * only BEFORE cpu_uninstall_idmap() (arch/arm64 setup_arch line ~320) and before
+ * PAN turns on (smp_prepare_boot_cpu, later) -- i.e. through early start_kernel
+ * and the first half of setup_arch, the window where ioremap_wc is NOT yet
+ * usable. Inline asm bypasses KASAN/instrumentation; clobbers x9/x10/x11. arm64.
+ */
+#define FBDBG_STRIPE_RAW(off, color)					\
+	asm volatile(							\
+		"mov	x9, %0\n"					\
+		"mov	w10, %w1\n"					\
+		"mov	w11, #16384\n"					\
+		"1:	str	w10, [x9], #4\n"			\
+		"	subs	w11, w11, #1\n"				\
+		"	b.ne	1b\n"					\
+		"	dsb	sy\n"					\
+		:: "r"(0xb8000000UL + (off)), "r"((u32)(color))		\
+		: "x9", "x10", "x11", "memory")
+
+/*
+ * Visual boot-progress breadcrumb: paints a solid 32-bit ARGB color
+ * onto the bootloader-painted splash framebuffer at 0xb8000000 (45 MB,
+ * gts9u splash_region). The FINAL color visible on screen when boot
+ * halts identifies the death point. ioremap_wc needs paging_init/fixmap,
+ * so the earliest safe call site is AFTER setup_arch() returns.
+ */
+static void __init paint_splash(u32 color)
+{
+	void __iomem *fb;
+	u32 __iomem *p;
+	size_t i, npx = 0x2b00000 / sizeof(u32);
+
+	fb = ioremap_wc(0xb8000000, 0x2b00000);
+	if (!fb)
+		return;
+	p = (u32 __iomem *)fb;
+	for (i = 0; i < npx; i++)
+		writel_relaxed(color, p + i);
+	wmb();
+	iounmap(fb);
+}
+
+static int __init paint_yellow(void) { paint_splash(0xFFFFFF00); return 0; }
+arch_initcall_sync(paint_yellow);
+
+static int __init paint_orange(void) { paint_splash(0xFFFF8000); return 0; }
+late_initcall(paint_orange);
+
+static int __init paint_red(void) { paint_splash(0xFFFF0000); return 0; }
+late_initcall_sync(paint_red);
+
 asmlinkage __visible __init __no_sanitize_address __noreturn __no_stack_protector
 void start_kernel(void)
 {
 	char *command_line;
 	char *after_dashes;
+
+	/* M9 cyan @ FB+0x240000: entered C start_kernel (idmap-FB raw str). */
+	FBDBG_STRIPE_RAW(0x240000, 0xff00ffff);
 
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
@@ -1026,7 +1085,11 @@ void start_kernel(void)
 	boot_cpu_init();
 	page_address_init();
 	pr_notice("%s", linux_banner);
+	/* M10 yellow @ FB+0x280000: early start_kernel C survived
+	 * (boot_cpu_init/page_address_init/banner), about to enter setup_arch. */
+	FBDBG_STRIPE_RAW(0x280000, 0xffffff00);
 	setup_arch(&command_line);
+	paint_splash(0xFF0000FF);
 	mm_core_init_early();
 	/* Static keys and static calls are needed by LSMs */
 	jump_label_init();
@@ -1067,6 +1130,14 @@ void start_kernel(void)
 	sort_main_extable();
 	trap_init();
 	mm_core_init();
+	/* E8 blue: setup_arch returned AND mm is up. This is the WORKING
+	 * "past setup_arch" marker -- the existing paint_splash(blue) at the top
+	 * of start_kernel (right after setup_arch returns) is mechanically DEAD:
+	 * ioremap_wc needs vmalloc_init(), which runs inside mm_core_init() just
+	 * above, so any paint_splash BEFORE this point silently returns NULL.
+	 * paint_splash floods the WHOLE FB, so a solid-blue screen = the kernel
+	 * cleared setup_arch + early mm init (death past the E0-E7 ladder). */
+	paint_splash(0xFF0000FF);
 	maple_tree_init();
 	poking_init();
 	ftrace_init();
@@ -1084,6 +1155,9 @@ void start_kernel(void)
 	if (WARN(!irqs_disabled(),
 		 "Interrupts were enabled *very* early, fixing it\n"))
 		local_irq_disable();
+	/* DEEP-1: past sched_init + the early-irq WARN (cyan). If
+	 * lit, the kernel SURVIVED the WARN that an earlier panic_on_warn made fatal. */
+	fbdbg_stripe(0x5c0000, 0xff00ffff);
 	radix_tree_init();
 
 	/*
@@ -1205,6 +1279,8 @@ void start_kernel(void)
 	arch_post_acpi_subsys_init();
 	kcsan_init();
 
+	/* DEEP-2: end of start_kernel, about to call rest_init (white). */
+	fbdbg_stripe(0x600000, 0xffffffff);
 	/* Do the rest non-__init'ed, we're now alive */
 	rest_init();
 
@@ -1449,6 +1525,8 @@ static void __init do_initcalls(void)
 	size_t len = saved_command_line_len + 1;
 	char *command_line;
 
+	paint_splash(0xFF00FF00);
+
 	command_line = kzalloc(len, GFP_KERNEL);
 	if (!command_line)
 		panic("%s: Failed to allocate %zu bytes\n", __func__, len);
@@ -1578,15 +1656,28 @@ static int __ref kernel_init(void *unused)
 	 */
 	wait_for_completion(&kthreadd_done);
 
+	/* DEEP-3: kernel_init thread running, about to do_basic_setup
+	 * / do_initcalls via kernel_init_freeable (magenta). */
+	fbdbg_stripe(0x640000, 0xffff00ff);
 	kernel_init_freeable();
 	/* need to finish all async __init code before freeing the memory */
 	async_synchronize_full();
 
+	/* DEEP-4: all __init + async done, about to free init mem and
+	 * exec userspace init (yellow). system_state still < SYSTEM_RUNNING here so
+	 * early_memremap (fbdbg_stripe) is still valid; the next line flips it. */
+	fbdbg_stripe(0x680000, 0xffffff00);
 	system_state = SYSTEM_FREEING_INITMEM;
 	kprobe_free_init_mem();
 	ftrace_free_init_mem();
 	kgdb_free_init_mem();
 	exit_boot_config();
+	/* DEEP-5: last early_memremap-safe FB mark before free_initmem
+	 * frees the __init early_memremap_prot code (green). Closes the
+	 * post-DEEP-4 gap to ~the run_init_process exec; deepest reliable
+	 * kernel-side proof. Beyond here the proven FB instrument is dead, so
+	 * the userspace heartbeat is purely behavioural (frozen vs reboot). */
+	fbdbg_stripe(0x6c0000, 0xff00ff00);
 	free_initmem();
 	mark_readonly();
 
