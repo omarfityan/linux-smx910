@@ -37,6 +37,7 @@
 #include <linux/context_tracking.h>
 #include <linux/seq_buf.h>
 #include <linux/sys_info.h>
+#include <linux/fbdbg.h>
 #include <trace/events/error_report.h>
 #include <asm/sections.h>
 
@@ -783,6 +784,10 @@ void panic(const char *fmt, ...)
 {
 	va_list args;
 
+	/* catch BUG/WARN+panic_on_warn/hung_task/softlockup paths that
+	 * don't reach die_kernel_fault. retaddr = panic's caller (coarse, not
+	 * line-accurate for BUG); red leader. Latched. */
+	fbdbg_emit_panic((unsigned long)__builtin_return_address(0));
 	va_start(args, fmt);
 	vpanic(fmt, args);
 	va_end(args);
@@ -1032,6 +1037,10 @@ struct warn_args {
 void __warn(const char *file, int line, void *caller, unsigned taint,
 	    struct pt_regs *regs, struct warn_args *args)
 {
+	/* paint the WARN caller's link addr (octal, yellow leader)
+	 * to the splash FB. Latched; captures the FIRST WARN's site. */
+	fbdbg_emit_warn((unsigned long)caller);
+
 	nbcon_cpu_emergency_enter();
 
 	disable_trace_on_warning();
