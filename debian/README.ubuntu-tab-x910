@@ -46,3 +46,30 @@ build env + leaf DTS + factored common.dtsi + defconfig + first dpkg-buildpackag
 attempt + .deb validation. No boot.img, no Thor flash, no first-boot smoke —
 those are milestone-2 (gated on milestone-1 closing cleanly per advisor sess-66
 #1; destructive-gate-adjacent per binding-constraint #6).
+
+Deferred Bucket-A items (M2+ first-boot binding scope)
+-------------------------------------------------------
+
+The following Bucket-A items per ADR-0027 D2 Stage 2 + ADR-0024 D2 are NOT
+applied at milestone-1 because they are first-BOOT dependencies, not
+first-BUILD dependencies. Added at M2+ as needed for driver binding:
+
+  * DEC-176 multi-SoC apss-wdt 4-patch series (binding + 3 dtsi):
+    Audit at sess-67 M1.7.1 confirmed apss-wdt watchdog node is NOT in
+    sm8550.dtsi at v7.0.6 mainline (zero matches for apss-wdt OR
+    watchdog@.*qcom in sm8550.dtsi). Action: if missing at first-boot,
+    author + apply at M2 as
+    debian/patches/ubuntu-tab-x910/0004-arm64-dts-qcom-sm8550-add-apss-wdt
+    + companion binding YAML patch + 3 dtsi enabler patches for SM8x50
+    family per DEC-176 shape.
+
+  * DEC-177 BT serdev parent &uart14:
+    Audit at sess-67 M1.7.1 confirmed uart14 IS present in sm8550.dtsi at
+    v7.0.6 mainline (line 1187: `uart14: serial@898000 { ... }`). Our
+    common.dtsi at sm8550-samsung-gts9-common.dtsi already overlays
+    `&uart14 { status = "okay"; };`. BT serdev child node lives in leaf
+    sm8550-samsung-x910.dts per R23 ADR-0016 D2 LINK-don't-COPY (deferred
+    to M2+ when the BT child node is authored).
+
+  * Future SoC-layer patches surfaced during M2+ first-boot validation per
+    ADR-0014 Rule 4 amendment workflow.
