@@ -88,6 +88,15 @@
 			height = <1848>;
 			stride = <(2960 * 4)>;
 			format = "a8r8g8b8";
+			/*
+			 * Disabled so simplefb does not bind and fbcon does not
+			 * contend for this scanout: the kmsgfb observability PID 1
+			 * paints 0xb8000000 directly via /dev/mem, and a second
+			 * framebuffer-console writer would garble that readout.
+			 * Power/clock backbone bring-up (the node under test) is
+			 * unaffected by this display-only node.
+			 */
+			status = "disabled";
 		};
 	};
 
