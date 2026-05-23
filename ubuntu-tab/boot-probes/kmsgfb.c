@@ -604,27 +604,40 @@ void _start(void)
 			FB = (volatile unsigned int *)ret;
 	}
 
-	(void)kfd;
-	/* banner (proves THIS binary is running) + the live FDT dump, pushed into
-	 * the ring -- pure FDT screen so apps_rsc stays on-screen (no kmsg backlog
-	 * competing for the 38 ring slots) */
-	static const char banner[] = "==== LIVE FDT DUMP v3 (2MB buf) ====";
+	/* banner (proves THIS binary is running + the strings-grep embed token) */
+	static const char banner[] = "==== LIVE KMSG rpmh-bind probe ====";
 	push_line(banner, sizeof(banner) - 1);
-	/* paint the banner IMMEDIATELY -- a canary: if this shows on the next boot,
-	 * our binary is running (vs an A/B rollback to the old boot) */
 	if (FB) { clear_fb(); render(); fb_flush((unsigned long)FB); }
 
-	dump_live_fdt();
-
-	if (FB) {
-		clear_fb();
-		render();
-		fb_flush((unsigned long)FB);
+	if (kfd < 0 || !FB) {
+		/* no kmsg or no FB: block forever so PID 1 never exits */
+		struct pollfd dummy = { 0, 0, 0 };
+		for (;;) sys_ppoll(&dummy, 0);
 	}
 
-	/* freeze on the FDT dump for a stable photo (we already have the -22 kmsg
-	 * evidence from sess-102 + the earlier boots) */
-	struct pollfd dummy = { 0, 0, 0 };
-	for (;;) sys_ppoll(&dummy, 0);
+	/* live /dev/kmsg renderer: drain the boot backlog into the ring, then paint
+	 * one frame per burst and block for the next record. The displayed tail is
+	 * the discriminator -- a persistent rpmh-rsc "-22" storm = still failing;
+	 * the storm gone = rpmh-rsc bound (the chain advanced past the -22 wall). */
+	static char rec[8192];
+	struct pollfd pfd = { (int)kfd, POLLIN, 0 };
+	for (;;) {
+		for (;;) {
+			long n = sys_read(kfd, rec, sizeof rec);
+			if (n > 0) {
+				handle_record(rec, (int)n);
+				continue;
+			}
+			if (n == -EAGAIN)
+				break;          /* backlog drained */
+			if (n == 0)
+				break;
+			/* -EPIPE etc (records overran the ring): retry read */
+		}
+		render();
+		fb_flush((unsigned long)FB);
+		pfd.revents = 0;
+		sys_ppoll(&pfd, 1);
+	}
 }
 #endif
