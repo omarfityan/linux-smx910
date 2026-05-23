@@ -32,7 +32,7 @@
 	#address-cells = <2>;
 	#size-cells = <2>;
 
-	chosen { };
+	qcom_tzlog: chosen { };
 
 	clocks {
 		xo_board: xo-board {
@@ -6756,7 +6756,7 @@
 		};
 	};
 
-	timer {
+	arch_timer: timer {
 		compatible = "arm,armv8-timer";
 		interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW) 0>,
 			     <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW) 0>,
