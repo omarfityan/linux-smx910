@@ -253,6 +253,25 @@
 			no-map;
 		};
 
+		/*
+		 * ramoops console capture: carveout-free gap (hdm-region end
+		 * 0x8_80b02000 .. rdx-bootdev 0x8_80c00000), inside the
+		 * ABL-declared high-DDR bank (0x8_80000000 + 0x37800000). Sizes
+		 * match the downstream reader's pstore-ram zone layout so the
+		 * same region is read back after a warm reboot.
+		 */
+		ramoops@880b10000 {
+			compatible = "ramoops";
+			reg = <0x8 0x80b10000 0x0 0xc0000>;
+			no-map;
+			console-size = <0x40000>;
+			record-size = <0x20000>;
+			ftrace-size = <0x20000>;
+			pmsg-size = <0x0>;
+			ecc-size = <0x10>;
+			max-reason = <0x05>;
+		};
+
 		sec_qcom_rdx_bootdev_region: sec-qcom-rdx-bootdev-region@880c00000 {
 			reg = <0x8 0x80c00000 0x0 0xad00000>;
 		};
