@@ -2,6 +2,11 @@
 # Consumed by CONFIG_INITRAMFS_SOURCE; the kernel's usr/gen_init_cpio builds the
 # cpio at compile time -- INCLUDING the device nodes -- without needing root or
 # fakeroot. Paths in `file` lines are relative to the kernel source root.
+#
+# Build-2 (USB gadget): /init (busybox sh script, rdinit=/init) brings up a
+# configfs ACM gadget on ttyGS0. /dev/console + /dev/kmsg are static nodes
+# needed before /init mounts devtmpfs over /dev (which then provides ttyGS0,
+# sda10, etc.). /kmsgmark is kept as a fallback PID-1 probe (select via rdinit).
 dir  /dev          0755 0 0
 nod  /dev/console  0600 0 0 c 5 1
 nod  /dev/kmsg     0600 0 0 c 1 11
@@ -9,4 +14,9 @@ dir  /dev/block    0755 0 0
 nod  /dev/block/sda10 0600 0 0 b 8 10
 dir  /proc         0755 0 0
 dir  /sys          0755 0 0
+dir  /sys/kernel   0755 0 0
+dir  /sys/kernel/config 0755 0 0
+dir  /bin          0755 0 0
+file /bin/busybox  ubuntu-tab/boot-probes/busybox 0755 0 0
+file /init         ubuntu-tab/boot-probes/init 0755 0 0
 file /kmsgmark     ubuntu-tab/boot-probes/kmsgmark 0755 0 0
