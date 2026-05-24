@@ -5,6 +5,8 @@
 dir  /dev          0755 0 0
 nod  /dev/console  0600 0 0 c 5 1
 nod  /dev/kmsg     0600 0 0 c 1 11
+dir  /dev/block    0755 0 0
+nod  /dev/block/sda10 0600 0 0 b 8 10
 dir  /proc         0755 0 0
 dir  /sys          0755 0 0
 file /kmsgmark     ubuntu-tab/boot-probes/kmsgmark 0755 0 0
