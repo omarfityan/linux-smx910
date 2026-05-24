@@ -2,21 +2,25 @@
 # via CONFIG_INITRAMFS_SOURCE=ubuntu-tab/boot-probes/initramfs.list.
 #
 #   kmsgfb    -- renders /dev/kmsg to the framebuffer (the observability renderer)
+#   kmsgmark  -- writes a 50x MAINLINE_PID1_REACHED marker to /dev/kmsg (PID-1 proof)
 #   fbpaint   -- floods the framebuffer one colour (first-userspace proof)
 #   idle-init -- ppoll-forever stub (minimal first-userspace proof)
 #
-# The committed `kmsgfb` binary is what the kernel build embeds; rebuild it here
-# when kmsgfb.c changes, then re-run the kernel build.
+# The binary referenced by initramfs.list is what the kernel build embeds;
+# rebuild it here when its .c changes, then re-run the kernel build.
 
 CROSS  ?= aarch64-linux-gnu-
 CFLAGS  = -ffreestanding -nostdlib -static -O2 -Wall -Wl,-e,_start
 
-PROBES = kmsgfb fbpaint idle-init
+PROBES = kmsgfb kmsgmark fbpaint idle-init
 
 all: $(PROBES)
 
 kmsgfb: kmsgfb.c font8x16.h
 	$(CROSS)gcc $(CFLAGS) kmsgfb.c -o $@
+
+kmsgmark: kmsgmark.c
+	$(CROSS)gcc $(CFLAGS) kmsgmark.c -o $@
 
 fbpaint: fbpaint.c
 	$(CROSS)gcc $(CFLAGS) fbpaint.c -o $@
