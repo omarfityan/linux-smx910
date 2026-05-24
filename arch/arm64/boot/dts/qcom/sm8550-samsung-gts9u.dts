@@ -740,6 +740,42 @@
 	status = "okay";
 };
 
+/* USB device-mode gadget: dwc3 peripheral over eUSB2 via the NXP PTN3222
+ * repeater on QUPv3-2 SE6 i2c (mainline exposes that SE as uart14; disable it
+ * and bring up i2c14). USB2/high-speed only -- no qmpphy/SuperSpeed. */
+&uart14 {
+	status = "disabled";
+};
+
+&i2c14 {
+	status = "okay";
+	clock-frequency = <400000>;
+
+	ptn3222: redriver@4f {
+		compatible = "nxp,ptn3222";
+		reg = <0x4f>;
+		#phy-cells = <0>;
+		vdd3v3-supply = <&vreg_l5b_3p1>;
+		vdd1v8-supply = <&vreg_l15b_1p8>;
+		reset-gpios = <&pm8550vs_d_gpios 4 GPIO_ACTIVE_LOW>;
+	};
+};
+
+&usb_1 {
+	status = "okay";
+	dr_mode = "peripheral";
+	phys = <&usb_1_hsphy>;
+	phy-names = "usb2-phy";
+	maximum-speed = "high-speed";
+};
+
+&usb_1_hsphy {
+	vdd-supply = <&vreg_l1e_0p88>;
+	vdda12-supply = <&vreg_l3e_1p2>;
+	phys = <&ptn3222>;
+	status = "okay";
+};
+
 &sleep_clk {
 	clock-frequency = <32764>;
 };

@@ -1,0 +1,72 @@
+#!/bin/busybox sh
+#
+# init -- first-userspace bring-up of a USB device-mode gadget on the mainline
+# kernel (SM-X910). Goal: a busybox shell on the gadget serial (ttyGS0) so the
+# running mainline kernel is reachable over USB from the host (screen/adb),
+# bypassing both the dark display and the ramoops-corruption read path.
+#
+# Every stage writes a "<1>INIT_..." marker to /dev/kmsg (KERN_ALERT, so it
+# rides into the panic crash-dump like the kmsgmark markers): if USB never
+# enumerates, the BCB watchdog (below) bounces the device into recovery (TWRP)
+# warm, and a ramoops read shows exactly how far init got.
+#
+# rdinit=/init ; BINFMT_SCRIPT runs this via /bin/busybox. All applets are
+# invoked explicitly as `/bin/busybox <applet>` (no symlink farm needed).
+
+BB=/bin/busybox
+mark() { $BB echo "<1>INIT_$1" > /dev/kmsg 2>/dev/null; }
+
+mark START
+
+# --- pseudo-filesystems (devtmpfs gives us /dev/ttyGS0, /dev/sda10, etc.) ---
+$BB mount -t proc     proc     /proc            2>/dev/null ; mark PROC
+$BB mount -t sysfs    sysfs    /sys             2>/dev/null ; mark SYS
+$BB mount -t devtmpfs devtmpfs /dev             2>/dev/null ; mark DEVTMPFS
+$BB mount -t configfs configfs /sys/kernel/config 2>/dev/null ; mark CONFIGFS
+
+# --- BCB watchdog: if USB never comes up, bounce to recovery warm for a read ---
+# (mainline UFS works now, so /dev/sda10 = the misc partition exists once probed)
+(
+	$BB sleep 150
+	mark WATCHDOG_BOUNCE
+	$BB dd if=/dev/zero of=/dev/sda10 bs=1 count=32 conv=notrunc 2>/dev/null
+	$BB printf 'boot-recovery' | $BB dd of=/dev/sda10 bs=1 conv=notrunc 2>/dev/null
+	$BB sync
+	mark WATCHDOG_REBOOT
+	$BB reboot -f
+) &
+
+# --- wait out the asynchronous dwc3 UDC probe (like the UFS probe race) ---
+i=0
+while [ -z "$($BB ls /sys/class/udc 2>/dev/null)" ]; do
+	i=$((i + 1))
+	[ "$i" -ge 75 ] && break
+	$BB sleep 0.2
+done
+UDC="$($BB ls /sys/class/udc 2>/dev/null | $BB head -1)"
+$BB echo "<1>INIT_UDC=[$UDC]" > /dev/kmsg
+
+# --- build the configfs ACM gadget (a serial -> /dev/ttyGS0) ---
+G=/sys/kernel/config/usb_gadget/g1
+$BB mkdir -p "$G/strings/0x409" "$G/functions/acm.usb0" "$G/configs/c.1/strings/0x409"
+mark GADGET_DIRS
+$BB echo 0x18d1            > "$G/idVendor"                         2>/dev/null
+$BB echo 0x4ee7            > "$G/idProduct"                        2>/dev/null
+$BB echo "ubuntu-tab"      > "$G/strings/0x409/manufacturer"       2>/dev/null
+$BB echo "mainline-gadget" > "$G/strings/0x409/product"            2>/dev/null
+$BB echo "0001"            > "$G/strings/0x409/serialnumber"       2>/dev/null
+$BB echo "acm"             > "$G/configs/c.1/strings/0x409/configuration" 2>/dev/null
+$BB ln -s "$G/functions/acm.usb0" "$G/configs/c.1/" 2>/dev/null
+mark ACM_LINKED
+$BB echo "$UDC" > "$G/UDC" 2>/dev/kmsg
+mark UDC_WRITTEN
+$BB echo "<1>INIT_GADGET_STATE=[$($BB cat "$G/state" 2>/dev/null)]" > /dev/kmsg
+mark SERVING_TTYGS0
+
+# --- serve an interactive shell on the gadget serial; respawn forever ---
+while true; do
+	if [ -e /dev/ttyGS0 ]; then
+		$BB setsid $BB sh </dev/ttyGS0 >/dev/ttyGS0 2>&1
+	fi
+	$BB sleep 1
+done
