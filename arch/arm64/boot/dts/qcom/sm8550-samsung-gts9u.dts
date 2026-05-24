@@ -89,14 +89,17 @@
 			stride = <(2960 * 4)>;
 			format = "a8r8g8b8";
 			/*
-			 * Disabled so simplefb does not bind and fbcon does not
-			 * contend for this scanout: the kmsgfb observability PID 1
-			 * paints 0xb8000000 directly via /dev/mem, and a second
-			 * framebuffer-console writer would garble that readout.
-			 * Power/clock backbone bring-up (the node under test) is
-			 * unaffected by this display-only node.
+			 * Enabled: simplefb binds this node and fbcon renders the
+			 * kernel console to the panel (the kmsgfb direct-paint PID 1
+			 * was removed, so there is no scanout contention). Enabling
+			 * it is ALSO a bet that the bootloader keeps the panel
+			 * powered when an enabled framebuffer node is present -- the
+			 * bootloader was observed powering the panel down ("Splash
+			 * region not found in device tree") shortly before the
+			 * kernel jump. Display-only: power/clock backbone bring-up
+			 * is unaffected by this node.
 			 */
-			status = "disabled";
+			status = "okay";
 		};
 	};
 
