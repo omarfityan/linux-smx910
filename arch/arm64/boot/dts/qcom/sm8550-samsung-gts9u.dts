@@ -89,17 +89,14 @@
 			stride = <(2960 * 4)>;
 			format = "a8r8g8b8";
 			/*
-			 * Enabled: simplefb binds this node and fbcon renders the
-			 * kernel console to the panel (the kmsgfb direct-paint PID 1
-			 * was removed, so there is no scanout contention). Enabling
-			 * it is ALSO a bet that the bootloader keeps the panel
-			 * powered when an enabled framebuffer node is present -- the
-			 * bootloader was observed powering the panel down ("Splash
-			 * region not found in device tree") shortly before the
-			 * kernel jump. Display-only: power/clock backbone bring-up
-			 * is unaffected by this node.
+			 * Disabled: enabling this node (so simplefb binds and drives
+			 * the panel) was tested and did NOT keep the panel alive --
+			 * the bootloader powers the panel down ("Splash region not
+			 * found in device tree") before the kernel jump regardless of
+			 * this node. Kept disabled so no simplefb probe runs during
+			 * boot (baseline; isolates simplefb as a boot-time variable).
 			 */
-			status = "okay";
+			status = "disabled";
 		};
 	};
 
@@ -210,9 +207,11 @@
 		};
 
 		/*
-		 * The bootloader keeps display hardware enabled only if
-		 * this region exists; named 'splash_region' (matches the
-		 * live stock resolved DT). MAP (framebuffer maps it).
+		 * The bootloader keeps display hardware enabled only if this
+		 * region exists; named 'splash_region' (matches the live stock
+		 * resolved DT). MAP: the stock DT carves it MAP. Making it no-map
+		 * (q5q-style) was tested and did NOT keep the panel alive, so it
+		 * is reverted to the stock MAP carveout (baseline).
 		 */
 		splash_region: splash-region@b8000000 {
 			reg = <0x0 0xb8000000 0x0 0x2b00000>;
