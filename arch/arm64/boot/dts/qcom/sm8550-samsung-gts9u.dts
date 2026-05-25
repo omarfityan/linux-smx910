@@ -312,6 +312,10 @@
 			regulator-min-microvolt = <3104000>;
 			regulator-max-microvolt = <3104000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			/* PTN3222 eUSB2 repeater vdd3v3: kept on with no driver
+			 * consumer (the repeater is brought up in hardware --
+			 * see the USB section). */
+			regulator-always-on;
 		};
 
 		vreg_l6b_1p8: ldo6 {
@@ -740,24 +744,29 @@
 	status = "okay";
 };
 
-/* USB device-mode gadget: dwc3 peripheral over eUSB2 via the NXP PTN3222
- * repeater on QUPv3-2 SE6 i2c (mainline exposes that SE as uart14; disable it
- * and bring up i2c14). USB2/high-speed only -- no qmpphy/SuperSpeed. */
-&uart14 {
-	status = "disabled";
-};
-
-&i2c14 {
-	status = "okay";
-	clock-frequency = <400000>;
-
-	ptn3222: redriver@4f {
-		compatible = "nxp,ptn3222";
-		reg = <0x4f>;
-		#phy-cells = <0>;
-		vdd3v3-supply = <&vreg_l5b_3p1>;
-		vdd1v8-supply = <&vreg_l15b_1p8>;
-		reset-gpios = <&pm8550vs_d_gpios 4 GPIO_ACTIVE_LOW>;
+/*
+ * USB device-mode gadget: dwc3 peripheral over eUSB2. USB2/high-speed only --
+ * no qmpphy/SuperSpeed.
+ *
+ * The NXP PTN3222 eUSB2 repeater conditions the 1.2V eUSB2 signal up to 3.3V
+ * USB2 for the connector, so it is electrically required. It sits on SE6 i2c
+ * (@898000) -- but that SE is firmware-provisioned as UART on this device, and
+ * mainline geni-i2c refuses to re-provision a non-blank SE ("Invalid proto 2"),
+ * so the i2c control path is unavailable. The mainline ptn3222 driver issues
+ * NO i2c transactions -- it only enables vdd3v3/vdd1v8 and deasserts the reset
+ * GPIO -- so the repeater is brought up purely in hardware here: its supplies
+ * are kept always-on (see vreg_l5b_3p1 below; vreg_l15b_1p8 is already
+ * always-on) and its active-low RESETN (pm8550vs_d gpio4) is held deasserted
+ * (driven high) by a gpio-hog. The eUSB2 phy then runs with no repeater
+ * sub-phy (phys=<&ptn3222> dropped; the snps-eusb2 driver treats the repeater
+ * as optional and no-ops phy_init on a NULL repeater).
+ */
+&pm8550vs_d_gpios {
+	ptn3222_reset_deassert: ptn3222-reset-hog {
+		gpio-hog;
+		gpios = <4 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "ptn3222-resetn-deassert";
 	};
 };
 
@@ -772,7 +781,6 @@
 &usb_1_hsphy {
 	vdd-supply = <&vreg_l1e_0p88>;
 	vdda12-supply = <&vreg_l3e_1p2>;
-	phys = <&ptn3222>;
 	status = "okay";
 };
 

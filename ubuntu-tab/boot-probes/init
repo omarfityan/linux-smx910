@@ -46,6 +46,19 @@ done
 UDC="$($BB ls /sys/class/udc 2>/dev/null | $BB head -1)"
 $BB echo "<1>INIT_UDC=[$UDC]" > /dev/kmsg
 
+# --- probe-state instrumentation: by now probes have settled, so this snapshot
+#     either confirms the i2c14/ptn3222 leaf came up (INIT_DEFER list empty, the
+#     ptn3222 phy present) or names the next deferring leaf. All rides the
+#     BCB-watchdog crash dump as <1> (KERN_ALERT) kmsg records. ---
+$BB mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null ; mark DEBUGFS
+$BB echo "<1>INIT_I2CDEV=[$($BB ls /sys/bus/i2c/devices/ 2>/dev/null)]" > /dev/kmsg
+$BB echo "<1>INIT_PHYS=[$($BB ls /sys/class/phy/ 2>/dev/null)]" > /dev/kmsg
+mark DEFER_BEGIN
+$BB cat /sys/kernel/debug/devices_deferred 2>/dev/null | while IFS= read -r dl; do
+	$BB echo "<1>INIT_DEFER:$dl" > /dev/kmsg
+done
+mark DEFER_END
+
 # --- build the configfs ACM gadget (a serial -> /dev/ttyGS0) ---
 G=/sys/kernel/config/usb_gadget/g1
 $BB mkdir -p "$G/strings/0x409" "$G/functions/acm.usb0" "$G/configs/c.1/strings/0x409"
