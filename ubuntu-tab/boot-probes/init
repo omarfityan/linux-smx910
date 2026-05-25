@@ -24,19 +24,10 @@ $BB mount -t sysfs    sysfs    /sys             2>/dev/null ; mark SYS
 $BB mount -t devtmpfs devtmpfs /dev             2>/dev/null ; mark DEVTMPFS
 $BB mount -t configfs configfs /sys/kernel/config 2>/dev/null ; mark CONFIGFS
 
-# --- BCB watchdog: if USB never comes up, bounce to recovery warm for a read ---
-# (mainline UFS works now, so /dev/sda10 = the misc partition exists once probed)
-(
-	$BB sleep 150
-	mark WATCHDOG_BOUNCE
-	$BB dd if=/dev/zero of=/dev/sda10 bs=1 count=32 conv=notrunc 2>/dev/null
-	$BB printf 'boot-recovery' | $BB dd of=/dev/sda10 bs=1 conv=notrunc 2>/dev/null
-	$BB sync
-	mark WATCHDOG_REBOOT
-	$BB reboot -f
-) &
-
 # --- wait out the asynchronous dwc3 UDC probe (like the UFS probe race) ---
+# Determine the UDC FIRST so the recovery watchdog can be CONDITIONAL: a
+# successful gadget (UDC present) is served indefinitely; only the failure
+# case (no UDC) arms the BCB bounce.
 i=0
 while [ -z "$($BB ls /sys/class/udc 2>/dev/null)" ]; do
 	i=$((i + 1))
@@ -45,6 +36,25 @@ while [ -z "$($BB ls /sys/class/udc 2>/dev/null)" ]; do
 done
 UDC="$($BB ls /sys/class/udc 2>/dev/null | $BB head -1)"
 $BB echo "<1>INIT_UDC=[$UDC]" > /dev/kmsg
+
+# --- CONDITIONAL BCB watchdog: arm ONLY on the failure case (no UDC), so the
+#     device auto-recovers to recovery (TWRP) warm and the probe-state dump can
+#     be read. On success we do NOT arm it -> the shell is served indefinitely
+#     (no 150 s bounce). (mainline UFS works, so /dev/sda10 = misc, once probed)
+if [ -z "$UDC" ]; then
+	mark NO_UDC_WATCHDOG_ARMED
+	(
+		$BB sleep 150
+		mark WATCHDOG_BOUNCE
+		$BB dd if=/dev/zero of=/dev/sda10 bs=1 count=32 conv=notrunc 2>/dev/null
+		$BB printf 'boot-recovery' | $BB dd of=/dev/sda10 bs=1 conv=notrunc 2>/dev/null
+		$BB sync
+		mark WATCHDOG_REBOOT
+		$BB reboot -f
+	) &
+else
+	mark UDC_PRESENT_WATCHDOG_DISARMED
+fi
 
 # --- probe-state instrumentation: by now probes have settled, so this snapshot
 #     either confirms the i2c14/ptn3222 leaf came up (INIT_DEFER list empty, the
@@ -77,9 +87,21 @@ $BB echo "<1>INIT_GADGET_STATE=[$($BB cat "$G/state" 2>/dev/null)]" > /dev/kmsg
 mark SERVING_TTYGS0
 
 # --- serve an interactive shell on the gadget serial; respawn forever ---
+# A bare `setsid sh </dev/ttyGS0 >/dev/ttyGS0` gives the shell NO controlling
+# tty (job control off) and re-opens the port per direction (DTR churn), so it
+# echoes input but never executes a command (perpetual PS2 "> "). Fix:
+#   (1) stty the port to sane canonical mode: icrnl (host CR ends a line),
+#       clocal (ignore carrier), -hupcl (no DTR drop between respawns);
+#   (2) open ttyGS0 read-write INSIDE the post-setsid child (`sh -c 'exec ...'`)
+#       so the ctty-less child acquires it as its controlling terminal on the
+#       open itself; cttyhack then makes that explicit (TIOCSCTTY) before exec.
+# This is busybox's documented "interactive shell from a boot script" idiom.
+SHELL_CTTY_SERVE='exec /bin/busybox cttyhack /bin/busybox sh <>/dev/ttyGS0 >&0 2>&1'
+mark SHELL_CTTY_SERVE_READY
 while true; do
 	if [ -e /dev/ttyGS0 ]; then
-		$BB setsid $BB sh </dev/ttyGS0 >/dev/ttyGS0 2>&1
+		$BB stty -F /dev/ttyGS0 sane clocal -hupcl 115200 2>/dev/null
+		$BB setsid $BB sh -c "$SHELL_CTTY_SERVE"
 	fi
 	$BB sleep 1
 done
