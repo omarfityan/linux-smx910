@@ -776,6 +776,16 @@
 	phys = <&usb_1_hsphy>;
 	phy-names = "usb2-phy";
 	maximum-speed = "high-speed";
+
+	/*
+	 * USB2/high-speed only -- no SuperSpeed QMP PHY, so nothing drives the
+	 * controller's PIPE clock. Without this, the DWC32 core soft reset
+	 * (DCTL.CSFTRST) never completes -- it blocks until all clock domains
+	 * synchronize, and the unfed PIPE domain never does -- so the controller
+	 * probe fails with -ETIMEDOUT. This makes the qcom glue feed the UTMI
+	 * clock into the PIPE domain instead, satisfying the reset.
+	 */
+	qcom,select-utmi-as-pipe-clk;
 };
 
 &usb_1_hsphy {
