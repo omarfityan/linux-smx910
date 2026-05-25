@@ -1,17 +1,22 @@
 #!/bin/busybox sh
 #
 # init -- first-userspace bring-up of a USB device-mode gadget on the mainline
-# kernel (SM-X910). Goal: a busybox shell on the gadget serial (ttyGS0) so the
-# running mainline kernel is reachable over USB from the host (screen/adb),
-# bypassing both the dark display and the ramoops-corruption read path.
+# kernel (SM-X910). Serves TWO host-visible channels over one USB gadget:
+#   (1) a busybox shell on the CDC-ACM serial (ttyGS0)  -- the proven fallback;
+#   (2) adbd over a FunctionFS function (ffs.adb)       -- the richer channel
+#       (adb shell / push / pull / multiple sessions), unauthenticated.
+# Both functions share one configuration (composite), so the host sees the
+# serial AND adb at once.
 #
 # Every stage writes a "<1>INIT_..." marker to /dev/kmsg (KERN_ALERT, so it
-# rides into the panic crash-dump like the kmsgmark markers): if USB never
-# enumerates, the BCB watchdog (below) bounces the device into recovery (TWRP)
-# warm, and a ramoops read shows exactly how far init got.
+# rides into any panic/recovery crash-dump). A recovery watchdog (below) is
+# armed early but bounces to recovery (TWRP) only if the success flag /serving
+# is never created -- so a genuine wedge auto-recovers while a healthy serve
+# stays up indefinitely.
 #
-# rdinit=/init ; BINFMT_SCRIPT runs this via /bin/busybox. All applets are
-# invoked explicitly as `/bin/busybox <applet>` (no symlink farm needed).
+# rdinit=/init ; BINFMT_SCRIPT runs this via /bin/busybox. Applets are invoked
+# explicitly as `/bin/busybox <applet>`; an applet symlink farm is also
+# installed into /bin so the served shells can use bare applet names.
 
 BB=/bin/busybox
 mark() { $BB echo "<1>INIT_$1" > /dev/kmsg 2>/dev/null; }
@@ -23,11 +28,35 @@ $BB mount -t proc     proc     /proc            2>/dev/null ; mark PROC
 $BB mount -t sysfs    sysfs    /sys             2>/dev/null ; mark SYS
 $BB mount -t devtmpfs devtmpfs /dev             2>/dev/null ; mark DEVTMPFS
 $BB mount -t configfs configfs /sys/kernel/config 2>/dev/null ; mark CONFIGFS
+# devpts: adbd's interactive `adb shell` allocates a PTY (openpty -> /dev/ptmx
+# master + /dev/pts/N slave); without devpts mounted the shell service closes
+# the connection. ptmxmode makes the slave usable by the (uid 2000) adb shell.
+$BB mkdir -p /dev/pts 2>/dev/null
+$BB mount -t devpts devpts /dev/pts -o ptmxmode=0666 2>/dev/null ; mark DEVPTS
+
+# --- applet symlink farm: makes bare `ls`/`cat`/... work in the served shells
+#     (both the ACM shell and any adb shell that inherits PATH=/bin). Idempotent
+#     and non-fatal. ---
+$BB --install -s /bin 2>/dev/null ; mark APPLET_FARM
+
+# --- recovery watchdog: armed EARLY (covers a hang anywhere in bring-up:
+#     UDC-wait, functionfs mount, adbd spawn, ep poll), but the BCB bounce is
+#     GATED on the success flag /serving. /serving is created only after the
+#     gadget is bound and the serve loop is about to run, so a healthy serve is
+#     never bounced; only a true wedge (no /serving within 150 s) recovers. ---
+(
+	$BB sleep 150
+	[ -f /serving ] && exit 0
+	mark WATCHDOG_BOUNCE
+	$BB dd if=/dev/zero of=/dev/sda10 bs=1 count=32 conv=notrunc 2>/dev/null
+	$BB printf 'boot-recovery' | $BB dd of=/dev/sda10 bs=1 conv=notrunc 2>/dev/null
+	$BB sync
+	mark WATCHDOG_REBOOT
+	$BB reboot -f
+) &
+mark WATCHDOG_ARMED_FLAG_GATED
 
 # --- wait out the asynchronous dwc3 UDC probe (like the UFS probe race) ---
-# Determine the UDC FIRST so the recovery watchdog can be CONDITIONAL: a
-# successful gadget (UDC present) is served indefinitely; only the failure
-# case (no UDC) arms the BCB bounce.
 i=0
 while [ -z "$($BB ls /sys/class/udc 2>/dev/null)" ]; do
 	i=$((i + 1))
@@ -37,29 +66,8 @@ done
 UDC="$($BB ls /sys/class/udc 2>/dev/null | $BB head -1)"
 $BB echo "<1>INIT_UDC=[$UDC]" > /dev/kmsg
 
-# --- CONDITIONAL BCB watchdog: arm ONLY on the failure case (no UDC), so the
-#     device auto-recovers to recovery (TWRP) warm and the probe-state dump can
-#     be read. On success we do NOT arm it -> the shell is served indefinitely
-#     (no 150 s bounce). (mainline UFS works, so /dev/sda10 = misc, once probed)
-if [ -z "$UDC" ]; then
-	mark NO_UDC_WATCHDOG_ARMED
-	(
-		$BB sleep 150
-		mark WATCHDOG_BOUNCE
-		$BB dd if=/dev/zero of=/dev/sda10 bs=1 count=32 conv=notrunc 2>/dev/null
-		$BB printf 'boot-recovery' | $BB dd of=/dev/sda10 bs=1 conv=notrunc 2>/dev/null
-		$BB sync
-		mark WATCHDOG_REBOOT
-		$BB reboot -f
-	) &
-else
-	mark UDC_PRESENT_WATCHDOG_DISARMED
-fi
-
-# --- probe-state instrumentation: by now probes have settled, so this snapshot
-#     either confirms the i2c14/ptn3222 leaf came up (INIT_DEFER list empty, the
-#     ptn3222 phy present) or names the next deferring leaf. All rides the
-#     BCB-watchdog crash dump as <1> (KERN_ALERT) kmsg records. ---
+# --- probe-state instrumentation: rides the recovery crash-dump as <1> kmsg
+#     records if the watchdog bounces. ---
 $BB mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null ; mark DEBUGFS
 $BB echo "<1>INIT_I2CDEV=[$($BB ls /sys/bus/i2c/devices/ 2>/dev/null)]" > /dev/kmsg
 $BB echo "<1>INIT_PHYS=[$($BB ls /sys/class/phy/ 2>/dev/null)]" > /dev/kmsg
@@ -69,7 +77,9 @@ $BB cat /sys/kernel/debug/devices_deferred 2>/dev/null | while IFS= read -r dl; 
 done
 mark DEFER_END
 
-# --- build the configfs ACM gadget (a serial -> /dev/ttyGS0) ---
+# --- build the configfs gadget skeleton (functions + one config), but do NOT
+#     link functions or write UDC yet (bind only after the ffs function is
+#     ready, so a half-configured ffs.adb can't block the whole gadget). ---
 G=/sys/kernel/config/usb_gadget/g1
 $BB mkdir -p "$G/strings/0x409" "$G/functions/acm.usb0" "$G/configs/c.1/strings/0x409"
 mark GADGET_DIRS
@@ -78,24 +88,74 @@ $BB echo 0x4ee7            > "$G/idProduct"                        2>/dev/null
 $BB echo "ubuntu-tab"      > "$G/strings/0x409/manufacturer"       2>/dev/null
 $BB echo "mainline-gadget" > "$G/strings/0x409/product"            2>/dev/null
 $BB echo "0001"            > "$G/strings/0x409/serialnumber"       2>/dev/null
-$BB echo "acm"             > "$G/configs/c.1/strings/0x409/configuration" 2>/dev/null
+$BB echo "acm+adb"         > "$G/configs/c.1/strings/0x409/configuration" 2>/dev/null
+
+# --- ffs.adb function: the mkdir is what lazily registers the "functionfs"
+#     filesystem (the kernel registers it on the first ffs.* function created
+#     in configfs), so it MUST precede the functionfs mount. The mount source
+#     name "adb" must match the ffs.<name> instance. Mount it owned by uid/gid
+#     2000 so ep0 is openable whether adbd runs as root (insecure mode, the
+#     expected case) or drops to shell. ---
+$BB mkdir "$G/functions/ffs.adb" 2>/dev/null ; mark FFS_FUNC_CREATED
+$BB mkdir -p /dev/usb-ffs/adb
+$BB mount -t functionfs adb /dev/usb-ffs/adb -o uid=2000,gid=2000 2>/dev/kmsg ; mark FFS_MOUNTED
+
+# --- start the SELinux-free Linux adbd (Debian android-tools-adbd 5.1.1). It
+#     opens /dev/usb-ffs/adb/ep0 and writes the FFS descriptors; the kernel then
+#     creates ep1/ep2. Runs unauthenticated as root (ro.secure unset => insecure
+#     mode), spawns /bin/sh. No SELinux/property-service/uid-drop coupling (the
+#     reason it replaced the Android-12 adbd). LD_LIBRARY_PATH points the glibc
+#     linker at the bundled closure under /lib; PATH lets the adb shell find the
+#     applet farm. ---
+LD_LIBRARY_PATH=/lib PATH=/bin:/sbin HOME=/ \
+	/sbin/adbd </dev/null >/adbd.log 2>&1 &
+mark ADBD_STARTED
+
+# --- readiness gate (the no-property-service equivalent of sys.usb.ffs.ready):
+#     ep1 AND ep2 appear only once adbd has written valid descriptors. ---
+adb_ready=0
+j=0
+while [ "$j" -lt 50 ]; do
+	if [ -e /dev/usb-ffs/adb/ep1 ] && [ -e /dev/usb-ffs/adb/ep2 ]; then
+		adb_ready=1 ; break
+	fi
+	j=$((j + 1))
+	$BB sleep 0.2
+done
+
+# --- link functions into the single config, then bind. acm is always linked
+#     (the fallback shell); ffs.adb is linked only if adbd readied it. The bind
+#     is self-healing: if the composite (acm+adb) bind fails (e.g. the ffs
+#     function is momentarily inactive), drop adb and bind acm-only so the
+#     serial shell always comes up. ---
 $BB ln -s "$G/functions/acm.usb0" "$G/configs/c.1/" 2>/dev/null
-mark ACM_LINKED
-$BB echo "$UDC" > "$G/UDC" 2>/dev/kmsg
+if [ "$adb_ready" = 1 ]; then
+	$BB ln -s "$G/functions/ffs.adb" "$G/configs/c.1/" 2>/dev/null
+	if $BB echo "$UDC" > "$G/UDC" 2>/dev/kmsg; then
+		mark ADB_LINKED_COMPOSITE
+	else
+		$BB rm -f "$G/configs/c.1/ffs.adb"
+		$BB echo "$UDC" > "$G/UDC" 2>/dev/kmsg
+		mark ADB_BIND_FAILED_ACM_ONLY
+	fi
+else
+	$BB echo "$UDC" > "$G/UDC" 2>/dev/kmsg
+	mark ADB_TIMEOUT_ACM_ONLY
+fi
 mark UDC_WRITTEN
 $BB echo "<1>INIT_GADGET_STATE=[$($BB cat "$G/state" 2>/dev/null)]" > /dev/kmsg
-mark SERVING_TTYGS0
+
+# --- success: disarm the watchdog bounce and serve. ---
+$BB touch /serving
+mark SERVING_FLAG_SET
 
 # --- serve an interactive shell on the gadget serial; respawn forever ---
-# A bare `setsid sh </dev/ttyGS0 >/dev/ttyGS0` gives the shell NO controlling
-# tty (job control off) and re-opens the port per direction (DTR churn), so it
-# echoes input but never executes a command (perpetual PS2 "> "). Fix:
-#   (1) stty the port to sane canonical mode: icrnl (host CR ends a line),
-#       clocal (ignore carrier), -hupcl (no DTR drop between respawns);
-#   (2) open ttyGS0 read-write INSIDE the post-setsid child (`sh -c 'exec ...'`)
-#       so the ctty-less child acquires it as its controlling terminal on the
-#       open itself; cttyhack then makes that explicit (TIOCSCTTY) before exec.
-# This is busybox's documented "interactive shell from a boot script" idiom.
+# Give the shell a controlling tty + sane line discipline: stty sane (icrnl so
+# a host CR ends a line), clocal (ignore carrier), -hupcl (no DTR churn between
+# respawns); then open ttyGS0 read-write INSIDE the post-setsid child so the
+# ctty-less child acquires it as its controlling terminal on the open itself,
+# and cttyhack makes that explicit (TIOCSCTTY) before exec. busybox's
+# documented "interactive shell from a boot script" idiom.
 SHELL_CTTY_SERVE='exec /bin/busybox cttyhack /bin/busybox sh <>/dev/ttyGS0 >&0 2>&1'
 mark SHELL_CTTY_SERVE_READY
 while true; do
