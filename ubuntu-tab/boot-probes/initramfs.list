@@ -3,10 +3,17 @@
 # cpio at compile time -- INCLUDING the device nodes -- without needing root or
 # fakeroot. Paths in `file` lines are relative to the kernel source root.
 #
-# Build-2 (USB gadget): /init (busybox sh script, rdinit=/init) brings up a
-# configfs ACM gadget on ttyGS0. /dev/console + /dev/kmsg are static nodes
-# needed before /init mounts devtmpfs over /dev (which then provides ttyGS0,
-# sda10, etc.). /kmsgmark is kept as a fallback PID-1 probe (select via rdinit).
+# /init (busybox sh script, rdinit=/init) brings up a composite configfs gadget:
+# a CDC-ACM serial shell on ttyGS0 PLUS adbd over a FunctionFS function. adbd is
+# a SELinux-free Linux adbd (Debian android-tools-adbd, AOSP 5.1.1) at /sbin/adbd
+# with its glibc shared-library closure under /lib; it runs unauthenticated as
+# root (ro.secure unset => insecure), spawns /bin/sh (a symlink to the static
+# busybox), and uses the FunctionFS transport at /dev/usb-ffs/adb -- no SELinux,
+# no Android property service, no uid-drop (unlike the Android-12 adbd, whose
+# shell needed a SELinux context and whose push needed root). /dev/console +
+# /dev/kmsg are static nodes needed before /init mounts devtmpfs over /dev (which
+# then provides ttyGS0, sda10, etc.; the FFS mountpoint /dev/usb-ffs/adb is
+# created by /init at runtime on that devtmpfs). /kmsgmark is a fallback PID-1 probe.
 dir  /dev          0755 0 0
 nod  /dev/console  0600 0 0 c 5 1
 nod  /dev/kmsg     0600 0 0 c 1 11
@@ -20,3 +27,17 @@ dir  /bin          0755 0 0
 file /bin/busybox  ubuntu-tab/boot-probes/busybox 0755 0 0
 file /init         ubuntu-tab/boot-probes/init 0755 0 0
 file /kmsgmark     ubuntu-tab/boot-probes/kmsgmark 0755 0 0
+# --- adbd: SELinux-free Linux adbd (Debian android-tools-adbd 5.1.1) + glibc closure ---
+dir   /sbin          0755 0 0
+file  /sbin/adbd     ubuntu-tab/boot-probes/linux-adbd/adbd 0755 0 0
+slink /bin/sh        /bin/busybox 0755 0 0
+dir   /lib           0755 0 0
+file  /lib/ld-linux-aarch64.so.1 ubuntu-tab/boot-probes/linux-adbd/lib/ld-linux-aarch64.so.1 0755 0 0
+file  /lib/libc.so.6        ubuntu-tab/boot-probes/linux-adbd/lib/libc.so.6        0644 0 0
+file  /lib/libpthread.so.0  ubuntu-tab/boot-probes/linux-adbd/lib/libpthread.so.0  0644 0 0
+file  /lib/libdl.so.2       ubuntu-tab/boot-probes/linux-adbd/lib/libdl.so.2       0644 0 0
+file  /lib/libresolv.so.2   ubuntu-tab/boot-probes/linux-adbd/lib/libresolv.so.2   0644 0 0
+file  /lib/librt.so.1       ubuntu-tab/boot-probes/linux-adbd/lib/librt.so.1       0644 0 0
+file  /lib/libbsd.so.0      ubuntu-tab/boot-probes/linux-adbd/lib/libbsd.so.0      0644 0 0
+file  /lib/libpcre.so.3     ubuntu-tab/boot-probes/linux-adbd/lib/libpcre.so.3     0644 0 0
+file  /lib/libcrypto.so.1.1 ubuntu-tab/boot-probes/linux-adbd/lib/libcrypto.so.1.1 0644 0 0
