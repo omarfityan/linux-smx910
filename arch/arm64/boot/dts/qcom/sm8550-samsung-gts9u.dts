@@ -674,9 +674,54 @@
 	};
 };
 
-/* Display clock controller disabled (splash-FB only; q5q pattern). */
+/*
+ * Display clock controller. The DP/qmpphy parent clocks it lists resolve as
+ * harmless lazy orphans on this USB2-only board (the DP RCGs are never
+ * enabled); the dispcc probe configures only the two display PLLs + the XO,
+ * so enabling it without usb_dp_qmpphy is safe.
+ */
 &dispcc {
-	status = "disabled";
+	status = "okay";
+};
+
+/*
+ * Native MIPI-DSI display bring-up. The DPU (mdss_mdp) auto-enables with its
+ * &mdss parent; mdss_dp0 stays disabled (no DisplayPort on this USB2-only
+ * board). The panel is a direct command-mode AMOLED (Anapass ANA38407 DDIC,
+ * Samsung AMSA46AS02 module) on DSI0 lane 0-3. Until its driver
+ * (panel-samsung-ana38407-amsa46as02) is loaded, the DSI component defers
+ * cleanly on the unbound panel device; the driver then completes the pipeline.
+ */
+&mdss {
+	status = "okay";
+};
+
+&mdss_dsi0 {
+	vdda-supply = <&vreg_l3e_1p2>;
+	status = "okay";
+
+	panel@0 {
+		compatible = "samsung,ana38407-amsa46as02";
+		reg = <0>;
+
+		reset-gpios = <&tlmm 125 GPIO_ACTIVE_LOW>;
+
+		port {
+			panel0_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel0_in>;
+	data-lanes = <0 1 2 3>;
+};
+
+&mdss_dsi0_phy {
+	vdds-supply = <&vreg_l1e_0p88>;
+	status = "okay";
 };
 
 &pm8550_gpios {
