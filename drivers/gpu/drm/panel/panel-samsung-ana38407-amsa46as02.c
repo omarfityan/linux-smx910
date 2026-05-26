@@ -7,8 +7,9 @@
  * Anapass ANA38407; the module is Samsung AMSA46AS02. Structural pattern from
  * panel-novatek-nt37801.c (command-mode + DSC + driver-side
  * mipi_dsi_picture_parameter_set) and the Samsung level-key idiom from
- * panel-samsung-s6e3ha8.c. The init sequence is adapted from the downstream
- * vendor device tree and the ANA38407 sister panel.
+ * panel-samsung-s6e3ha8.c. The power-on sequence is transcribed from this
+ * device's own downstream Panel Data File (GTS9U_ANA38407_AMSA46AS02); the
+ * sub-table names below (VBP_SETTING etc.) cross-reference that source.
  *
  * Copyright (c) 2026, ubuntu-tab project.
  */
@@ -76,16 +77,47 @@ static int ana38407_on(struct ana38407 *ctx)
 {
 	struct mipi_dsi_device *dsi = ctx->dsi;
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
+	struct drm_dsc_picture_parameter_set pps;
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
+	/* VBP_SETTING_FOR_SDC_IP */
+	ana38407_unlock_lvl0(&dsi_ctx);
+	ana38407_unlock_lvl1(&dsi_ctx);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x0a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0,
+				     0x0f, 0x00, 0x00, 0x00, 0x09, 0xfd, 0x81);
+	ana38407_lock_lvl0(&dsi_ctx);
+	ana38407_lock_lvl1(&dsi_ctx);
+
+	/* DISPLAY_ON_DELAY_SETTING */
+	ana38407_unlock_lvl0(&dsi_ctx);
+	ana38407_unlock_lvl1(&dsi_ctx);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x23);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0,
+				     0x0f, 0x00, 0x00, 0x00, 0x01, 0x04, 0x81);
+	ana38407_lock_lvl0(&dsi_ctx);
+	ana38407_lock_lvl1(&dsi_ctx);
+
+	/* Sleep-out, then the mandatory >=120 ms settle. */
 	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
 	mipi_dsi_msleep(&dsi_ctx, 120);
 
-	/* TCON interrupt / timing setup (vendor registers, behind the keys). */
+	/* MX_IP_ENABLE */
 	ana38407_unlock_lvl0(&dsi_ctx);
 	ana38407_unlock_lvl1(&dsi_ctx);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x23);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0,
+				     0x0f, 0x00, 0x00, 0x00, 0x09, 0xb2, 0x81);
+	ana38407_lock_lvl0(&dsi_ctx);
+	ana38407_lock_lvl1(&dsi_ctx);
 
+	/* TCON_INTR_SETTING (0xc1 0x02 = TE active-low, per the device source). */
+	ana38407_unlock_lvl0(&dsi_ctx);
+	ana38407_unlock_lvl1(&dsi_ctx);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x02);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0,
@@ -98,18 +130,59 @@ static int ana38407_on(struct ana38407 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0,
 				     0x0f, 0x00, 0x00, 0x00, 0x09, 0xcd, 0x81);
-
+	ana38407_lock_lvl0(&dsi_ctx);
 	ana38407_lock_lvl1(&dsi_ctx);
+
+	/* UPIM_SSCG_SETTING is rev-BtoB only; this module is rev A. */
+
+	/* TE_ON (hardware TE, VBLANK). */
+	ana38407_unlock_lvl0(&dsi_ctx);
+	mipi_dsi_dcs_set_tear_on_multi(&dsi_ctx, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
 	ana38407_lock_lvl0(&dsi_ctx);
 
-	/* Tearing-effect signal on (hardware TE, VBLANK). */
-	mipi_dsi_dcs_set_tear_on_multi(&dsi_ctx, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
+	/* TSP_SYNC_ON (rev A). */
+	ana38407_unlock_lvl0(&dsi_ctx);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0b, 0xb9);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0xcc);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0e, 0xb9);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x15);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x10, 0xb9);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x88, 0x88, 0x88, 0x88);
+	ana38407_lock_lvl0(&dsi_ctx);
 
-	/* Display brightness control on + a visible level (12-bit). */
+	/*
+	 * DSC_SETTING: enable compression, then send the PPS (the device order;
+	 * standard DSI 0x07 + 0x0A transport). The msm host fills ctx->dsc
+	 * before prepare() (prepare_prev_first), so the packed PPS is complete.
+	 * Bring-up: dump it to verify it matches the device's 88-byte PPS.
+	 */
+	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
+	print_hex_dump(KERN_INFO, "ana38407 pps: ", DUMP_PREFIX_OFFSET, 16, 1,
+		       &pps, sizeof(pps), false);
+	ana38407_unlock_lvl0(&dsi_ctx);
+	mipi_dsi_compression_mode_multi(&dsi_ctx, true);
+	mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
+	ana38407_lock_lvl0(&dsi_ctx);
+
+	/* DIA_SETTING (DIA on). */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x91, 0x02);
+
+	/* Brightness: control-display on + a fixed visible level (gamma deferred). */
+	ana38407_unlock_lvl0(&dsi_ctx);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
 				     0x20);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
 				     0x0f, 0xff);
+	ana38407_lock_lvl0(&dsi_ctx);
+
+	/* SP_SETTING */
+	ana38407_unlock_lvl0(&dsi_ctx);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc3, 0x02);
+	ana38407_lock_lvl0(&dsi_ctx);
+
+	mipi_dsi_msleep(&dsi_ctx, 50);
+
+	/* VRR_SETTING deferred: fixed 60 Hz uses the DDIC default rate. */
 
 	return dsi_ctx.accum_err;
 }
@@ -117,8 +190,6 @@ static int ana38407_on(struct ana38407 *ctx)
 static int ana38407_prepare(struct drm_panel *panel)
 {
 	struct ana38407 *ctx = to_ana38407(panel);
-	struct device *dev = &ctx->dsi->dev;
-	struct drm_dsc_picture_parameter_set pps;
 	int ret;
 
 	ret = regulator_bulk_enable(ARRAY_SIZE(ana38407_supplies),
@@ -129,33 +200,14 @@ static int ana38407_prepare(struct drm_panel *panel)
 	ana38407_reset(ctx);
 
 	ret = ana38407_on(ctx);
-	if (ret < 0)
-		goto err;
-
-	/* Driver-side PPS: this DDIC carries no_qcom_pps, so the panel sends it. */
-	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
-
-	ret = mipi_dsi_picture_parameter_set(ctx->dsi, &pps);
 	if (ret < 0) {
-		dev_err(dev, "failed to transmit PPS: %d\n", ret);
-		goto err;
+		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+		regulator_bulk_disable(ARRAY_SIZE(ana38407_supplies),
+				       ctx->supplies);
+		return ret;
 	}
-
-	ret = mipi_dsi_compression_mode(ctx->dsi, true);
-	if (ret < 0) {
-		dev_err(dev, "failed to enable compression mode: %d\n", ret);
-		goto err;
-	}
-
-	msleep(28);
 
 	return 0;
-
-err:
-	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	regulator_bulk_disable(ARRAY_SIZE(ana38407_supplies), ctx->supplies);
-
-	return ret;
 }
 
 static int ana38407_enable(struct drm_panel *panel)
@@ -163,7 +215,10 @@ static int ana38407_enable(struct drm_panel *panel)
 	struct ana38407 *ctx = to_ana38407(panel);
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
 
+	/* POWER_ON_POST_SETTING: display-on behind the level-2 key. */
+	ana38407_unlock_lvl0(&dsi_ctx);
 	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
+	ana38407_lock_lvl0(&dsi_ctx);
 
 	return dsi_ctx.accum_err;
 }
