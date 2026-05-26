@@ -736,6 +736,18 @@ config DRM_PANEL_SAMSUNG_AMS639RQ08
 	  Say Y or M here if you want to enable support for the
 	  Samsung AMS639RQ08 FHD Plus (2340x1080@60Hz) CMD mode panel.
 
+config DRM_PANEL_SAMSUNG_ANA38407_AMSA46AS02
+	tristate "Samsung AMSA46AS02 panel with Anapass ANA38407 DDIC"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	select DRM_DISPLAY_DSC_HELPER
+	select DRM_DISPLAY_HELPER
+	help
+	  Say Y or M here to enable support for the Samsung AMSA46AS02
+	  command-mode AMOLED panel (Anapass ANA38407 DDIC) as fitted to
+	  the Samsung Galaxy Tab S9 Ultra (SM-X910): 2960x1848, 4-lane
+	  MIPI-DSI, DSC v1.1 with driver-side PPS.
+
 config DRM_PANEL_SAMSUNG_S6E88A0_AMS427AP24
 	tristate "Samsung AMS427AP24 panel with S6E88A0 controller"
 	depends on GPIOLIB && OF && REGULATOR

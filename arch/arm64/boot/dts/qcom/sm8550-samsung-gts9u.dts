@@ -353,11 +353,21 @@
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
+		/*
+		 * Candidate panel VDDIO (1.8V) / VCI (3.0V) rails. The panel
+		 * node is wired to panel_ldo_en (the only rail the downstream
+		 * device tree software-controls for the panel); these two are
+		 * kept always-on as a DEFENSIVE GUESS for the panel's I/O /
+		 * analog rails, pending schematic confirmation. Drop the
+		 * always-on flags one at a time after first light to identify
+		 * which (if any) is actually load-bearing.
+		 */
 		vreg_l12b_1p8: ldo12 {
 			regulator-name = "vreg_l12b_1p8";
 			regulator-min-microvolt = <1800000>;
 			regulator-max-microvolt = <1800000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-always-on;
 		};
 
 		vreg_l13b_3p0: ldo13 {
@@ -365,6 +375,7 @@
 			regulator-min-microvolt = <3000000>;
 			regulator-max-microvolt = <3000000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-always-on;
 		};
 
 		vreg_l14b_3p2: ldo14 {
@@ -703,6 +714,17 @@
 	panel@0 {
 		compatible = "samsung,ana38407-amsa46as02";
 		reg = <0>;
+
+		/*
+		 * Single GPIO-gated panel-power rail (panel_ldo_en, &tlmm 187,
+		 * boot-on): it enables the discrete panel-power IC that produces
+		 * the panel's VCI/VDDIO/VSP/VSN. This is the only software-
+		 * controlled supply the downstream device tree declares for the
+		 * panel. (vreg_l12b_1p8 / vreg_l13b_3p0 are kept always-on below
+		 * as a defensive guess for the panel's I/O / analog rails,
+		 * pending schematic confirmation.)
+		 */
+		power-supply = <&panel_ldo_en>;
 
 		reset-gpios = <&tlmm 125 GPIO_ACTIVE_LOW>;
 
