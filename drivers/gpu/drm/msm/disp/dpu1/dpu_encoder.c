@@ -1965,7 +1965,7 @@ int dpu_encoder_vsync_time(struct drm_encoder *drm_enc, ktime_t *wakeup_time)
 
 static u32
 dpu_encoder_dsc_initial_line_calc(struct drm_dsc_config *dsc,
-				  u32 enc_ip_width)
+				  u32 enc_ip_width, int dsc_common_mode)
 {
 	int ssm_delay, total_pixels, soft_slice_per_enc;
 
@@ -1985,6 +1985,11 @@ dpu_encoder_dsc_initial_line_calc(struct drm_dsc_config *dsc,
 	total_pixels = ssm_delay * 3 + dsc->initial_xmit_delay + 47;
 	if (soft_slice_per_enc > 1)
 		total_pixels += (ssm_delay * 3);
+	/* dsc-merge (split-panel + multiplex) needs an extra one-chunk multi-HS first-line budget, else the first slice line under-runs */
+	if ((dsc_common_mode & DSC_MODE_SPLIT_PANEL) &&
+	    (dsc_common_mode & DSC_MODE_MULTIPLEX))
+		total_pixels += DIV_ROUND_UP(8 * dsc->slice_chunk_size,
+					     dsc->bits_per_pixel >> 4);
 	return DIV_ROUND_UP(total_pixels, dsc->slice_width);
 }
 
@@ -2053,7 +2058,10 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
 	intf_ip_w = this_frame_slices * dsc->slice_width;
 
 	enc_ip_w = intf_ip_w / num_dsc;
-	initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, enc_ip_w);
+	initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, enc_ip_w,
+							  dsc_common_mode);
+	DPU_DEBUG_ENC(dpu_enc, "dsc initial_lines=%u common_mode=0x%x\n",
+		      initial_lines, dsc_common_mode);
 
 	for (i = 0; i < num_dsc; i++)
 		dpu_encoder_dsc_pipe_cfg(ctl, hw_dsc[i], hw_pp[i],
