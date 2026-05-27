@@ -40,6 +40,8 @@
 #define DEFAULT_TEARCHECK_SYNC_THRESH_CONTINUE	4
 
 static void dpu_encoder_phys_cmd_enable_te(struct dpu_encoder_phys *phys_enc);
+static int dpu_encoder_phys_cmd_control_vblank_irq(struct dpu_encoder_phys *phys_enc,
+		bool enable);
 
 static bool dpu_encoder_phys_cmd_is_master(struct dpu_encoder_phys *phys_enc)
 {
@@ -200,8 +202,8 @@ static int _dpu_encoder_phys_cmd_handle_ppdone_timeout(
 			  cmd_enc->pp_timeout_report_cnt,
 			  atomic_read(&phys_enc->pending_kickoff_cnt));
 		msm_disp_snapshot_state(drm_enc->dev);
-		dpu_core_irq_unregister_callback(phys_enc->dpu_kms,
-				phys_enc->irq[INTR_IDX_RDPTR]);
+		/* balance the rd_ptr teardown so vblank_refcount stays consistent and the IRQ re-arms */
+		dpu_encoder_phys_cmd_control_vblank_irq(phys_enc, false);
 	}
 
 	atomic_add_unless(&phys_enc->pending_kickoff_cnt, -1, 0);
