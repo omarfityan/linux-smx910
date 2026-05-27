@@ -387,7 +387,8 @@ static void dpu_encoder_phys_cmd_tearcheck_config(
 	 * Set the sync_cfg_height to twice vtotal so that if we lose a
 	 * TE event coming from the display TE pin we won't stall immediately
 	 */
-	tc_cfg.hw_vsync_mode = 1;
+	/* defer external-TE (BIT20) to the post-kickoff connect_external_te() to avoid a premature-autorefresh glitch */
+	tc_cfg.hw_vsync_mode = 0;
 	tc_cfg.sync_cfg_height = mode->vtotal * 2;
 	tc_cfg.vsync_init_val = mode->vdisplay;
 	tc_cfg.sync_threshold_start = DEFAULT_TEARCHECK_SYNC_THRESH_START;
