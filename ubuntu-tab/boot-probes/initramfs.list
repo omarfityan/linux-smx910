@@ -31,6 +31,8 @@ file /kmsgmark     ubuntu-tab/boot-probes/kmsgmark 0755 0 0
 dir   /sbin          0755 0 0
 file  /sbin/adbd     ubuntu-tab/boot-probes/linux-adbd/adbd 0755 0 0
 slink /bin/sh        /bin/busybox 0755 0 0
+# rootsh: setuid-root (4755) re-exec shim -> `adb shell` (uid 2000) then `rootsh` = a root shell over adb (adbd drops the shell to AID_SHELL; no property service for `adb root`). Dormant at boot; serial-root stays the fallback.
+file  /bin/rootsh    ubuntu-tab/boot-probes/rootsh 4755 0 0
 dir   /lib           0755 0 0
 file  /lib/ld-linux-aarch64.so.1 ubuntu-tab/boot-probes/linux-adbd/lib/ld-linux-aarch64.so.1 0755 0 0
 file  /lib/libc.so.6        ubuntu-tab/boot-probes/linux-adbd/lib/libc.so.6        0644 0 0
