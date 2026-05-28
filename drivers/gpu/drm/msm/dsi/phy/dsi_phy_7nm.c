@@ -981,6 +981,20 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
 		return -EINVAL;
 	}
 
+	/* gts9u: install the device's own DT D-PHY timings; mainline's computed values undershoot the clock-lane settle (clk_zero/clk_pre), making the first-HS-burst CDR margin content-dependently tight */
+	if (!phy->cphy_mode) {
+		timing->clk_zero    = 53;
+		timing->clk_prepare = 13;
+		timing->clk_trail   = 13;
+		timing->hs_exit     = 31;
+		timing->hs_zero     = 39;
+		timing->hs_prepare  = 13;
+		timing->hs_trail    = 13;
+		timing->hs_rqst     = 12;
+		timing->shared_timings.clk_pre  = 42;
+		timing->shared_timings.clk_post = 18;
+	}
+
 	if (dsi_phy_hw_v4_0_is_pll_on(phy))
 		pr_warn("PLL turned on before configuring PHY\n");
 
