@@ -215,8 +215,6 @@ struct dpu_encoder_virt {
 
 	/* DSC configuration */
 	struct drm_dsc_config *dsc;
-	/* program DSC once per enable: per-kickoff re-flush state-bleeds the first slice */
-	bool dsc_setup_done;
 };
 
 #define to_dpu_encoder_virt(x) container_of(x, struct dpu_encoder_virt, base)
@@ -1345,7 +1343,6 @@ static void dpu_encoder_virt_atomic_enable(struct drm_encoder *drm_enc,
 
 	dpu_enc = to_dpu_encoder_virt(drm_enc);
 	dpu_enc->dsc = dpu_encoder_get_dsc_config(drm_enc);
-	dpu_enc->dsc_setup_done = false;
 
 	atomic_set(&dpu_enc->frame_done_timeout_cnt, 0);
 
@@ -2110,10 +2107,8 @@ void dpu_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc)
 		}
 	}
 
-	if (dpu_enc->dsc && !dpu_enc->dsc_setup_done) {
+	if (dpu_enc->dsc)
 		dpu_encoder_prep_dsc(dpu_enc, dpu_enc->dsc);
-		dpu_enc->dsc_setup_done = true;
-	}
 }
 
 /**
