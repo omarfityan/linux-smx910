@@ -215,7 +215,6 @@ struct dpu_encoder_virt {
 
 	/* DSC configuration */
 	struct drm_dsc_config *dsc;
-	bool dsc_programmed;	/* DSC programmed for this enable epoch: program the engine once (downstream-style), then re-flush only on later kickoffs (keeps the per-frame CTL_DSC_FLUSH / commit-done wait, without re-writing the engine each frame) */
 };
 
 #define to_dpu_encoder_virt(x) container_of(x, struct dpu_encoder_virt, base)
@@ -1344,7 +1343,6 @@ static void dpu_encoder_virt_atomic_enable(struct drm_encoder *drm_enc,
 
 	dpu_enc = to_dpu_encoder_virt(drm_enc);
 	dpu_enc->dsc = dpu_encoder_get_dsc_config(drm_enc);
-	dpu_enc->dsc_programmed = false;	/* fresh enable epoch: program the DSC once on the next kickoff, then re-flush only */
 
 	atomic_set(&dpu_enc->frame_done_timeout_cnt, 0);
 
@@ -2000,34 +1998,22 @@ static void dpu_encoder_dsc_pipe_cfg(struct dpu_hw_ctl *ctl,
 				     struct dpu_hw_pingpong *hw_pp,
 				     struct drm_dsc_config *dsc,
 				     u32 common_mode,
-				     u32 initial_lines,
-				     bool program)
+				     u32 initial_lines)
 {
-	/*
-	 * Program the DSC engine registers only once per enable epoch
-	 * (mirroring the device's downstream "program once, free-run"
-	 * cadence); on later kickoffs re-flush the unchanged config but do
-	 * not re-write the engine.  The per-frame register re-write is the
-	 * only per-frame DSC engine perturbation mainline has that downstream
-	 * does not; keeping the per-frame CTL_DSC_FLUSH preserves mainline's
-	 * commit-done wait (so this does not regress commit latency).
-	 */
-	if (program) {
-		if (hw_dsc->ops.dsc_config)
-			hw_dsc->ops.dsc_config(hw_dsc, dsc, common_mode, initial_lines);
+	if (hw_dsc->ops.dsc_config)
+		hw_dsc->ops.dsc_config(hw_dsc, dsc, common_mode, initial_lines);
 
-		if (hw_dsc->ops.dsc_config_thresh)
-			hw_dsc->ops.dsc_config_thresh(hw_dsc, dsc);
+	if (hw_dsc->ops.dsc_config_thresh)
+		hw_dsc->ops.dsc_config_thresh(hw_dsc, dsc);
 
-		if (hw_pp->ops.setup_dsc)
-			hw_pp->ops.setup_dsc(hw_pp);
+	if (hw_pp->ops.setup_dsc)
+		hw_pp->ops.setup_dsc(hw_pp);
 
-		if (hw_dsc->ops.dsc_bind_pingpong_blk)
-			hw_dsc->ops.dsc_bind_pingpong_blk(hw_dsc, hw_pp->idx);
+	if (hw_dsc->ops.dsc_bind_pingpong_blk)
+		hw_dsc->ops.dsc_bind_pingpong_blk(hw_dsc, hw_pp->idx);
 
-		if (hw_pp->ops.enable_dsc)
-			hw_pp->ops.enable_dsc(hw_pp);
-	}
+	if (hw_pp->ops.enable_dsc)
+		hw_pp->ops.enable_dsc(hw_pp);
 
 	if (ctl->ops.update_pending_flush_dsc)
 		ctl->ops.update_pending_flush_dsc(ctl, hw_dsc->idx);
@@ -2074,15 +2060,12 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
 	enc_ip_w = intf_ip_w / num_dsc;
 	initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, enc_ip_w,
 							  dsc_common_mode);
-	DPU_DEBUG_ENC(dpu_enc, "dsc initial_lines=%u common_mode=0x%x program=%d\n",
-		      initial_lines, dsc_common_mode, !dpu_enc->dsc_programmed);
+	DPU_DEBUG_ENC(dpu_enc, "dsc initial_lines=%u common_mode=0x%x\n",
+		      initial_lines, dsc_common_mode);
 
 	for (i = 0; i < num_dsc; i++)
 		dpu_encoder_dsc_pipe_cfg(ctl, hw_dsc[i], hw_pp[i],
-					 dsc, dsc_common_mode, initial_lines,
-					 !dpu_enc->dsc_programmed);
-
-	dpu_enc->dsc_programmed = true;
+					 dsc, dsc_common_mode, initial_lines);
 }
 
 /**
