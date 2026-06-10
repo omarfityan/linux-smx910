@@ -137,6 +137,86 @@
 		regulator-boot-on;
 	};
 
+	/*
+	 * QCA WCN7850 (Samsung codename "kiwi"; PCI 17cb:1107) Wi-Fi/BT
+	 * power-management unit. Bound by pwrseq-qcom-wcn (the power-
+	 * sequencing provider): it enables the six SoC-rail inputs, toggles
+	 * the WLAN/BT enable GPIOs in the required order, and exposes ten
+	 * LDO outputs (vreg_pmu_*) that the wifi@0 (and, later, the BT)
+	 * consumer references as its supplies. PCI_PWRCTRL_PWRSEQ runs this
+	 * sequence before the PCIe endpoint is enumerated.
+	 *
+	 * Structure copied from the in-tree sm8550-qrd.dts WCN7850 reference
+	 * (the canonical mainline board for this binding). Device-own values:
+	 *   - wlan-enable-gpios = TLMM 80, bt-enable-gpios = TLMM 81: extracted
+	 *     from this device's stock bt_kiwi node (qcom,wl-reset-gpio = 0x50,
+	 *     qcom,bt-reset-gpio = 0x51) -- identical to the QRD layout.
+	 *   - The six input supplies are remapped from the QRD's rail names to
+	 *     this device's RPMh rail labels (same SMPS/LDO identity, ranges
+	 *     cover the WCN requirements): s5g, l15b, s2g, s4e, s4g, s6g.
+	 * The regulators{} subtree (the WCN chip's own LDO outputs) is chip-
+	 * intrinsic and copied verbatim. The 32 kHz reference is delivered via
+	 * the pmk8550_sleep_clk pin (see &pmk8550_gpios), not a clocks= phandle.
+	 */
+	wcn7850-pmu {
+		compatible = "qcom,wcn7850-pmu";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&wlan_en>, <&bt_default>, <&pmk8550_sleep_clk>;
+
+		wlan-enable-gpios = <&tlmm 80 GPIO_ACTIVE_HIGH>;
+		bt-enable-gpios = <&tlmm 81 GPIO_ACTIVE_HIGH>;
+
+		vdd-supply = <&vreg_s5g_0p8>;
+		vddio-supply = <&vreg_l15b_1p8>;
+		vddaon-supply = <&vreg_s2g_0p8>;
+		vdddig-supply = <&vreg_s4e_0p9>;
+		vddrfa1p2-supply = <&vreg_s4g_1p3>;
+		vddrfa1p8-supply = <&vreg_s6g_1p8>;
+
+		regulators {
+			vreg_pmu_rfa_cmn: ldo0 {
+				regulator-name = "vreg_pmu_rfa_cmn";
+			};
+
+			vreg_pmu_aon_0p59: ldo1 {
+				regulator-name = "vreg_pmu_aon_0p59";
+			};
+
+			vreg_pmu_wlcx_0p8: ldo2 {
+				regulator-name = "vreg_pmu_wlcx_0p8";
+			};
+
+			vreg_pmu_wlmx_0p85: ldo3 {
+				regulator-name = "vreg_pmu_wlmx_0p85";
+			};
+
+			vreg_pmu_btcmx_0p85: ldo4 {
+				regulator-name = "vreg_pmu_btcmx_0p85";
+			};
+
+			vreg_pmu_rfa_0p8: ldo5 {
+				regulator-name = "vreg_pmu_rfa_0p8";
+			};
+
+			vreg_pmu_rfa_1p2: ldo6 {
+				regulator-name = "vreg_pmu_rfa_1p2";
+			};
+
+			vreg_pmu_rfa_1p8: ldo7 {
+				regulator-name = "vreg_pmu_rfa_1p8";
+			};
+
+			vreg_pmu_pcie_0p9: ldo8 {
+				regulator-name = "vreg_pmu_pcie_0p9";
+			};
+
+			vreg_pmu_pcie_1p8: ldo9 {
+				regulator-name = "vreg_pmu_pcie_1p8";
+			};
+		};
+	};
+
 	reserved-memory {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -856,6 +936,34 @@
 		drive-strength = <8>;
 		bias-pull-up;
 	};
+
+	/*
+	 * WCN7850 WLAN/BT enable + BT SW-ctrl pinmux. GPIO numbers are this
+	 * device's own (stock bt_kiwi: wl-reset = gpio80, bt-reset = gpio81,
+	 * bt-sw-ctrl = gpio82); pin attributes copied from the sm8550-qrd
+	 * reference. Clear of the firmware-reserved <36 4> block above.
+	 */
+	wlan_en: wlan-en-state {
+		pins = "gpio80";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-pull-down;
+	};
+
+	bt_default: bt-default-state {
+		bt-en-pins {
+			pins = "gpio81";
+			function = "gpio";
+			drive-strength = <16>;
+			bias-disable;
+		};
+
+		sw-ctrl-pins {
+			pins = "gpio82";
+			function = "gpio";
+			bias-pull-down;
+		};
+	};
 };
 
 /* UFS = the rootfs path; q5q-proven supply mapping (SoC+PMIC-level). */
@@ -931,6 +1039,65 @@
 
 &xo_board {
 	clock-frequency = <76800000>;
+};
+
+&pmk8550_gpios {
+	/* 32 kHz sleep-clock output routed to the WCN7850 (PMIC gpio3 func1). */
+	pmk8550_sleep_clk: sleep-clk-state {
+		pins = "gpio3";
+		function = "func1";
+		input-disable;
+		output-enable;
+		bias-disable;
+		power-source = <0>;
+	};
+};
+
+/*
+ * PCIe0 root complex -- the WCN7850 Wi-Fi endpoint sits here. PERST# (gpio94)
+ * and WAKE# (gpio96) are SoC-dedicated PCIe0 pins: sm8550.dtsi's
+ * pcie0_default_state pins gpio94/95/96 to perst / pcie0_clk_req_n / wake, so
+ * they are fixed by the SoC (not board-routed) and the QRD reference uses the
+ * same. CLKREQ# (gpio95) is handled by the pinctrl default state.
+ */
+&pcie0 {
+	perst-gpios = <&tlmm 94 GPIO_ACTIVE_LOW>;
+	wake-gpios = <&tlmm 96 GPIO_ACTIVE_HIGH>;
+
+	pinctrl-0 = <&pcie0_default_state>;
+	pinctrl-names = "default";
+
+	status = "okay";
+};
+
+&pcie0_phy {
+	vdda-phy-supply = <&vreg_l1e_0p88>;
+	vdda-pll-supply = <&vreg_l3e_1p2>;
+
+	status = "okay";
+};
+
+/*
+ * WCN7850 Wi-Fi endpoint (mainline ath12k; PCI 17cb:1107). Its supplies are
+ * the WCN PMU's LDO outputs (vreg_pmu_*, from the wcn7850-pmu node above) and
+ * are copied verbatim from the sm8550-qrd reference -- the supply set is
+ * chip-intrinsic, not board-specific.
+ */
+&pcieport0 {
+	wifi@0 {
+		compatible = "pci17cb,1107";
+		reg = <0x10000 0x0 0x0 0x0 0x0>;
+
+		vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;
+		vddaon-supply = <&vreg_pmu_aon_0p59>;
+		vddwlcx-supply = <&vreg_pmu_wlcx_0p8>;
+		vddwlmx-supply = <&vreg_pmu_wlmx_0p85>;
+		vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
+		vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
+		vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
+		vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
+		vddpcie1p8-supply = <&vreg_pmu_pcie_1p8>;
+	};
 };
 
 /*
