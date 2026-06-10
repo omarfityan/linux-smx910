@@ -785,6 +785,49 @@
 	status = "okay";
 };
 
+/*
+ * GPI DMA engine for the QUPv3 wrapper-1 buses. i2c4 (below) declares
+ * dmas = <&gpi_dma1 ...> in sm8550.dtsi; mainline geni-i2c requests that tx
+ * DMA channel at probe and sits in -EPROBE_DEFER forever ("Failed to get tx
+ * DMA ch") if the controller is disabled. i2c4 is the first wrap-1 bus we
+ * enable on this device, so gpi_dma1 must be turned on for the touchscreen
+ * bus to register at all.
+ */
+&gpi_dma1 {
+	status = "okay";
+};
+
+/*
+ * Goodix gt9916 (Berlin-D) capacitive touchscreen on i2c4 (i2c@a90000),
+ * i2c address 0x5d. The bus is confirmed by the stock dtbo's
+ * qts,trusted-touch-io-bases = <0xa90000>; the chip identity, GPIOs and
+ * rails are this device's own stock values (native goodix-berlin@5d,
+ * fragment@19) and agree with the sm8550-qrd reference (gpio25 IRQ /
+ * gpio24 reset / avdd = L14B). Mainline goodix_berlin_i2c binds
+ * "goodix,gt9916"; firmware is factory-flashed in-IC (no request_firmware).
+ * vddio (downstream iovdd = L12B) is omitted to match qrd — that rail is
+ * already kept always-on for the panel, so the driver's dummy regulator
+ * suffices.
+ */
+&i2c4 {
+	status = "okay";
+
+	touchscreen@5d {
+		compatible = "goodix,gt9916";
+		reg = <0x5d>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <25 IRQ_TYPE_LEVEL_LOW>;
+
+		reset-gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
+
+		avdd-supply = <&vreg_l14b_3p2>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&ts_irq>, <&ts_reset>;
+	};
+};
+
 /* gts9u firmware-protected GPIOs = {36,37,38,39} (
  * 2-source-verified: live qcom,gpios-reserved == overlay1).  THE
  * prime ~6 s killer (research cause-1).  Shares q5q's <36 4>
@@ -792,6 +835,27 @@
  * <50 2>. */
 &tlmm {
 	gpio-reserved-ranges = <36 4>;
+
+	/*
+	 * Goodix gt9916 touchscreen IRQ (gpio25) + reset (gpio24). GPIO
+	 * numbers + rails extracted from this device's own stock dtbo
+	 * (native goodix-berlin@5d, fragment@19) and cross-confirmed against
+	 * the sm8550-qrd reference board's gt9916 node. Both clear of the
+	 * reserved <36 4> block above.
+	 */
+	ts_irq: ts-irq-state {
+		pins = "gpio25";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-pull-up;
+	};
+
+	ts_reset: ts-reset-state {
+		pins = "gpio24";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-pull-up;
+	};
 };
 
 /* UFS = the rootfs path; q5q-proven supply mapping (SoC+PMIC-level). */
@@ -867,4 +931,23 @@
 
 &xo_board {
 	clock-frequency = <76800000>;
+};
+
+/*
+ * Adreno 740 GPU. The SoC dtsi ships gpu@3d00000 status="disabled"; enable it
+ * here. The GMU (gmu@3d6a000) and adreno_smmu (iommu@3da0000) carry no status
+ * property, so they cascade to "okay" from the GPU node. SQE (a740_sqe.fw) and
+ * GMU (gmu_gen70200.bin) firmware are auto-derived from the chip-id by the
+ * driver and need no firmware-name. The zap shader is a PAS-signed image whose
+ * trust chain is rooted in this device's QFPROM fuses, so the generic
+ * linux-firmware zap is rejected by TrustZone; point firmware-name at the
+ * device-extracted, Samsung-signed blob at a device-specific path so a stock
+ * linux-firmware-qcom install cannot shadow it at the shared qcom/sm8550 path.
+ */
+&gpu {
+	status = "okay";
+};
+
+&gpu_zap_shader {
+	firmware-name = "qcom/sm8550/samsung/gts9u/a740_zap.mbn";
 };

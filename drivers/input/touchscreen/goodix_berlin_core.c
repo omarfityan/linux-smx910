@@ -39,6 +39,17 @@
 
 #define GOODIX_BERLIN_MAX_TOUCH			10
 
+/*
+ * GTS9U panel-native multitouch range. The gt6936_gts9u firmware reports
+ * contacts in portrait panel units, 0..GOODIX_GTS9U_RAW_MAX_X by
+ * 0..GOODIX_GTS9U_RAW_MAX_Y, matching the downstream sec_input max_coords of
+ * 1848 x 2960 (inclusive maxima are one less). goodix_berlin_report_state()
+ * rotates each contact into the landscape desktop frame before reporting, so
+ * GOODIX_GTS9U_RAW_MAX_X is also the inversion pivot for the rotated Y axis.
+ */
+#define GOODIX_GTS9U_RAW_MAX_X			1847
+#define GOODIX_GTS9U_RAW_MAX_Y			2959
+
 #define GOODIX_BERLIN_NORMAL_RESET_DELAY_MS	100
 
 #define GOODIX_BERLIN_TOUCH_EVENT		BIT(7)
@@ -136,12 +147,28 @@ struct goodix_berlin_ic_info_misc {
 	__le32 esd_addr;
 } __packed;
 
+/*
+ * GTS9U: the gt9916 "gt6936_gts9u" firmware uses a 16-byte event record, NOT
+ * the 8-byte upstream {status, reserved, le16 x/y/w}. Confirmed by live raw
+ * capture: with two fingers down, finger 1's record begins at report offset 24
+ * (= header 8 + one 16-byte record), and the report checksum trails touch_num
+ * 16-byte records. The first 8 bytes of each record carry the contact
+ * (action/id/eid + nibble-packed 12-bit x/y + major/minor/z); the trailing 8
+ * bytes carry aux data (noise/strength/hover/freq/pad) the coordinate path
+ * ignores. Sizing this struct at 16 bytes makes GOODIX_BERLIN_TOUCH_SIZE -- and
+ * thus the IRQ read length, the per-record stride, get_remaining_contacts() and
+ * the checksum span -- all use the correct record size.
+ */
 struct goodix_berlin_touch {
-	u8 status;
-	u8 reserved;
-	__le16 x;
-	__le16 y;
-	__le16 w;
+	u8 status;	/* [action:7-6][tid:5-2][eid:1-0] */
+	u8 x_hi;	/* X[11:4] */
+	u8 y_hi;	/* Y[11:4] */
+	u8 xy_lo;	/* [X[3:0]:7-4][Y[3:0]:3-0] */
+	u8 major;
+	u8 minor;
+	u8 z_hi;	/* [touch_type hi:7-6][z:5-0] */
+	u8 z_lo;
+	u8 aux[8];	/* noise_level, max_strength, hover_id_num, freq_id, pad */
 };
 #define GOODIX_BERLIN_TOUCH_SIZE	sizeof(struct goodix_berlin_touch)
 
@@ -174,6 +201,8 @@ struct goodix_berlin_core {
 
 	/* Runtime parameters extracted from IC_INFO buffer  */
 	u32 touch_data_addr;
+	u16 touch_data_head_len;	/* GTS9U-DBG: chip-reported, currently UNUSED upstream */
+	u16 point_struct_len;		/* GTS9U-DBG: chip-reported, currently UNUSED upstream */
 
 	const struct goodix_berlin_ic_data *ic_data;
 
@@ -349,6 +378,14 @@ static int goodix_berlin_parse_ic_info(struct goodix_berlin_core *cd,
 
 	misc = (struct goodix_berlin_ic_info_misc *)&data[offset];
 	cd->touch_data_addr = le32_to_cpu(misc->touch_data_addr);
+	cd->touch_data_head_len = le16_to_cpu(misc->touch_data_head_len);
+	cd->point_struct_len = le16_to_cpu(misc->point_struct_len);
+
+	/* GTS9U-DBG: info_version_id is the first byte after the 2-byte length */
+	dev_info(cd->dev,
+		 "GTS9U-DBG ic_info: info_ver=0x%02x touch_data_addr=%#x head_len=%u point_struct_len=%u\n",
+		 data[sizeof(__le16)], cd->touch_data_addr,
+		 cd->touch_data_head_len, cd->point_struct_len);
 
 	return 0;
 
@@ -433,38 +470,69 @@ static int goodix_berlin_get_remaining_contacts(struct goodix_berlin_core *cd,
 	return 0;
 }
 
+/*
+ * GTS9U: this device's gt9916 ships Samsung "gt6936_gts9u" firmware whose event
+ * records are 16 bytes each (GOODIX_BERLIN_TOUCH_SIZE) and do NOT use the
+ * upstream {status, reserved, le16 x/y/w} layout. It uses the Samsung sec_input
+ * packing (cf. downstream goodix_brl_hw.c goodix_parse_finger, BYTES_PER_POINT=16):
+ *   byte0: [7:6]=action(1=press,2=move,3=release) [5:2]=finger id [1:0]=eid
+ *   byte1: x[11:4]   byte2: y[11:4]   byte3: [7:4]=x[3:0] [3:0]=y[3:0]
+ *   byte4: major     byte5: minor     byte6: [5:0]=pressure
+ *   bytes 8-15: aux (noise/strength/hover/freq/pad) -- ignored here
+ * eid (byte0 bits 1:0) selects record type: 0=coordinate, 1=status, 2=gesture,
+ * 3=empty; only eid==0 carries a contact. Decoding the upstream 8-byte-stride
+ * way reads record-0's aux tail as a phantom "finger 1" (garbage ~x=500,y=0) and
+ * truncates the read before the real 2nd contact; the 16-byte stride + nibble-pack
+ * below match the live raw captures (finger 1 begins at report offset 24).
+ */
 static void goodix_berlin_report_state(struct goodix_berlin_core *cd, int n)
 {
-	struct goodix_berlin_touch *touch_data =
-			(struct goodix_berlin_touch *)cd->event.data;
-	struct goodix_berlin_touch *t;
+	u8 *data = cd->event.data;
 	int i;
-	u8 type, id;
 
 	for (i = 0; i < n; i++) {
-		t = &touch_data[i];
+		u8 *p = data + i * GOODIX_BERLIN_TOUCH_SIZE;
+		unsigned int eid = p[0] & 0x03;
+		unsigned int action = (p[0] & 0xC0) >> 6;
+		unsigned int id = (p[0] & 0x3C) >> 2;
+		unsigned int x = ((unsigned int)p[1] << 4) | ((p[3] & 0xF0) >> 4);
+		unsigned int y = ((unsigned int)p[2] << 4) | (p[3] & 0x0F);
+		bool active = (action != 3);	/* 3 = release */
 
-		type = FIELD_GET(GOODIX_BERLIN_POINT_TYPE_MASK, t->status);
-		if (type == GOODIX_BERLIN_POINT_TYPE_STYLUS ||
-		    type == GOODIX_BERLIN_POINT_TYPE_STYLUS_HOVER) {
-			dev_warn_once(cd->dev, "Stylus event type not handled\n");
+		/*
+		 * eid (p[0] bits 1:0): 0 = coordinate, 1 = status, 2 = gesture,
+		 * 3 = empty. Only coordinate records carry contact data; skip the
+		 * rest so a status/gesture event is not reported as a phantom finger.
+		 */
+		if (eid != 0)
 			continue;
-		}
 
-		id = FIELD_GET(GOODIX_BERLIN_TOUCH_ID_MASK, t->status);
 		if (id >= GOODIX_BERLIN_MAX_TOUCH) {
 			dev_warn_ratelimited(cd->dev, "invalid finger id %d\n", id);
 			continue;
 		}
 
 		input_mt_slot(cd->input_dev, id);
-		input_mt_report_slot_state(cd->input_dev, MT_TOOL_FINGER, true);
+		input_mt_report_slot_state(cd->input_dev, MT_TOOL_FINGER, active);
 
-		touchscreen_report_pos(cd->input_dev, &cd->props,
-				       __le16_to_cpu(t->x), __le16_to_cpu(t->y),
-				       true);
-		input_report_abs(cd->input_dev, ABS_MT_TOUCH_MAJOR,
-				 __le16_to_cpu(t->w));
+		if (active) {
+			/*
+			 * The panel is mounted portrait (raw 0..MAX_X by
+			 * 0..MAX_Y) but the desktop runs landscape. Rotate the
+			 * contact 270 degrees here so the compositor needs only
+			 * an identity calibration matrix: rx = y, ry = MAX_X - x.
+			 * This reproduces the proven-correct "0 1 0 -1 0 1"
+			 * libinput matrix in-driver, sidestepping the KWin 6
+			 * off-diagonal-matrix mapping bug that collapses a
+			 * rotated touch X to zero.
+			 */
+			unsigned int rx = y;
+			unsigned int ry = GOODIX_GTS9U_RAW_MAX_X - x;
+
+			touchscreen_report_pos(cd->input_dev, &cd->props,
+					       rx, ry, true);
+			input_report_abs(cd->input_dev, ABS_MT_TOUCH_MAJOR, p[4]);
+		}
 	}
 
 	input_mt_sync_frame(cd->input_dev);
@@ -491,13 +559,23 @@ static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
 	}
 
 	if (touch_num) {
+		/*
+		 * GTS9U: each event record is GOODIX_BERLIN_TOUCH_SIZE (16) bytes,
+		 * so the report checksum trails touch_num records: span
+		 * touch_num * 16 + CHECKSUM_SIZE. (The earlier 8-byte stride read
+		 * record-0's 8-byte aux tail as a phantom "finger 1" and mistook
+		 * the first 2 bytes of finger-1's real record for the checksum --
+		 * both fixed by the 16-byte record size.) Kept non-fatal: a
+		 * transient mismatch must not drop a frame, since each contact's
+		 * coordinates decode independently of the checksum.
+		 */
 		int len = touch_num * GOODIX_BERLIN_TOUCH_SIZE +
 			  GOODIX_BERLIN_CHECKSUM_SIZE;
-		if (!goodix_berlin_checksum_valid(cd->event.data, len)) {
-			dev_err(cd->dev, "touch data checksum error: %*ph\n",
+
+		if (!goodix_berlin_checksum_valid(cd->event.data, len))
+			dev_warn_ratelimited(cd->dev,
+				"touch data checksum mismatch (non-fatal): %*ph\n",
 				len, cd->event.data);
-			return;
-		}
 	}
 
 	goodix_berlin_report_state(cd, touch_num);
@@ -520,39 +598,22 @@ static irqreturn_t goodix_berlin_irq(int irq, void *data)
 	int error;
 
 	/*
-	 * First, read buffer with space for 2 touch events:
+	 * First read: header + space for 2 event records + checksum:
 	 * - GOODIX_BERLIN_HEADER_SIZE = 8 bytes
-	 * - GOODIX_BERLIN_TOUCH_SIZE * 2 = 16 bytes
-	 * - GOODIX_BERLIN_CHECKLSUM_SIZE = 2 bytes
-	 * For a total of 26 bytes.
+	 * - GOODIX_BERLIN_TOUCH_SIZE * 2 = 32 bytes (each record is 16 bytes:
+	 *   an 8-byte contact followed by 8 bytes of aux data)
+	 * - GOODIX_BERLIN_CHECKSUM_SIZE = 2 bytes
+	 * For a total of 42 bytes.
 	 *
-	 * If only a single finger is reported, we will read 8 bytes more than
-	 * needed:
-	 * - bytes 0-7:   Header (GOODIX_BERLIN_HEADER_SIZE)
-	 * - bytes 8-15:  Finger 0 Data
-	 * - bytes 24-25: Checksum
-	 * - bytes 18-25: Unused 8 bytes
+	 * Layout when up to 2 events are reported:
+	 * - bytes 0-7:   Header
+	 * - bytes 8-23:  Event record 0 (contact bytes 0-7, aux bytes 8-15)
+	 * - bytes 24-39: Event record 1
+	 * - bytes 40-41: Checksum (immediately after touch_num records)
 	 *
-	 * If 2 fingers are reported, we would have read the exact needed
-	 * amount of data and checksum would be at the end of the buffer:
-	 * - bytes 0-7:   Header (GOODIX_BERLIN_HEADER_SIZE)
-	 * - bytes 8-15:  Finger 0 Bytes 0-7
-	 * - bytes 16-23: Finger 1 Bytes 0-7
-	 * - bytes 24-25: Checksum
-	 *
-	 * If more than 2 fingers were reported, the "Checksum" bytes would
-	 * in fact contain part of the next finger data, and then
-	 * goodix_berlin_get_remaining_contacts() would complete the buffer
-	 * with the missing bytes, including the trailing checksum.
-	 * For example, if 3 fingers are reported, then we would do:
-	 * Read 1:
-	 * - bytes 0-7:   Header (GOODIX_BERLIN_HEADER_SIZE)
-	 * - bytes 8-15:  Finger 0 Bytes 0-7
-	 * - bytes 16-23: Finger 1 Bytes 0-7
-	 * - bytes 24-25: Finger 2 Bytes 0-1
-	 * Read 2 (with length of (3 - 2) * 8 = 8 bytes):
-	 * - bytes 26-31: Finger 2 Bytes 2-7
-	 * - bytes 32-33: Checksum
+	 * If more than 2 events are reported, bytes 40-41 instead hold the
+	 * first 2 bytes of record 2, and goodix_berlin_get_remaining_contacts()
+	 * reads the rest contiguously, including the trailing checksum.
 	 */
 	error = regmap_raw_read(cd->regmap, cd->touch_data_addr,
 				&cd->event,
@@ -567,6 +628,10 @@ static irqreturn_t goodix_berlin_irq(int irq, void *data)
 
 	if (cd->event.hdr.status == 0)
 		goto out;
+
+	/* GTS9U-DBG: dump the raw report (header + two 16-byte records + checksum) */
+	dev_info_ratelimited(cd->dev, "GTS9U-DBG raw[42]: %42ph\n",
+			     (u8 *)&cd->event);
 
 	if (!goodix_berlin_checksum_valid((u8 *)&cd->event.hdr,
 					  GOODIX_BERLIN_HEADER_SIZE)) {
@@ -620,10 +685,19 @@ static int goodix_berlin_input_dev_config(struct goodix_berlin_core *cd,
 
 	input_dev->id = *id;
 
+	/*
+	 * GTS9U: the gt6936_gts9u firmware reports coordinates in portrait
+	 * panel-native units (max_coords 1848 x 2960, from the downstream
+	 * sec_input node), not the upstream SZ_64K logical range.
+	 * goodix_berlin_report_state() rotates each contact 270 degrees into
+	 * the landscape desktop frame, so the *reported* axes are swapped
+	 * relative to the panel: X spans the panel's long axis and Y its short
+	 * axis. Advertise the post-rotation range here.
+	 */
 	input_set_abs_params(cd->input_dev, ABS_MT_POSITION_X,
-			     0, SZ_64K - 1, 0, 0);
+			     0, GOODIX_GTS9U_RAW_MAX_Y, 0, 0);
 	input_set_abs_params(cd->input_dev, ABS_MT_POSITION_Y,
-			     0, SZ_64K - 1, 0, 0);
+			     0, GOODIX_GTS9U_RAW_MAX_X, 0, 0);
 	input_set_abs_params(cd->input_dev, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
 
 	touchscreen_parse_properties(cd->input_dev, true, &cd->props);

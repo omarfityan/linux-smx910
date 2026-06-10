@@ -26,6 +26,12 @@ dir  /sys/kernel/config 0755 0 0
 dir  /bin          0755 0 0
 file /bin/busybox  ubuntu-tab/boot-probes/busybox 0755 0 0
 file /init         ubuntu-tab/boot-probes/init 0755 0 0
+# /init.real: a second copy of the busybox init. The bootloader concatenates
+# init_boot's magiskinit ramdisk as an external initrd that overwrites /init at
+# unpack-time; booting with rdinit=/init.real runs OUR busybox init regardless
+# (init_boot ships only /init + .backup + overlay.d, never /init.real), decoupling
+# this mainline bring-up from the bootloader's Android ramdisk.
+file /init.real    ubuntu-tab/boot-probes/init 0755 0 0
 file /kmsgmark     ubuntu-tab/boot-probes/kmsgmark 0755 0 0
 # --- adbd: SELinux-free Linux adbd (Debian android-tools-adbd 5.1.1) + glibc closure ---
 dir   /sbin          0755 0 0

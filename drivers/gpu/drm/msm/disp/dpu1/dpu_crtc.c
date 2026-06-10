@@ -11,6 +11,7 @@
 #include <linux/debugfs.h>
 #include <linux/ktime.h>
 #include <linux/bits.h>
+#include <linux/moduleparam.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_blend.h>
@@ -43,6 +44,74 @@
 
 #define	CONVERT_S3_15(val) \
 	(((((u64)val) & ~BIT_ULL(63)) >> 17) & GENMASK_ULL(17, 0))
+
+/*
+ * DSPP colour-injection test hook (residual dark-seam flicker investigation).
+ *
+ * The downstream OneUI userspace programs DSPP PA/six-zone plus an (identity)
+ * PCC that the bare mainline and TWRP stacks leave disabled; a three-way live
+ * register capture-diff (OneUI / mainline / bare-TWRP) attributed the dark-seam
+ * flicker suppression to that DSPP-colour delta.  This gated hook reproduces the
+ * reproducible part of it from inside the powered atomic commit - the same
+ * context mainline already uses for PCC/GC - so the causal question can be
+ * tested on mainline against the synthetic dark-seam oracle, escaping the
+ * fragile downstream-recovery reader.
+ *
+ * Runtime-writable bitmask at /sys/module/msm/parameters/oneui_dspp_inject:
+ *   BIT(0) identity PCC  - enable PCC with OneUI's captured identity matrix
+ *                          (a colour no-op; tests whether merely switching a
+ *                          DSPP sub-block into the datapath perturbs per-frame
+ *                          seam latching - a faithful sub-component of the delta)
+ *   BIT(1) tint PCC      - positive control: enable PCC with a deliberately
+ *                          visible tint (halve green) to prove the inject reaches
+ *                          the pixels (register latch + datapath routing + eye)
+ *   BIT(2) force DSPP    - add a DSPP to the CRTC reservation so the encoder
+ *                          wires it into the active path (fallback if the
+ *                          un-reserved DSPP turns out to be bypassed)
+ *   BIT(3) six-zone      - faithful: program OneUI's captured PA + six-zone
+ *                          (OP_MODE 0xE0120000 = PA enable + six-zone hue/sat/val
+ *                          enable, plus the captured threshold/adjust and the
+ *                          curve).  OneUI's QDCM six-zone curve is IDENTITY
+ *                          (all-zero in the device-own calibration), so this
+ *                          tests whether enabling the PA/six-zone pipeline stage
+ *                          - a different datapath than PCC - suppresses the seam.
+ *   BIT(4) six-zone ctrl - positive control for the PA/six-zone WRITE path: same
+ *                          enable, but a deliberately strong non-identity curve
+ *                          so a visible colour change proves these writes reach
+ *                          pixels (without it a faithful no-change is untrustworthy).
+ * 0 = disabled (stock behaviour - the hook early-returns and reverts to stock).
+ */
+#define ONEUI_INJECT_PCC_IDENTITY	BIT(0)
+#define ONEUI_INJECT_PCC_TINT		BIT(1)
+#define ONEUI_INJECT_FORCE_DSPP		BIT(2)
+#define ONEUI_INJECT_SIXZONE		BIT(3)
+#define ONEUI_INJECT_SIXZONE_CTRL	BIT(4)
+
+static int oneui_dspp_inject;
+/*
+ * Set on every param write, consumed on the next atomic commit: the inject is
+ * applied exactly ONCE per write (so it rides any commit - flip or modeset -
+ * not only a needs_modeset, which mainline's fbdev consumes at insmod), then
+ * persists across subsequent flips without re-flushing the DSPP every frame.
+ */
+static int oneui_inject_pending;
+
+static int oneui_dspp_inject_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (!ret)
+		oneui_inject_pending = 1;
+	return ret;
+}
+
+static const struct kernel_param_ops oneui_dspp_inject_ops = {
+	.set = oneui_dspp_inject_set,
+	.get = param_get_int,
+};
+module_param_cb(oneui_dspp_inject, &oneui_dspp_inject_ops, &oneui_dspp_inject, 0644);
+MODULE_PARM_DESC(oneui_dspp_inject,
+	"DSPP colour-inject flicker test (bitmask: 1=identity-PCC 2=tint-PCC 4=force-DSPP 8=six-zone-faithful 16=six-zone-control; 0=off/revert)");
 
 static struct dpu_kms *_dpu_crtc_get_kms(struct drm_crtc *crtc)
 {
@@ -902,6 +971,191 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	}
 }
 
+/*
+ * DSPP sub-block offsets within the DSPP block.  These are identical
+ * mainline<->downstream: the mainline catalog DSPP_0 base (0x54000) is off by
+ * 0x1000 from the captured downstream physical base, but that is compensated by
+ * the MDP region base, so a DPU_REG_WRITE at within-block offset 'off' lands at
+ * the captured downstream physical 0xae55000+off.  Pinned from the device-own DT
+ * (qcom,sde-dspp-blocks: hist/PA @0x800, sixzone @0x900) and the downstream
+ * sde_hw_color_processing_v1_7.c (sde_setup_dspp_sixzone_v17).
+ */
+#define DSPP_PA_OP_MODE		0x800	/* PA/HSIC OP_MODE */
+#define DSPP_SIXZONE_BASE	0x900	/* +0 = p0(hue) port, +4 = p1(sat/val) port */
+#define DSPP_SIXZONE_THRESH	0x908
+#define DSPP_SIXZONE_ADJ_P0	0x90c
+#define DSPP_SIXZONE_ADJ_P1	0x910
+#define SIXZONE_INDEX_RESET	BIT(26)	/* write to base: reset LUT index + auto-inc */
+#define SIXZONE_LUT_ENTRIES	384
+
+/* OneUI's captured live values (the three-way capture-diff ground truth). */
+#define ONEUI_PA_OPMODE		0xe0120000u /* PA_EN|SZ_VAL|SZ_SAT|SZ_HUE|bit17(reset dflt) */
+#define ONEUI_SZ_THRESHOLD	0xe5e51919u
+#define ONEUI_SZ_ADJUST_P0	0x00004c4cu
+#define ONEUI_SZ_ADJUST_P1	0x035e035eu
+#define STOCK_PA_OPMODE		0x00020000u /* PA OFF (bit17 reset default) - the revert */
+#define CTL_FLUSH_DSPP_IDX	29	    /* CTL_FLUSH DSPP sub-block-flush bit (DPU 7.x+) */
+#define CTL_DSPP_FLUSH_PA	BIT(0)	    /* CTL_DSPP_n_FLUSH: PA/HSIC/memcol/six-zone */
+
+/*
+ * _dpu_crtc_oneui_sixzone - program OneUI's captured PA + six-zone into a DSPP.
+ *
+ * Reproduces the attributed OneUI-userspace DSPP-colour delta (the PA OP_MODE
+ * enable + the six-zone curve/threshold/adjust) from inside the powered atomic
+ * commit, via the auto-increment LUT protocol (BIT(26) index reset, then 384
+ * {p1,p0} writes to the two fixed ports), then stages the PA flush
+ * (CTL_DSPP_n_FLUSH BIT0).  OneUI's QDCM six-zone curve is IDENTITY (all-zero in
+ * the device-own calibration), so 'control' writes a deliberately strong curve to
+ * positive-control the PA/six-zone write path (prove these writes reach pixels),
+ * while the faithful path writes the identity curve OneUI actually uses.
+ */
+static void _dpu_crtc_oneui_sixzone(struct dpu_hw_dspp *dspp,
+				    struct dpu_hw_ctl *ctl, bool control)
+{
+	struct dpu_hw_blk_reg_map *hw = &dspp->hw;
+	int n = dspp->idx - DSPP_0;
+	int i;
+
+	/* index reset + auto-increment enable */
+	DPU_REG_WRITE(hw, DSPP_SIXZONE_BASE, SIXZONE_INDEX_RESET);
+
+	/*
+	 * Stream the 384-entry curve through the two fixed auto-increment ports
+	 * (p1 = sat/val @ base+4, p0 = hue @ base+0).  Faithful = identity
+	 * (zeros, OneUI's real curve); control = a strong constant hue+sat shift
+	 * so the path's effect is unmistakable on saturated content.
+	 */
+	for (i = 0; i < SIXZONE_LUT_ENTRIES; i++) {
+		u32 p0 = control ? 0x200 : 0;	/* hue adjustment */
+		u32 p1 = control ? 0x200 : 0;	/* sat/val adjustment */
+
+		DPU_REG_WRITE(hw, DSPP_SIXZONE_BASE + 4, p1);
+		DPU_REG_WRITE(hw, DSPP_SIXZONE_BASE, p0);
+	}
+
+	/* six-zone threshold + adjust (OneUI captured, address-mapped) */
+	DPU_REG_WRITE(hw, DSPP_SIXZONE_THRESH, ONEUI_SZ_THRESHOLD);
+	DPU_REG_WRITE(hw, DSPP_SIXZONE_ADJ_P0, ONEUI_SZ_ADJUST_P0);
+	DPU_REG_WRITE(hw, DSPP_SIXZONE_ADJ_P1, ONEUI_SZ_ADJUST_P1);
+
+	/* PA OP_MODE: enable PA + six-zone (OneUI's E0120000) - written last */
+	DPU_REG_WRITE(hw, DSPP_PA_OP_MODE, ONEUI_PA_OPMODE);
+
+	/* stage the PA/HSIC/memcol/six-zone flush (CTL_DSPP_n_FLUSH BIT0) */
+	if (n >= 0 && n < DSPP_MAX - DSPP_0) {
+		ctl->pending_dspp_flush_mask[n] |= CTL_DSPP_FLUSH_PA;
+		ctl->pending_flush_mask |= BIT(CTL_FLUSH_DSPP_IDX);
+	}
+
+	DRM_INFO("oneui_dspp_inject: six-zone %s -> dspp%d ctl%d opmode=0x%x curve=0x%x\n",
+		 control ? "CONTROL(visible)" : "faithful(identity)",
+		 n, ctl->idx - CTL_0, ONEUI_PA_OPMODE, control ? 0x200 : 0);
+}
+
+/*
+ * _dpu_crtc_oneui_dspp_inject - gated DSPP colour-inject test hook.
+ *
+ * Programs a PCC (identity, or a deliberately visible tint as a positive
+ * control) or OneUI's PA + six-zone into the CRTC's DSPP(s) from inside the
+ * powered atomic commit and stages the native DSPP flush, so the captured OneUI
+ * DSPP-colour delta can be reproduced and its effect on the residual dark-seam
+ * flicker tested on mainline.  When oneui_dspp_inject == 0 this reverts to stock.
+ */
+static void _dpu_crtc_oneui_dspp_inject(struct drm_crtc *crtc)
+{
+	struct drm_crtc_state *state = crtc->state;
+	struct dpu_crtc_state *cstate = to_dpu_crtc_state(state);
+	struct dpu_crtc_mixer *mixer = cstate->mixers;
+	struct dpu_kms *dpu_kms = _dpu_crtc_get_kms(crtc);
+	bool enable = (oneui_dspp_inject != 0);
+	bool sixzone = (oneui_dspp_inject &
+			(ONEUI_INJECT_SIXZONE | ONEUI_INJECT_SIXZONE_CTRL));
+	struct dpu_hw_pcc_cfg pcc;
+	struct dpu_hw_dspp *dspp;
+	struct dpu_hw_ctl *ctl;
+	int i;
+
+	/*
+	 * Apply exactly ONCE per param write (the write callback sets
+	 * oneui_inject_pending), on whatever atomic commit comes next - so it
+	 * rides any commit (flip or modeset), not only a needs_modeset event
+	 * (mainline's fbdev consumes the first modeset at insmod), and does not
+	 * re-flush the DSPP on every subsequent flip.  A write of 0 actively
+	 * DISABLES PCC (revert), so the off-state is observable too.
+	 */
+	if (!oneui_inject_pending)
+		return;
+	oneui_inject_pending = 0;
+
+	DRM_INFO("oneui_dspp_inject: hook fired param=0x%x mixers=%d needs_modeset=%d\n",
+		 oneui_dspp_inject, cstate->num_mixers,
+		 drm_atomic_crtc_needs_modeset(state));
+
+	/* OneUI's captured PCC is identity (0x8000 == 1.0 in S3.15); the tint
+	 * positive control halves green so the datapath is provably visible.
+	 */
+	memset(&pcc, 0, sizeof(pcc));
+	pcc.r.r = 0x8000;
+	pcc.g.g = (oneui_dspp_inject & ONEUI_INJECT_PCC_TINT) ? 0x4000 : 0x8000;
+	pcc.b.b = 0x8000;
+
+	for (i = 0; i < cstate->num_mixers; i++) {
+		ctl = mixer[i].lm_ctl;
+
+		/* prefer a reserved DSPP; else use the probe-initialised block
+		 * object (correct blk_addr, independent of RM reservation).
+		 */
+		dspp = mixer[i].hw_dspp;
+		if (!dspp && i < ARRAY_SIZE(dpu_kms->rm.dspp_blks) &&
+		    dpu_kms->rm.dspp_blks[i])
+			dspp = to_dpu_hw_dspp(dpu_kms->rm.dspp_blks[i]);
+
+		if (!dspp || !ctl) {
+			DRM_INFO("oneui_dspp_inject: mixer%d SKIP (dspp=%p ctl=%p)\n",
+				 i, dspp, ctl);
+			continue;
+		}
+
+		/* six-zone path: program OneUI's PA + six-zone directly */
+		if (sixzone && enable) {
+			_dpu_crtc_oneui_sixzone(dspp, ctl,
+				oneui_dspp_inject & ONEUI_INJECT_SIXZONE_CTRL);
+			continue;
+		}
+
+		if (!dspp->ops.setup_pcc) {
+			DRM_INFO("oneui_dspp_inject: mixer%d no setup_pcc\n", i);
+			continue;
+		}
+
+		dspp->ops.setup_pcc(dspp, enable ? &pcc : NULL);
+
+		if (ctl->ops.update_pending_flush_dspp)
+			ctl->ops.update_pending_flush_dspp(ctl, dspp->idx,
+							   DPU_DSPP_PCC);
+
+		/*
+		 * On revert (param == 0) also clear any PA/six-zone a prior write
+		 * may have enabled: restore the stock PA OP_MODE and flush it, so a
+		 * six-zone test fully reverts to stock, not just the PCC sub-block.
+		 */
+		if (!enable && dspp->idx - DSPP_0 < DSPP_MAX - DSPP_0) {
+			DPU_REG_WRITE(&dspp->hw, DSPP_PA_OP_MODE, STOCK_PA_OPMODE);
+			ctl->pending_dspp_flush_mask[dspp->idx - DSPP_0] |=
+				CTL_DSPP_FLUSH_PA;
+			ctl->pending_flush_mask |= BIT(CTL_FLUSH_DSPP_IDX);
+		}
+
+		DRM_INFO("oneui_dspp_inject=0x%x: %s -> dspp%d (g.g=0x%x) ctl%d\n",
+			 oneui_dspp_inject,
+			 !enable ? "DISABLE" :
+			 (oneui_dspp_inject & ONEUI_INJECT_PCC_TINT) ?
+				"TINT(control)" : "identity",
+			 dspp->idx - DSPP_0, enable ? pcc.g.g : 0,
+			 ctl->idx - CTL_0);
+	}
+}
+
 static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
 		struct drm_atomic_state *state)
 {
@@ -933,6 +1187,8 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
 	_dpu_crtc_blend_setup(crtc);
 
 	_dpu_crtc_setup_cp_blocks(crtc);
+
+	_dpu_crtc_oneui_dspp_inject(crtc);
 
 	/*
 	 * PP_DONE irq is only used by command mode for now.
@@ -1415,7 +1671,8 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	else
 		topology.num_lm = 1;
 
-	if (crtc_state->ctm || crtc_state->gamma_lut)
+	if (crtc_state->ctm || crtc_state->gamma_lut ||
+	    (oneui_dspp_inject & ONEUI_INJECT_FORCE_DSPP))
 		topology.num_dspp = topology.num_lm;
 
 	return topology;
