@@ -65,6 +65,16 @@
 	qcom,board-id = <0x10008 0x03>;
 
 	aliases {
+		/*
+		 * serial0 = uart7 is REQUIRED even though uart7 is the BT serdev
+		 * engine, not a console: qcom_geni_serial's uart driver assigns its
+		 * port line via of_alias_get_id(node, "serial") and FAILS probe
+		 * ("Invalid line -19" = -ENODEV) without an alias. This ONLY numbers
+		 * the port; it does NOT make uart7 a console — there is no stdout-path
+		 * here and the cmdline carries no console=ttyMSM0, so no console is
+		 * registered on it (and the bluetooth serdev child claims the port).
+		 * Console is tty0 (panel) + the USB CDC-ACM gadget (ttyGS0).
+		 */
 		serial0 = &uart7;
 	};
 
@@ -72,8 +82,6 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
-
-		stdout-path = "serial0:115200n8";
 
 		/*
 		 * gts9u panel = GTS9U_ANA38407_AMSA46AS02 (live bootargs);
@@ -1117,4 +1125,40 @@
 
 &gpu_zap_shader {
 	firmware-name = "qcom/sm8550/samsung/gts9u/a740_zap.mbn";
+};
+
+/*
+ * Bluetooth — the device's own WCN7850 ("kiwi") BT controller over UART.
+ *
+ * GOLDEN-RULE value (device's own resolved DTS, gts9uwifi_eur_open_w00_r03):
+ * the stock BT HCI runs on qcom,qup_hsuart@0xa9c000 = QUP1 Serial Engine 7,
+ * pins gpio26 (TX) / gpio27 (RX), 2-wire with QCA in-band-sleep (the stock
+ * "qcom,wakeup-byte"). In mainline that engine is uart7 — NOT the QRD's
+ * uart14 that ADR-0016 named. The base node is qcom,geni-debug-uart (a
+ * polled console); override it with the full serdev-capable geni-uart so
+ * hci_qca can drive the HCI link. Pinctrl (qup_uart7_default = gpio26/27,
+ * 2-wire) is inherited from sm8550.dtsi and already matches the device; the
+ * board does NOT route CTS/RTS to BT, so no flow-control pins are added.
+ *
+ * Power is owned by the wcn7850-pmu pwrseq node above (bt-enable-gpios =
+ * TLMM 81); per the mainline-qrd convention the bluetooth node OMITS
+ * enable-gpios and only lists its supplies (the PMU's vreg_pmu_* LDOs).
+ */
+&uart7 {
+	compatible = "qcom,geni-uart";
+	status = "okay";
+
+	bluetooth {
+		compatible = "qcom,wcn7850-bt";
+
+		vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;
+		vddaon-supply = <&vreg_pmu_aon_0p59>;
+		vddwlcx-supply = <&vreg_pmu_wlcx_0p8>;
+		vddwlmx-supply = <&vreg_pmu_wlmx_0p85>;
+		vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
+		vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
+		vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
+
+		max-speed = <3200000>;
+	};
 };

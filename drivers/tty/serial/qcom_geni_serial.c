@@ -95,6 +95,14 @@
 #define IO_MACRO_IO0_SEL		0x3
 #define DEFAULT_IO_MACRO_IO2_IO3_MASK	GENMASK(15, 4)
 #define IO_MACRO_IO2_IO3_SWAP		0x4640
+/*
+ * IO2_IO3 routing bit the device's own (downstream) geni driver sets on every
+ * non-console SE-DMA UART (its IO_MACRO_CTRL value is 0x431c). Mainline only
+ * touches IO_MACRO_CTRL under a pin-swap guard and otherwise trusts the boot
+ * default, which on this SE leaves this bit clear -- so a serdev's TX/RX never
+ * reach the peripheral. It is also part of IO_MACRO_IO2_IO3_SWAP above.
+ */
+#define IO_MACRO_IO2_IO3_HS_ROUTE	0x4000
 
 /* We always configure 4 bytes per FIFO word */
 #define BYTES_PER_FIFO_WORD		4U
@@ -1212,8 +1220,19 @@ static int qcom_geni_serial_port_setup(struct uart_port *uport)
 		pin_swap &= ~DEFAULT_IO_MACRO_IO0_IO1_MASK;
 		pin_swap |= IO_MACRO_IO0_SEL;
 	}
-	/* Configure this register if RX-TX, CTS-RTS pins are swapped */
-	if (port->rx_tx_swap || port->cts_rts_swap)
+	/*
+	 * Device-own routing (gts9u 2-wire WCN7850 BT): the device's downstream
+	 * geni driver programs IO_MACRO_CTRL = 0x431c on every non-console SE-DMA
+	 * UART. Mainline only writes this register under the pin-swap guard,
+	 * otherwise trusting the boot default (0x031c on this SE) which leaves the
+	 * IO2_IO3 routing bit clear -- so the serdev's TX/RX never reach the
+	 * WCN7850 (the 0xfc00 version read times out, rx stays 0). Set the
+	 * device-own routing bit for the non-console (serdev) UART.
+	 */
+	if (!uart_console(uport))
+		pin_swap |= IO_MACRO_IO2_IO3_HS_ROUTE;
+	/* Configure this register if pins are swapped or the routing bit is set */
+	if (port->rx_tx_swap || port->cts_rts_swap || !uart_console(uport))
 		writel(pin_swap, uport->membase + SE_UART_IO_MACRO_CTRL);
 
 	/*

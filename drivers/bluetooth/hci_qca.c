@@ -1756,7 +1756,15 @@ static int qca_port_reopen(struct hci_uart *hu)
 		return ret;
 	}
 
-	hci_uart_set_flow_control(hu, false);
+	/*
+	 * This board's WCN7850 BT runs a 2-wire UART (TX/RX only; no CTS/RTS
+	 * pin is muxed on uart7). Enabling HW flow control here makes the geni
+	 * serial engine gate TX on its unmuxed, floating CTS input, so every
+	 * HCI command stalls in the TX FIFO and the 0xfc00 version read times
+	 * out with RX=0. Disable HW flow control for the 2-wire link. (A 4-wire
+	 * QCA BT keeps flow control here; conditionalise before upstreaming.)
+	 */
+	hci_uart_set_flow_control(hu, true);
 
 	return 0;
 }
