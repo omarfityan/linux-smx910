@@ -1757,14 +1757,18 @@ static int qca_port_reopen(struct hci_uart *hu)
 	}
 
 	/*
-	 * This board's WCN7850 BT runs a 2-wire UART (TX/RX only; no CTS/RTS
-	 * pin is muxed on uart7). Enabling HW flow control here makes the geni
-	 * serial engine gate TX on its unmuxed, floating CTS input, so every
-	 * HCI command stalls in the TX FIFO and the 0xfc00 version read times
-	 * out with RX=0. Disable HW flow control for the 2-wire link. (A 4-wire
-	 * QCA BT keeps flow control here; conditionalise before upstreaming.)
+	 * Match the device's own stock bring-up, which runs this WCN7850 BT
+	 * link with HW flow control ENABLED (RTS asserted) for the version
+	 * read. Captured from rooted OneUI (vendor.qti.bluetooth@1.1):
+	 * "ConfigUart: HW flow control enabled" + "UART Flow On" immediately
+	 * before the 0xfc00 Get-Version read succeeds, at 115200. The earlier
+	 * theory that flow control gates TX on the unmuxed/floating CTS of this
+	 * 2-wire (TX/RX-only) link is refuted by stock: the same hardware runs
+	 * flow control ON and transmits fine. Restore the upstream call
+	 * (enable=false => CRTSCTS on, RTS asserted) so the version read runs
+	 * against a baseline aligned with the working reference.
 	 */
-	hci_uart_set_flow_control(hu, true);
+	hci_uart_set_flow_control(hu, false);
 
 	return 0;
 }
