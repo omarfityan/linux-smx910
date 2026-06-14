@@ -20,6 +20,7 @@ obj-$(CONFIG_INPUT_JOYDEV)	+= joydev.o
 obj-$(CONFIG_INPUT_EVDEV)	+= evdev.o
 
 obj-$(CONFIG_INPUT_KEYBOARD)	+= keyboard/
+obj-$(CONFIG_KEYBOARD_STM32_POGO_V3)	+= sec_input/
 obj-$(CONFIG_INPUT_MOUSE)	+= mouse/
 obj-$(CONFIG_INPUT_JOYSTICK)	+= joystick/
 obj-$(CONFIG_INPUT_TABLET)	+= tablet/

@@ -146,6 +146,23 @@
 	};
 
 	/*
+	 * stm32_vddo — I/O rail for the Book Cover Keyboard's STM32 MCU
+	 * (R12 keyboard cover). Device-own value (gts9uwifi r03 fixed_regulator@1):
+	 * a GPIO-enabled fixed regulator on TLMM 10, active-high. The stm32_pogo_v3
+	 * driver enables this rail (stm32_dev_regulator) when the cover attaches,
+	 * before talking to the MCU over i2c15. NOT regulator-boot-on: the driver
+	 * owns the on/off so power tracks cover attach/detach.
+	 */
+	kbd_stm32_vddo: kbd-stm32-vddo-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "kbd_stm32_vddo";
+		gpio = <&tlmm 10 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		pinctrl-names = "default";
+		pinctrl-0 = <&kbd_ldo_en>;
+	};
+
+	/*
 	 * QCA WCN7850 (Samsung codename "kiwi"; PCI 17cb:1107) Wi-Fi/BT
 	 * power-management unit. Bound by pwrseq-qcom-wcn (the power-
 	 * sequencing provider): it enables the six SoC-rail inputs, toggles
@@ -1160,5 +1177,96 @@
 		vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
 
 		max-speed = <3200000>;
+	};
+};
+
+/*
+ * Book Cover Keyboard (R12) — Samsung stm32_pogo_v3 over i2c15.
+ *
+ * The cover is an STM32 MCU on the pogo connector at i2c address 0x2a, on
+ * qupv3_se15 = mainline i2c15 (i2c@89c000, QUPv3 wrapper-2). Bring-up mirrors
+ * the i2c4 touchscreen pattern: the parent QUP controller (qupv3_id_1) and its
+ * GPI DMA engine (gpi_dma2) are disabled in sm8550.dtsi and must be enabled, or
+ * geni-i2c sits in -EPROBE_DEFER forever ("Failed to get tx DMA ch"). The bus
+ * SCL/SDA pinmux (qup_i2c15_data_clk) is inherited from sm8550.dtsi.
+ *
+ * All node/GPIO/property values are this device's own (gts9uwifi r03 stm32@2a +
+ * its fixed_regulator@1 I/O rail + its attn/conn/swclk/nrst pinmux).
+ */
+&qupv3_id_1 {
+	status = "okay";
+};
+
+&gpi_dma2 {
+	status = "okay";
+};
+
+&tlmm {
+	kbd_attn_irq: kbd-attn-irq-state {
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-disable;
+	};
+
+	kbd_conn_irq: kbd-conn-irq-state {
+		pins = "gpio62";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-disable;
+	};
+
+	kbd_swclk: kbd-swclk-state {
+		pins = "gpio12";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-low;
+	};
+
+	kbd_nrst: kbd-nrst-state {
+		pins = "gpio13";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+
+	kbd_ldo_en: kbd-ldo-en-state {
+		pins = "gpio10";
+		function = "gpio";
+		bias-disable;
+	};
+};
+
+&i2c15 {
+	status = "okay";
+
+	keyboard@2a {
+		compatible = "stm,stm32_pogo";
+		reg = <0x2a>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&kbd_attn_irq>, <&kbd_conn_irq>,
+			    <&kbd_swclk>, <&kbd_nrst>;
+
+		stm32_vddo-supply = <&kbd_stm32_vddo>;
+
+		stm32,irq_gpio = <&tlmm 75 GPIO_ACTIVE_HIGH>;
+		stm32,irq_conn = <&tlmm 62 GPIO_ACTIVE_HIGH>;
+		stm32,irq_type = <0x2008>;	/* IRQF_ONESHOT | IRQF_TRIGGER_LOW */
+		stm32,irq_conn_type = <0x2003>;	/* IRQF_ONESHOT | RISING | FALLING */
+		stm32,mcu_swclk = <&tlmm 12 GPIO_ACTIVE_HIGH>;
+		stm32,mcu_nrst = <&tlmm 13 GPIO_ACTIVE_HIGH>;
+		stm32,sda_gpio = <&tlmm 72 GPIO_ACTIVE_HIGH>;
+		stm32,scl_gpio = <&tlmm 106 GPIO_ACTIVE_HIGH>;
+		stm32,fw_name = "keyboard_stm/stm32_gts9family.bin";
+		stm32,model_name = "EF-DX915\0EF-DX910\0EF-DX900\0EF-DX925\0EF-DX920";
+		stm32,fota_fw_path = [00];
+		support_open_close;
+		stm32,booster_power_models = <0xf9 0xd3>;
+		stm32,booster_power_voltage = <0x7d7d0>;	/* 514000 uV */
 	};
 };

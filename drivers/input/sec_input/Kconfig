@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Samsung sec_input keyboard-cover drivers (ubuntu-tab port)
+#
+
+config KEYBOARD_STM32_POGO_V3
+	tristate "Samsung STM32 POGO keyboard cover (V3)"
+	depends on I2C
+	select INPUT_MATRIXKMAP
+	help
+	  Support for the Samsung Book Cover Keyboard used by the Galaxy Tab S9
+	  Ultra (SM-X910). The cover is an STM32 microcontroller on the pogo-pin
+	  connector, attached over I2C (stm,stm32_pogo, address 0x2a). This is a
+	  port of Samsung's downstream stm32_pogo_v3 driver bundle; it reports a
+	  matrix keypad and (optionally) a touchpad, and drives the MAX77816
+	  buck-boost booster rail for high-current cover models.
+
+	  Say M here to build it as a module, or Y to build it in. If unsure, N.
