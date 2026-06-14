@@ -163,6 +163,42 @@
 	};
 
 	/*
+	 * Book Cover Keyboard keypad logical device. The stm32_pogo_v3 core
+	 * (keyboard@2a on i2c15) owns the I2C link and, on cover attach,
+	 * broadcasts key data over a kernel notifier chain. The keypad input
+	 * device is registered by a SEPARATE platform driver (name "stm32_kpd",
+	 * compatible "stm,keypad") that subscribes to that chain. of_platform
+	 * instantiates this root node into the platform device the driver binds
+	 * to; without it the keypad driver's platform_driver_probe() finds no
+	 * device and no input device is ever created. Authored from the device's
+	 * own downstream source (gts9uwifi r03, fragment@72 pogo_kpd) for the
+	 * names + supported-model list.
+	 *
+	 * The supported covers (EF-DX9xx, model ids below) are all "bypass"
+	 * models: the MCU does the matrix scan and emits final keycodes, so the
+	 * host keymap is never consulted (see _bypass.c). The num-rows/columns +
+	 * linux,keymap1/2 below are a PARSE-SAFETY STUB only: stm32_parse_dt()
+	 * reads them unconditionally at probe and dereferences a NULL keymap
+	 * pointer / uses an uninitialised length if they are absent. The values
+	 * are inert for bypass covers.
+	 */
+	pogo_kpd: pogo-keypad {
+		compatible = "stm,keypad";
+		keypad,input_name = "Book Cover Keyboard (EF-DX915)",
+			"Book Cover Keyboard Slim (EF-DX910)",
+			"Book Cover Keyboard (EF-DX900)",
+			"Book Cover Keyboard (EF-DX925)",
+			"Book Cover Keyboard Slim (EF-DX920)",
+			"Neos Keyboard";
+		keypad,input_name_row = [00];
+		keypad,support_keyboard_model = <0xf9 0xf8 0xfe 0xd3 0xd6 0x51>;
+		keypad,num-rows = <1>;
+		keypad,num-columns = <1>;
+		linux,keymap1 = <0x00000002>;
+		linux,keymap2 = <0x00000002>;
+	};
+
+	/*
 	 * QCA WCN7850 (Samsung codename "kiwi"; PCI 17cb:1107) Wi-Fi/BT
 	 * power-management unit. Bound by pwrseq-qcom-wcn (the power-
 	 * sequencing provider): it enables the six SoC-rail inputs, toggles
