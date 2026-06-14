@@ -1326,9 +1326,13 @@
  * dependency to -EPROBE_DEFER on. SDA gpio206 / SCL gpio207 (i2chub0_se8),
  * pinctrl + clocks + interconnects all inherited from sm8550.dtsi.
  *
- * No child device node yet: this enables the bare bus so the SM5714 register
- * sequence (BSTCNTL1/CNTL2 OTG-boost enable) can be validated by direct i2c
- * read/write before a regulator driver is written. 0x49 is left unclaimed.
+ * The SM5714 charger block (0x49) is claimed by the sm5714-usb-vbus driver,
+ * which drives both the OTG VBUS boost (charger 0x49) and the USB2 data-path
+ * com switch (MUIC 0x25, a secondary i2c client it creates). USB host mode is
+ * off by default -- the SM5714 cannot source VBUS and charge the battery at the
+ * same time -- and is enabled on demand via the driver's "host_vbus" sysfs
+ * attribute. Add "siliconmitus,vbus-always-on" below to bring host mode up
+ * automatically at boot instead (note: that prevents charging while running).
  */
 &i2c_master_hub_0 {
 	status = "okay";
@@ -1337,4 +1341,10 @@
 &i2c_hub_8 {
 	status = "okay";
 	clock-frequency = <400000>;
+
+	usb_vbus: usb-vbus@49 {
+		compatible = "siliconmitus,sm5714-usb-vbus";
+		reg = <0x49>;
+		/* siliconmitus,vbus-always-on; */
+	};
 };
