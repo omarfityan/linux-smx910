@@ -35,3 +35,4 @@ obj-$(CONFIG_USB_SISUSBVGA)		+= sisusbvga/
 obj-$(CONFIG_USB_LINK_LAYER_TEST)	+= lvstest.o
 obj-$(CONFIG_BRCM_USB_PINMAP)		+= brcmstb-usb-pinmap.o
 obj-$(CONFIG_USB_ONBOARD_DEV)		+= onboard_usb_dev.o
+obj-$(CONFIG_USB_SM5714_VBUS)		+= sm5714-usb-vbus.o

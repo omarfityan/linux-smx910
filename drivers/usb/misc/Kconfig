@@ -359,3 +359,20 @@ config USB_ONBOARD_DEV_USB5744
 	  during hub start-up configuration stage. It is must to enable this
 	  option on AMD Kria KR260 Robotics Starter Kit as this hub is
 	  connected to USB-SD converter which mounts the root filesystem.
+
+config USB_SM5714_VBUS
+	tristate "Silicon Mitus SM5714 USB host (OTG) VBUS controller"
+	depends on I2C && OF
+	help
+	  Say Y here to support USB host (OTG) mode on boards that source the
+	  USB-C VBUS and route the USB2 data lines through a Silicon Mitus
+	  SM5714 PMIC (e.g. the Samsung Galaxy Tab S9 Ultra, SM-X910).
+
+	  The driver drives the SM5714 charger block (5 V OTG boost) and MUIC
+	  block (manual D+/D- com switch) over I2C to bring up host mode. Host
+	  mode is off by default and is controlled by the "host_vbus" sysfs
+	  attribute, or brought up at probe with the device-tree property
+	  "siliconmitus,vbus-always-on".
+
+	  If unsure, say N. If built as a module it will be called
+	  sm5714-usb-vbus.
