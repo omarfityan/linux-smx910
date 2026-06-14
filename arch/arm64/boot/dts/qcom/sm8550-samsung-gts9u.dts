@@ -1310,3 +1310,31 @@
 		stm32,booster_power_voltage = <0x7d7d0>;	/* 514000 uV */
 	};
 };
+
+/*
+ * Silicon Mitus SM5714 PMIC control bus (USB-host VBUS bring-up).
+ *
+ * The USB-C port's 5V VBUS boost (downstream "sm5714-otg") lives inside the
+ * SM5714 charger block, reached over I2C at 7-bit addr 0x49. The device's own
+ * downstream DT places the SM5714 MFD on qupv3_hub_i2c8 (i2c@9a0000) = mainline
+ * &i2c_hub_8, inside the I2C-master-hub wrapper &i2c_master_hub_0 (geniqup@9c0000).
+ *
+ * That hub is a dedicated I2C-only QUP (compatible "qcom,geni-i2c-master-hub",
+ * FIFO/no-DMA) -- it is NOT a general geniqup SE that firmware multiplexes to
+ * UART/SPI, so the "Invalid proto 2" provisioning wall (which blocks the eUSB2
+ * repeater's SE6 i2c above) does not apply here, and there is no GPI-DMA
+ * dependency to -EPROBE_DEFER on. SDA gpio206 / SCL gpio207 (i2chub0_se8),
+ * pinctrl + clocks + interconnects all inherited from sm8550.dtsi.
+ *
+ * No child device node yet: this enables the bare bus so the SM5714 register
+ * sequence (BSTCNTL1/CNTL2 OTG-boost enable) can be validated by direct i2c
+ * read/write before a regulator driver is written. 0x49 is left unclaimed.
+ */
+&i2c_master_hub_0 {
+	status = "okay";
+};
+
+&i2c_hub_8 {
+	status = "okay";
+	clock-frequency = <400000>;
+};
