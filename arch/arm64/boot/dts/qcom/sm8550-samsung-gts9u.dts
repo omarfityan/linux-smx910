@@ -1045,8 +1045,12 @@
 };
 
 /*
- * USB device-mode gadget: dwc3 peripheral over eUSB2. USB2/high-speed only --
- * no qmpphy/SuperSpeed.
+ * USB host: dwc3 host over eUSB2 (flipped from peripheral/gadget for USB-host
+ * bring-up; loses the ttyGS0 gadget serial console -- SSH-over-Wi-Fi is primary).
+ * USB2/high-speed only -- no qmpphy/SuperSpeed. NOTE: native port VBUS (5V out)
+ * is sourced by the Samsung SM5714 (sm5714-otg) which has no mainline driver --
+ * so attached devices need EXTERNAL VBUS (a powered/PD hub or dock). The host
+ * data path itself does not depend on that.
  *
  * The NXP PTN3222 eUSB2 repeater conditions the 1.2V eUSB2 signal up to 3.3V
  * USB2 for the connector, so it is electrically required. It sits on SE6 i2c
@@ -1072,7 +1076,7 @@
 
 &usb_1 {
 	status = "okay";
-	dr_mode = "peripheral";
+	dr_mode = "host";
 	phys = <&usb_1_hsphy>;
 	phy-names = "usb2-phy";
 	maximum-speed = "high-speed";
