@@ -1132,4 +1132,14 @@ config FUEL_GAUGE_MM8013
 	  the state of charge, temperature, cycle count, actual and design
 	  capacity, etc.
 
+config FUEL_GAUGE_SM5714
+	tristate "Silicon Mitus SM5714 fuel gauge driver"
+	depends on I2C
+	help
+	  Say Y here to enable the read-only Silicon Mitus SM5714 battery
+	  fuel-gauge driver.  The SM5714 combined PMIC carries a fuel-gauge
+	  sub-block (i2c 0x71) on boards such as the Samsung Galaxy Tab S9
+	  Ultra (SM-X910).  It exposes battery capacity, voltage, current and
+	  temperature via the power-supply interface.
+
 endif # POWER_SUPPLY
