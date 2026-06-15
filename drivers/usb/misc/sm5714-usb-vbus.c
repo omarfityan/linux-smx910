@@ -76,6 +76,33 @@
 #define SM5714_INPUT_CURRENT_CDP	1500
 #define SM5714_INPUT_CURRENT_TA		1800
 
+/*
+ * Cell charge current (CHGCNTL2 reg 0x18, fast-charge field, whole byte):
+ * value = 7 + (uA - 109375) / 15625.  The device-own default_charging_current
+ * for a wall charger (gts9u cable-info) is 2100 mA; the hardware power-on
+ * default is 500 mA.  We do NOT run stock's full thermal step-charging, so the
+ * 2100 mA value is applied only with a battery-temperature read and is
+ * throttled back to the 500 mA floor when the cell runs hot (hysteresis).
+ */
+#define SM5714_CHG_REG_CHGCNTL2		0x18
+#define SM5714_CHARGE_CURRENT_MIN	500	/* safe floor (hw default) */
+#define SM5714_CHARGE_CURRENT_TA	2100	/* device-own (0x834) */
+#define SM5714_CHGCNTL2_MAX_OFFSET	134	/* register cap == 2100 mA */
+
+/*
+ * Cell temperature window for the raised charge current (units: 0.1 C from the
+ * fuel gauge).  Full current only inside ~15..40 C, with hysteresis out to
+ * 10..45 C; throttle to the 500 mA floor when the cell is HOT (thermal stress)
+ * or COLD (fast charge below ~10 C risks lithium plating -- permanent damage).
+ * Readings outside the plausible range are treated as a failed read (-> floor).
+ */
+#define SM5714_BATT_TEMP_HOT		450	/* >=45.0 C: throttle (enter) */
+#define SM5714_BATT_TEMP_HOT_OK		400	/* <=40.0 C: hot cleared (exit) */
+#define SM5714_BATT_TEMP_COLD		100	/* <=10.0 C: throttle (enter) */
+#define SM5714_BATT_TEMP_COLD_OK	150	/* >=15.0 C: cold cleared (exit) */
+#define SM5714_BATT_TEMP_VALID_LO	-300	/* < -30.0 C: implausible read */
+#define SM5714_BATT_TEMP_VALID_HI	800	/* >  80.0 C: implausible read */
+
 /* poll period: no IRQ wired, so re-evaluate the attached charger periodically */
 #define SM5714_CHG_POLL_MS		3000
 
@@ -84,6 +111,7 @@ struct sm5714_vbus {
 	struct i2c_client *muic;	/* 0x25 - secondary client */
 	struct mutex lock;
 	bool enabled;
+	bool charge_throttled;		/* hot/cold throttle hysteresis state */
 	struct power_supply *psy;	/* charger online indicator */
 	struct delayed_work charger_work;	/* input-current management */
 };
@@ -171,28 +199,69 @@ static int sm5714_input_current_ma(u8 dev_type1)
 	return SM5714_INPUT_CURRENT_SDP;		/* SDP / undetected -> spec-safe */
 }
 
+/* CHGCNTL2 fast-charge field: value = 7 + (uA - 109375) / 15625, capped. */
+static u8 sm5714_chgcurr_offset(int ma)
+{
+	int off;
+
+	if (ma < 110)
+		return 7;
+	off = 7 + (ma * 1000 - 109375) / 15625;
+	if (off > SM5714_CHGCNTL2_MAX_OFFSET)
+		off = SM5714_CHGCNTL2_MAX_OFFSET;	/* never exceed 2100 mA */
+	return off;
+}
+
+/* Read the cell temperature (0.1 C) from the SM5714 fuel-gauge power supply. */
+static bool sm5714_read_batt_temp(int *temp)
+{
+	struct power_supply *fg;
+	union power_supply_propval val;
+	bool ok = false;
+
+	fg = power_supply_get_by_name("sm5714-fuelgauge");
+	if (!fg)
+		return false;
+	/* Reject implausible (garbage / stale) readings -> caller uses the floor. */
+	if (power_supply_get_property(fg, POWER_SUPPLY_PROP_TEMP, &val) == 0 &&
+	    val.intval >= SM5714_BATT_TEMP_VALID_LO &&
+	    val.intval <= SM5714_BATT_TEMP_VALID_HI) {
+		*temp = val.intval;
+		ok = true;
+	}
+	power_supply_put(fg);
+	return ok;
+}
+
 /*
  * The SM5714 charger autonomously charges, but its input-current limit defaults
- * to 500 mA -- too low to charge under load.  With no IRQ wired, poll: when a
- * charger is present (and we are not sourcing VBUS for host mode), read the MUIC
- * classification and raise VBUSCNTL to the device-own ceiling for that charger
- * class; when nothing is attached, return it to the conservative 500 mA so a
- * later SDP plug starts spec-safe.  Hardware AICL caps the real draw.
+ * to 500 mA -- too low to charge under load -- and its cell charge current to a
+ * conservative 500 mA.  With no IRQ wired, poll: when a charger is present (and
+ * we are not sourcing VBUS for host mode), read the MUIC classification, raise
+ * the input limit (VBUSCNTL) to the device-own ceiling for that charger class,
+ * and raise the cell charge current (CHGCNTL2) toward the device-own 2100 mA TA
+ * value -- but only with a real charger AND a temperature read, throttling back
+ * to 500 mA when the cell runs hot (we do not run stock's full step-charging).
+ * When nothing is attached, both return to 500 mA.  Hardware AICL caps the input
+ * draw to the adapter's capability; charge/float-voltage/OVP are hardware.
  */
 static void sm5714_vbus_charger_work(struct work_struct *work)
 {
 	struct sm5714_vbus *sv = container_of(work, struct sm5714_vbus,
 					      charger_work.work);
-	int status1, dev_type1, factory, cur, ma = SM5714_INPUT_CURRENT_SDP;
+	int status1, dev_type1, factory, cur, temp;
+	int input_ma = SM5714_INPUT_CURRENT_SDP;
+	int charge_ma = SM5714_CHARGE_CURRENT_MIN;
+	bool charger = false;
 	u8 offset;
 
 	mutex_lock(&sv->lock);
 
-	/* In host mode we source VBUS; the input-current limit does not apply. */
+	/* In host mode we source VBUS; charger management does not apply. */
 	if (sv->enabled)
 		goto out;
 
-	/* Factory mode owns VBUSCNTL; do not fight it. */
+	/* Factory mode owns the charger registers; do not fight it. */
 	factory = i2c_smbus_read_byte_data(sv->chg, SM5714_CHG_REG_FACTORY1);
 	if (factory >= 0 && (factory & SM5714_CHG_FACTORY1_FACMODE))
 		goto out;
@@ -204,16 +273,47 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 	if (status1 & SM5714_CHG_STATUS1_VBUSPOK) {
 		dev_type1 = i2c_smbus_read_byte_data(sv->muic,
 						     SM5714_MUIC_REG_DEVTYPE1);
-		if (dev_type1 >= 0)
-			ma = sm5714_input_current_ma(dev_type1);
+		if (dev_type1 >= 0) {
+			input_ma = sm5714_input_current_ma(dev_type1);
+			/* a source above SDP can charge faster than the default */
+			charger = input_ma > SM5714_INPUT_CURRENT_SDP;
+		}
 	}
 
-	offset = ((ma - 100) / 25) & SM5714_CHG_VBUSCNTL_MASK;
+	/* 1) input-current limit (VBUSCNTL); clamp (not wrap) for safety */
+	offset = min((input_ma - 100) / 25, (int)SM5714_CHG_VBUSCNTL_MASK);
 	cur = i2c_smbus_read_byte_data(sv->chg, SM5714_CHG_REG_VBUSCNTL);
 	if (cur >= 0 && (cur & SM5714_CHG_VBUSCNTL_MASK) != offset) {
 		i2c_smbus_write_byte_data(sv->chg, SM5714_CHG_REG_VBUSCNTL,
 					  (cur & ~SM5714_CHG_VBUSCNTL_MASK) | offset);
-		dev_info(&sv->chg->dev, "input-current limit set to %d mA\n", ma);
+		dev_info(&sv->chg->dev, "input-current limit set to %d mA\n",
+			 input_ma);
+	}
+
+	/*
+	 * 2) cell charge current (CHGCNTL2): raise to the device-own TA value
+	 * only inside a safe temperature window.  Throttle to the floor when the
+	 * cell is HOT (>=45 C) or COLD (<=10 C -- fast charge there risks lithium
+	 * plating), with a dead-band so the state cannot oscillate.  Any failed or
+	 * implausible temperature read leaves charge_ma at the 500 mA floor.
+	 */
+	if (charger && sm5714_read_batt_temp(&temp)) {
+		if (temp >= SM5714_BATT_TEMP_HOT || temp <= SM5714_BATT_TEMP_COLD)
+			sv->charge_throttled = true;
+		else if (temp <= SM5714_BATT_TEMP_HOT_OK &&
+			 temp >= SM5714_BATT_TEMP_COLD_OK)
+			sv->charge_throttled = false;
+		charge_ma = sv->charge_throttled ? SM5714_CHARGE_CURRENT_MIN
+						 : SM5714_CHARGE_CURRENT_TA;
+	}
+
+	offset = sm5714_chgcurr_offset(charge_ma);
+	cur = i2c_smbus_read_byte_data(sv->chg, SM5714_CHG_REG_CHGCNTL2);
+	if (cur >= 0 && cur != offset) {
+		i2c_smbus_write_byte_data(sv->chg, SM5714_CHG_REG_CHGCNTL2,
+					  offset);
+		dev_info(&sv->chg->dev, "cell charge current set to %d mA\n",
+			 charge_ma);
 	}
 
 out:
