@@ -1362,6 +1362,30 @@
 };
 
 /*
+ * SM5714 Type-C PD/role controller (PDIC) bus.
+ *
+ * The USB-C cable-orientation / role-detect block (downstream "sm5714-usbpd")
+ * lives at i2c 7-bit addr 0x33 -- on a SECOND i2c-hub serial engine, SE9
+ * (i2c@9a4000 = mainline &i2c_hub_9), a sibling of the SE8 above inside the
+ * same dedicated I2C-master-hub wrapper &i2c_master_hub_0. The device's own
+ * downstream DT places it here (overlay fragment@46 -> qupv3_hub_i2c9); a
+ * vestigial "i2c-gpio,delay-us" property in that overlay misleadingly suggests
+ * a bitbanged bus, but the resolved node is a hardware geni i2c controller --
+ * SDA gpio84 / SCL gpio85 (i2chub0_se9), pinctrl/clocks inherited from
+ * sm8550.dtsi, identical in shape to SE8.
+ *
+ * The bus is enabled here with NO child node so the PDIC address (0x33) stays
+ * unclaimed -- this lets CC_STATUS (reg 0x28) be read directly over i2c to
+ * confirm role detection before any driver exists. The usbpd@33 node + its
+ * role-switch driver (DRP init CC_CNTL1 0x29=0x40; CC_STATUS decode 0x01=sink/
+ * DEVICE, 0x02=source/HOST, 0x03=audio) are a later increment.
+ */
+&i2c_hub_9 {
+	status = "okay";
+	clock-frequency = <400000>;
+};
+
+/*
  * ADSP (LPASS) remoteproc -- the keystone for pmic_glink (battery / USB-C PD /
  * DP-altmode) and for CPU-offload audio. The mainline sm8550-adsp-pas driver
  * loads Samsung's own signed PAS firmware (adsp.mdt + adsp_dtb.mdt) through
