@@ -187,8 +187,13 @@ while [ -z "$PB_ROOTDEV" ]; do
 done
 $BB echo "<1>INIT_PATHB_ROOTDEV=[$PB_ROOTDEV] waited=${k}x0.2s" > /dev/kmsg
 if [ -n "$PB_ROOTDEV" ] && $BB mount -t btrfs -o ro "$PB_ROOTDEV" "$PB_NEWROOT" 2>/dev/kmsg; then
-	if [ -f "$PB_NEWROOT/$PB_MARKER" ] && [ -e "$PB_NEWROOT/sbin/init" ]; then
-		mark PATHB_MARKER_ARMED
+	# DEV-MODE BYPASS: in dr_mode=host there is no ttyGS0 serve-loop shell to
+	# re-arm the one-shot $PB_MARKER, so the marker gate only traps us in the
+	# passive serve loop (a single hung boot consumes the marker and the next
+	# cold boot has no way back). Hand off to systemd whenever the root carries
+	# /sbin/init. Restore the marker gate once a USB gadget lifeline returns.
+	if [ -e "$PB_NEWROOT/sbin/init" ]; then
+		mark PATHB_MARKER_BYPASS
 		$BB mount -o remount,rw "$PB_NEWROOT" 2>/dev/kmsg
 		$BB rm -f "$PB_NEWROOT/$PB_MARKER" ; $BB sync
 		# hand the live pseudo-fs to systemd (keeps the bound USB gadget alive)
