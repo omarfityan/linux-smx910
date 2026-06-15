@@ -34,11 +34,16 @@
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
 
+#include "sm5714-usb-vbus.h"
+
 /* MUIC sub-block: secondary i2c address + the manual-switch register */
 #define SM5714_MUIC_I2C_ADDR		0x25
 #define SM5714_MUIC_REG_MANUAL_SW	0x06
 #define SM5714_MUIC_MANSW_USB		0x89	/* bit7 manual | DM/DP -> USB */
-#define SM5714_MUIC_MANSW_OPEN		0x00	/* open all (D+/D-/VBUS detached) */
+#define SM5714_MUIC_MANSW_OPEN		0x00	/* bit7=0 -> automatic mode: the
+						 * MUIC autonomously routes D+/D-
+						 * (USB data for SDP/CDP -> gadget,
+						 * charging otherwise) */
 
 /* Charger sub-block: this driver binds its i2c client (0x49) */
 #define SM5714_CHG_REG_CNTL2		0x14
@@ -136,6 +141,15 @@ static int sm5714_vbus_enable(struct sm5714_vbus *sv)
 	if (ret)
 		goto unroute;
 
+	/*
+	 * The boost is current-limited to 900 mA (BSTCNTL1 above).  That hardware
+	 * cap -- with the SM5714's own back-feed/OVP protection -- is the safety
+	 * net for the brief source-vs-source contention if a peripheral is swapped
+	 * for a charger faster than the role driver cuts VBUS.  STATUS3 OTGFAIL is
+	 * advisory only (warn, not abort).  NOTE: the downstream driver's
+	 * check_usb_killer() D+/D- probe before energizing is deliberately NOT
+	 * ported here -- acceptable for a controlled development target.
+	 */
 	status = i2c_smbus_read_byte_data(sv->chg, SM5714_CHG_REG_STATUS3);
 	if (status >= 0 && (status & SM5714_CHG_STATUS3_OTGFAIL))
 		dev_warn(&sv->chg->dev,
@@ -150,14 +164,32 @@ unroute:
 	return ret;
 }
 
-static void sm5714_vbus_disable(struct sm5714_vbus *sv)
+static int sm5714_vbus_disable(struct sm5714_vbus *sv)
 {
-	/* Cut VBUS first, then open the data switch. */
-	i2c_smbus_write_byte_data(sv->chg, SM5714_CHG_REG_CNTL2,
-				  SM5714_CHG_CNTL2_OFF);
+	int ret;
+
+	/*
+	 * Cut VBUS first -- this is the safety-critical write; a silent failure
+	 * here would leave the 5 V boost sourcing.  Then return the MUIC to
+	 * automatic.  The CNTL2 result is propagated so the caller does not record
+	 * the boost as off when it may still be live.
+	 */
+	ret = i2c_smbus_write_byte_data(sv->chg, SM5714_CHG_REG_CNTL2,
+					SM5714_CHG_CNTL2_OFF);
 	i2c_smbus_write_byte_data(sv->muic, SM5714_MUIC_REG_MANUAL_SW,
 				  SM5714_MUIC_MANSW_OPEN);
+	return ret;
 }
+
+/*
+ * Single-instance hook: the SM5714 Type-C role driver (sm5714-typec, bound to
+ * the PDIC at i2c 0x33 on the sibling bus) detects host vs device from CC_STATUS
+ * and calls in here to source / cut the OTG VBUS + data routing.  Host VBUS lives
+ * in the charger sub-block this driver owns, so the role driver reaches it through
+ * this exported helper rather than poking 0x49 itself.
+ */
+static DEFINE_MUTEX(sm5714_vbus_instance_lock);
+static struct sm5714_vbus *sm5714_vbus_instance;
 
 static int sm5714_vbus_set(struct sm5714_vbus *sv, bool on)
 {
@@ -171,8 +203,14 @@ static int sm5714_vbus_set(struct sm5714_vbus *sv, bool on)
 	if (on)
 		ret = sm5714_vbus_enable(sv);
 	else
-		sm5714_vbus_disable(sv);
+		ret = sm5714_vbus_disable(sv);
 
+	/*
+	 * Commit the new state only when the hardware write succeeded.  On a
+	 * failed cutoff sv->enabled stays true, so the early-out above does not
+	 * fire next time and the caller's resync retries the cutoff instead of
+	 * trusting a still-live boost to be off.
+	 */
 	if (!ret) {
 		sv->enabled = on;
 		changed = true;
@@ -185,6 +223,25 @@ out:
 		power_supply_changed(sv->psy);
 	return ret;
 }
+
+/*
+ * Source (host) or cut (device / disconnected) the OTG VBUS + data routing on
+ * behalf of the Type-C role driver.  HOST -> 5 V boost on + D+/D- routed to the
+ * controller; DEVICE/NONE -> boost off + MUIC back to automatic (which routes a
+ * PC's data for gadget mode and charges a wall charger).  Returns -ENODEV until
+ * the VBUS driver has probed.
+ */
+int sm5714_usb_vbus_set_host(bool on)
+{
+	int ret;
+
+	mutex_lock(&sm5714_vbus_instance_lock);
+	ret = sm5714_vbus_instance ? sm5714_vbus_set(sm5714_vbus_instance, on)
+				   : -ENODEV;
+	mutex_unlock(&sm5714_vbus_instance_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(sm5714_usb_vbus_set_host);
 
 /* Map the MUIC BC1.2 classification to its device-own input-current ceiling. */
 static int sm5714_input_current_ma(u8 dev_type1)
@@ -322,6 +379,14 @@ out:
 			      msecs_to_jiffies(SM5714_CHG_POLL_MS));
 }
 
+/*
+ * Read-only host-VBUS state indicator.  The SM5714 Type-C role driver
+ * (sm5714-typec) owns VBUS now -- it asserts host mode from CC_STATUS -- so this
+ * attribute only reports whether the boost is currently sourcing.  It is NOT
+ * writable: a manual override would desync the role driver's state (it would cut
+ * VBUS while the role driver still believes the port is HOST and, being
+ * idempotent, would never re-assert it).
+ */
 static ssize_t host_vbus_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
 {
@@ -329,23 +394,7 @@ static ssize_t host_vbus_show(struct device *dev,
 
 	return sysfs_emit(buf, "%d\n", sv->enabled);
 }
-
-static ssize_t host_vbus_store(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
-{
-	struct sm5714_vbus *sv = dev_get_drvdata(dev);
-	bool on;
-	int ret;
-
-	ret = kstrtobool(buf, &on);
-	if (ret)
-		return ret;
-
-	ret = sm5714_vbus_set(sv, on);
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_RW(host_vbus);
+static DEVICE_ATTR_RO(host_vbus);
 
 static struct attribute *sm5714_vbus_attrs[] = {
 	&dev_attr_host_vbus.attr,
@@ -446,6 +495,10 @@ static int sm5714_vbus_probe(struct i2c_client *client)
 	INIT_DELAYED_WORK(&sv->charger_work, sm5714_vbus_charger_work);
 	schedule_delayed_work(&sv->charger_work, 0);
 
+	mutex_lock(&sm5714_vbus_instance_lock);
+	sm5714_vbus_instance = sv;
+	mutex_unlock(&sm5714_vbus_instance_lock);
+
 	dev_info(&client->dev,
 		 "SM5714 USB host VBUS controller ready (host_vbus=%d)\n",
 		 sv->enabled);
@@ -455,6 +508,11 @@ static int sm5714_vbus_probe(struct i2c_client *client)
 static void sm5714_vbus_remove(struct i2c_client *client)
 {
 	struct sm5714_vbus *sv = i2c_get_clientdata(client);
+
+	mutex_lock(&sm5714_vbus_instance_lock);
+	if (sm5714_vbus_instance == sv)
+		sm5714_vbus_instance = NULL;
+	mutex_unlock(&sm5714_vbus_instance_lock);
 
 	cancel_delayed_work_sync(&sv->charger_work);
 	sm5714_vbus_set(sv, false);
