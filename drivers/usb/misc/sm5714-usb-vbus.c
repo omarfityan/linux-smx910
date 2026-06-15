@@ -30,6 +30,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/power_supply.h>
 #include <linux/sysfs.h>
 
 /* MUIC sub-block: secondary i2c address + the manual-switch register */
@@ -46,12 +47,15 @@
 #define SM5714_CHG_BSTCNTL1_OTG		0x46	/* 5.1 V / 900 mA OTG boost */
 #define SM5714_CHG_REG_STATUS3		0x0f
 #define SM5714_CHG_STATUS3_OTGFAIL	BIT(2)
+#define SM5714_CHG_REG_STATUS1		0x0d
+#define SM5714_CHG_STATUS1_VBUSPOK	BIT(0)	/* valid charger VBUS present */
 
 struct sm5714_vbus {
 	struct i2c_client *chg;		/* 0x49 - the bound device */
 	struct i2c_client *muic;	/* 0x25 - secondary client */
 	struct mutex lock;
 	bool enabled;
+	struct power_supply *psy;	/* charger online indicator */
 };
 
 static int sm5714_vbus_enable(struct sm5714_vbus *sv)
@@ -99,6 +103,7 @@ static void sm5714_vbus_disable(struct sm5714_vbus *sv)
 
 static int sm5714_vbus_set(struct sm5714_vbus *sv, bool on)
 {
+	bool changed = false;
 	int ret = 0;
 
 	mutex_lock(&sv->lock);
@@ -110,10 +115,16 @@ static int sm5714_vbus_set(struct sm5714_vbus *sv, bool on)
 	else
 		sm5714_vbus_disable(sv);
 
-	if (!ret)
+	if (!ret) {
 		sv->enabled = on;
+		changed = true;
+	}
 out:
 	mutex_unlock(&sv->lock);
+
+	/* host mode gates the charger-online report; refresh it on a change */
+	if (changed && sv->psy)
+		power_supply_changed(sv->psy);
 	return ret;
 }
 
@@ -148,6 +159,53 @@ static struct attribute *sm5714_vbus_attrs[] = {
 };
 ATTRIBUTE_GROUPS(sm5714_vbus);
 
+/*
+ * Report-only charger presence.  The SM5714 charger autonomously charges the
+ * battery whenever valid VBUS is present (the bootloader leaves it in
+ * CHG_ON_VBUS mode with the charge FET armed), so this driver does not touch
+ * the charge path -- it only exposes whether a charger is online so the desktop
+ * shows a line-power source.  VBUS_POK reads set when our own OTG boost sources
+ * 5 V, so the report is gated on host mode being off.
+ */
+static int sm5714_chg_get_property(struct power_supply *psy,
+				   enum power_supply_property psp,
+				   union power_supply_propval *val)
+{
+	struct sm5714_vbus *sv = power_supply_get_drvdata(psy);
+	int status1;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_ONLINE:
+		mutex_lock(&sv->lock);
+		if (sv->enabled) {
+			val->intval = 0;	/* sourcing VBUS, not charging */
+			mutex_unlock(&sv->lock);
+			return 0;
+		}
+		status1 = i2c_smbus_read_byte_data(sv->chg,
+						   SM5714_CHG_REG_STATUS1);
+		mutex_unlock(&sv->lock);
+		if (status1 < 0)
+			return status1;
+		val->intval = !!(status1 & SM5714_CHG_STATUS1_VBUSPOK);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static enum power_supply_property sm5714_chg_props[] = {
+	POWER_SUPPLY_PROP_ONLINE,
+};
+
+static const struct power_supply_desc sm5714_chg_desc = {
+	.name		= "sm5714-charger",
+	.type		= POWER_SUPPLY_TYPE_USB,
+	.properties	= sm5714_chg_props,
+	.num_properties	= ARRAY_SIZE(sm5714_chg_props),
+	.get_property	= sm5714_chg_get_property,
+};
+
 static int sm5714_vbus_probe(struct i2c_client *client)
 {
 	struct sm5714_vbus *sv;
@@ -169,6 +227,18 @@ static int sm5714_vbus_probe(struct i2c_client *client)
 
 	dev_set_drvdata(&client->dev, sv);
 	i2c_set_clientdata(client, sv);
+
+	{
+		struct power_supply_config cfg = { };
+
+		cfg.drv_data = sv;
+		cfg.fwnode = dev_fwnode(&client->dev);
+		sv->psy = devm_power_supply_register(&client->dev,
+						     &sm5714_chg_desc, &cfg);
+		if (IS_ERR(sv->psy))
+			return dev_err_probe(&client->dev, PTR_ERR(sv->psy),
+					     "failed to register charger power supply\n");
+	}
 
 	if (of_property_read_bool(client->dev.of_node,
 				  "siliconmitus,vbus-always-on")) {
