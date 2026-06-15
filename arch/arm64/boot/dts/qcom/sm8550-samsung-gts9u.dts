@@ -1348,3 +1348,34 @@
 		/* siliconmitus,vbus-always-on; */
 	};
 };
+
+/*
+ * ADSP (LPASS) remoteproc -- the keystone for pmic_glink (battery / USB-C PD /
+ * DP-altmode) and for CPU-offload audio. The mainline sm8550-adsp-pas driver
+ * loads Samsung's own signed PAS firmware (adsp.mdt + adsp_dtb.mdt) through
+ * TrustZone PAS. The bootloader-unlocked posture does not weaken peripheral
+ * firmware authentication: the signature roots in Samsung's QFPROM-burned
+ * ECDSA384 ROOT 77, so PAS authenticates the genuine stock blob the fuses
+ * expect. The memory-region phandles (adspslpi_mem + q6_adsp_dtb_mem) already
+ * resolve to the gts9u-correct carveouts declared in /reserved-memory above.
+ *
+ * firmware-name index 0 = the ADSP image, index 1 = the ADSP DTB image
+ * (sm8550_adsp_resource sets dtb_firmware_name; both blobs are required).
+ */
+&remoteproc_adsp {
+	status = "okay";
+	firmware-name = "qcom/sm8550/samsung/gts9u/adsp.mdt",
+			"qcom/sm8550/samsung/gts9u/adsp_dtb.mdt";
+};
+
+/*
+ * PMIC GLINK -- the OS-side interface to the PMIC firmware service that runs on
+ * the ADSP. A bare node (no USB-C connector graph yet) is sufficient for the
+ * battery client (qcom_battmgr -> /sys/class/power_supply). The Type-C
+ * connector + usb-role-switch + DP-altmode graph is a later increment.
+ */
+/ {
+	pmic_glink: pmic-glink {
+		compatible = "qcom,sm8550-pmic-glink", "qcom,pmic-glink";
+	};
+};
