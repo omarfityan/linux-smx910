@@ -1347,6 +1347,18 @@
 		reg = <0x49>;
 		/* siliconmitus,vbus-always-on; */
 	};
+
+	/*
+	 * SM5714 battery fuel-gauge sub-block (read-only).  Same chip, same
+	 * bus, separate i2c address -- exposes capacity / voltage / current /
+	 * temperature as a POWER_SUPPLY_TYPE_BATTERY so the desktop has a real
+	 * battery indicator.  The fuel-gauge IC is cell-powered and keeps the
+	 * vendor-programmed model table across reboots, so no parameter push.
+	 */
+	fuelgauge: fuelgauge@71 {
+		compatible = "siliconmitus,sm5714-fuelgauge";
+		reg = <0x71>;
+	};
 };
 
 /*
