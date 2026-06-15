@@ -1076,7 +1076,15 @@
 
 &usb_1 {
 	status = "okay";
-	dr_mode = "host";
+	/*
+	 * Dual-role (DRD): the data role is driven by the SM5714 Type-C
+	 * controller (sm5714-typec, usbpd@33 below) through the standard
+	 * usb_role_switch the dwc3 core registers in OTG mode (the base
+	 * "usb-role-switch" property is inherited from sm8550.dtsi).  HOST when a
+	 * peripheral is attached (the PDIC also turns on OTG VBUS), DEVICE/gadget
+	 * when a charger or host PC is attached.  USB2/high-speed only.
+	 */
+	dr_mode = "otg";
 	phys = <&usb_1_hsphy>;
 	phy-names = "usb2-phy";
 	maximum-speed = "high-speed";
@@ -1374,15 +1382,51 @@
  * SDA gpio84 / SCL gpio85 (i2chub0_se9), pinctrl/clocks inherited from
  * sm8550.dtsi, identical in shape to SE8.
  *
- * The bus is enabled here with NO child node so the PDIC address (0x33) stays
- * unclaimed -- this lets CC_STATUS (reg 0x28) be read directly over i2c to
- * confirm role detection before any driver exists. The usbpd@33 node + its
- * role-switch driver (DRP init CC_CNTL1 0x29=0x40; CC_STATUS decode 0x01=sink/
- * DEVICE, 0x02=source/HOST, 0x03=audio) are a later increment.
+ * The usbpd@33 child binds the sm5714-typec role driver, which programs
+ * autonomous DRP (CC_CNTL1 0x29=0x40), decodes CC_STATUS (reg 0x28: 0x01=source
+ * on cable -> DEVICE, 0x02=sink on cable -> HOST, 0x03=audio), and drives the
+ * dwc3 usb_role_switch + the SM5714 OTG VBUS.  The PDIC interrupt is gpio133.
  */
+&tlmm {
+	typec_int_default: typec-int-state {
+		pins = "gpio133";
+		function = "gpio";
+		bias-disable;
+		input-enable;
+	};
+};
+
 &i2c_hub_9 {
 	status = "okay";
 	clock-frequency = <400000>;
+
+	usbpd@33 {
+		compatible = "siliconmitus,sm5714-typec";
+		reg = <0x33>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <133 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&typec_int_default>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C";
+			power-role = "dual";
+			data-role = "dual";
+			try-power-role = "sink";
+
+			port {
+				sm5714_hs_ep: endpoint {
+					remote-endpoint = <&usb_1_dwc3_hs>;
+				};
+			};
+		};
+	};
+};
+
+&usb_1_dwc3_hs {
+	remote-endpoint = <&sm5714_hs_ep>;
 };
 
 /*
