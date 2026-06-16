@@ -26,6 +26,7 @@
  */
 
 #include <linux/bitops.h>
+#include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -46,9 +47,12 @@
 						 * charging otherwise) */
 
 /* Charger sub-block: this driver binds its i2c client (0x49) */
+#define SM5714_CHG_REG_CNTL1		0x13
+#define SM5714_CHG_CNTL1_ENQ4FET	BIT(3)	/* battery charge FET (Q4) enable */
 #define SM5714_CHG_REG_CNTL2		0x14
+#define SM5714_CHG_CNTL2_OPMODE_MASK	0x0f	/* OP_MODE field (bits[3:0]) */
 #define SM5714_CHG_CNTL2_OTG		0x07	/* OP_MODE = USB_OTG */
-#define SM5714_CHG_CNTL2_OFF		0x05	/* OP_MODE default (boost off) */
+#define SM5714_CHG_CNTL2_OFF		0x05	/* OP_MODE = CHG_ON_VBUS (boost off) */
 #define SM5714_CHG_REG_BSTCNTL1		0x23
 #define SM5714_CHG_BSTCNTL1_OTG		0x46	/* 5.1 V / 900 mA OTG boost */
 #define SM5714_CHG_REG_STATUS3		0x0f
@@ -57,6 +61,7 @@
 #define SM5714_CHG_STATUS1_VBUSPOK	BIT(0)	/* valid charger VBUS present */
 #define SM5714_CHG_REG_VBUSCNTL		0x15	/* input-current limit */
 #define SM5714_CHG_VBUSCNTL_MASK	0x7f	/* offset = (mA - 100) / 25 */
+#define SM5714_CHG_VBUSCNTL_500MA	16	/* (500 - 100) / 25: inrush floor */
 #define SM5714_CHG_REG_FACTORY1		0x25
 #define SM5714_CHG_FACTORY1_FACMODE	BIT(0)	/* factory mode: leave VBUSCNTL alone */
 
@@ -101,12 +106,25 @@
  * or COLD (fast charge below ~10 C risks lithium plating -- permanent damage).
  * Readings outside the plausible range are treated as a failed read (-> floor).
  */
-#define SM5714_BATT_TEMP_HOT		450	/* >=45.0 C: throttle (enter) */
-#define SM5714_BATT_TEMP_HOT_OK		400	/* <=40.0 C: hot cleared (exit) */
-#define SM5714_BATT_TEMP_COLD		100	/* <=10.0 C: throttle (enter) */
-#define SM5714_BATT_TEMP_COLD_OK	150	/* >=15.0 C: cold cleared (exit) */
+#define SM5714_BATT_TEMP_HOT		450	/* >=45.0 C: throttle current (enter) */
+#define SM5714_BATT_TEMP_HOT_OK		400	/* <=40.0 C: current throttle cleared */
+#define SM5714_BATT_TEMP_COLD		100	/* <=10.0 C: throttle current (enter) */
+#define SM5714_BATT_TEMP_COLD_OK	150	/* >=15.0 C: current throttle cleared */
 #define SM5714_BATT_TEMP_VALID_LO	-300	/* < -30.0 C: implausible read */
 #define SM5714_BATT_TEMP_VALID_HI	800	/* >  80.0 C: implausible read */
+
+/*
+ * Hard charge-cut stop-lines.  Outside these the FET is opened, not merely
+ * throttled.  Transcribed from the device's own battery layer, which cuts the
+ * charge (BUCK_OFF) at the overheat (50.0 C, wire_warm_overheat_thresh) and
+ * cold (0.0 C, wire_cold_cool3_thresh) thresholds; below 0 C fast charge plates
+ * lithium (permanent cell damage).  A wide re-arm dead-band prevents the cut
+ * from oscillating against the inner current-throttle band above.
+ */
+#define SM5714_BATT_TEMP_HOT_CUT	500	/* >=50.0 C: cut charging (enter) */
+#define SM5714_BATT_TEMP_HOT_CUT_OK	450	/* <=45.0 C: overheat cut cleared */
+#define SM5714_BATT_TEMP_COLD_CUT	0	/* <=0.0 C: cut charging (enter) */
+#define SM5714_BATT_TEMP_COLD_CUT_OK	50	/* >=5.0 C: cold cut cleared */
 
 /* poll period: no IRQ wired, so re-evaluate the attached charger periodically */
 #define SM5714_CHG_POLL_MS		3000
@@ -116,14 +134,85 @@ struct sm5714_vbus {
 	struct i2c_client *muic;	/* 0x25 - secondary client */
 	struct mutex lock;
 	bool enabled;
-	bool charge_throttled;		/* hot/cold throttle hysteresis state */
+	bool charge_throttled;		/* hot/cold current-throttle hysteresis */
+	bool charge_cut;		/* hot/cold FET-cut hysteresis */
 	struct power_supply *psy;	/* charger online indicator */
 	struct delayed_work charger_work;	/* input-current management */
 };
 
+/*
+ * Arm (close) or disarm (open) the battery charge FET, ENQ4FET = CNTL1 bit3.
+ * The SM5714 charger only delivers current into the cell when this FET is
+ * closed.  The bootloader closes it once at power-on, but in USB-C dual-role
+ * mode nothing re-arms it after the Type-C role driver selects the sink role,
+ * so the charger sits in CHG_ON op_mode delivering nothing while the battery
+ * drains -- this RMW is what actually turns charging on in device mode.
+ *
+ * On the open->closed transition we hold the input-current limit at the 500 mA
+ * floor while the FET closes, to damp the inrush peak into a depleted cell, as
+ * the device-own chg_set_enq4fet() does.  In the normal poll-worker path the
+ * FET is armed BEFORE the input limit is raised, so VBUSCNTL is already at its
+ * 500 mA default and the cap/settle is a no-op; it only does real work on a
+ * re-detect where the limit was already raised.  Caller must hold sv->lock.
+ *
+ * The charge watchdog (WDTCNTL 0x22) is deliberately left untouched: it is
+ * disabled at power-on (read back as 0x22=0x04 on this device) and stock only
+ * enables it to guard its active SW step-charging loop, which this driver does
+ * not run.  The real charge terminator is the charger's own hardware auto-stop,
+ * confirmed programmed by the bootloader on this device: CHGCNTL4 (0x1A) bit6
+ * (autostop) = 1 with batreg <= the device-own 4.44 V float (read back 4.38 V;
+ * it may vary across boots, e.g. battery-care, but stays cell-safe well under
+ * the 4.62 V cap), and CHGCNTL5 (0x1B) top-off = 350 mA.  So no SW dead-man is
+ * needed; those termination registers persist from the bootloader and are not
+ * touched here (programming them in the driver is a noted robustness follow-up).
+ */
+static void sm5714_set_charge_fet(struct sm5714_vbus *sv, bool arm)
+{
+	int cntl1, lim, off;
+
+	cntl1 = i2c_smbus_read_byte_data(sv->chg, SM5714_CHG_REG_CNTL1);
+	if (cntl1 < 0)
+		return;
+	if (arm == !!(cntl1 & SM5714_CHG_CNTL1_ENQ4FET))
+		return;				/* already in the requested state */
+
+	if (!arm) {
+		i2c_smbus_write_byte_data(sv->chg, SM5714_CHG_REG_CNTL1,
+					  cntl1 & ~SM5714_CHG_CNTL1_ENQ4FET);
+		dev_info(&sv->chg->dev, "charge FET disarmed\n");
+		return;
+	}
+
+	/* Hold the input limit at 500 mA across FET closure (inrush damping). */
+	lim = i2c_smbus_read_byte_data(sv->chg, SM5714_CHG_REG_VBUSCNTL);
+	if (lim >= 0) {
+		off = lim & SM5714_CHG_VBUSCNTL_MASK;
+		if (off > SM5714_CHG_VBUSCNTL_500MA) {
+			i2c_smbus_write_byte_data(sv->chg, SM5714_CHG_REG_VBUSCNTL,
+				(lim & ~SM5714_CHG_VBUSCNTL_MASK) |
+				SM5714_CHG_VBUSCNTL_500MA);
+			/* device-own settle: (limit_mA - 500) / 250 ms */
+			msleep((off - SM5714_CHG_VBUSCNTL_500MA) * 25 / 250);
+		}
+	}
+	i2c_smbus_write_byte_data(sv->chg, SM5714_CHG_REG_CNTL1,
+				  cntl1 | SM5714_CHG_CNTL1_ENQ4FET);
+	dev_info(&sv->chg->dev, "charge FET armed (charging enabled)\n");
+}
+
 static int sm5714_vbus_enable(struct sm5714_vbus *sv)
 {
 	int ret, status;
+
+	/*
+	 * Entering host mode: open the battery charge FET before sourcing VBUS,
+	 * so the OTG boost can never coincide with a closed charge path.  The
+	 * op_mode write below (CHG_ON -> USB_OTG) already excludes charging, but
+	 * keeping the FET strictly host-off is the invariant the role-switch
+	 * audit requires.  The poll worker, which is the only other caller that
+	 * arms the FET, early-outs while sv->enabled, so host mode stays clean.
+	 */
+	sm5714_set_charge_fet(sv, false);
 
 	/* Route D+/D- to USB first, then source VBUS. */
 	ret = i2c_smbus_write_byte_data(sv->muic, SM5714_MUIC_REG_MANUAL_SW,
@@ -291,16 +380,16 @@ static bool sm5714_read_batt_temp(int *temp)
 }
 
 /*
- * The SM5714 charger autonomously charges, but its input-current limit defaults
- * to 500 mA -- too low to charge under load -- and its cell charge current to a
- * conservative 500 mA.  With no IRQ wired, poll: when a charger is present (and
- * we are not sourcing VBUS for host mode), read the MUIC classification, raise
- * the input limit (VBUSCNTL) to the device-own ceiling for that charger class,
- * and raise the cell charge current (CHGCNTL2) toward the device-own 2100 mA TA
- * value -- but only with a real charger AND a temperature read, throttling back
- * to 500 mA when the cell runs hot (we do not run stock's full step-charging).
- * When nothing is attached, both return to 500 mA.  Hardware AICL caps the input
- * draw to the adapter's capability; charge/float-voltage/OVP are hardware.
+ * Charger management poll (no IRQ wired).  When host-off and an input source is
+ * present, this: (a) gates charging on cell temperature -- cut the FET outside
+ * the device-own stop-lines (>=50 C / <=0 C / unreadable), throttle current in
+ * an inner caution band; (b) arms the charge FET (the dual-role device-mode fix)
+ * in CHG_ON_VBUS op_mode; (c) raises the input-current limit (VBUSCNTL) to the
+ * device-own ceiling for the MUIC-classified charger class; (d) raises the cell
+ * charge current (CHGCNTL2) toward the device-own 2100 mA TA value for a real
+ * charger.  When nothing is attached the FET is opened and both limits return to
+ * the 500 mA floor.  Hardware AICL caps the input draw to the adapter; the
+ * float-voltage / top-off / OVP charge termination is all in hardware.
  */
 static void sm5714_vbus_charger_work(struct work_struct *work)
 {
@@ -310,6 +399,7 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 	int input_ma = SM5714_INPUT_CURRENT_SDP;
 	int charge_ma = SM5714_CHARGE_CURRENT_MIN;
 	bool charger = false;
+	bool vbus = false;
 	u8 offset;
 
 	mutex_lock(&sv->lock);
@@ -327,7 +417,8 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 	if (status1 < 0)
 		goto out;
 
-	if (status1 & SM5714_CHG_STATUS1_VBUSPOK) {
+	vbus = !!(status1 & SM5714_CHG_STATUS1_VBUSPOK);
+	if (vbus) {
 		dev_type1 = i2c_smbus_read_byte_data(sv->muic,
 						     SM5714_MUIC_REG_DEVTYPE1);
 		if (dev_type1 >= 0) {
@@ -335,6 +426,72 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 			/* a source above SDP can charge faster than the default */
 			charger = input_ma > SM5714_INPUT_CURRENT_SDP;
 		}
+	}
+
+	/*
+	 * Temperature gate.  The cell temperature decides whether we charge at
+	 * all, not just how fast.  The device's own battery layer hard-cuts the
+	 * charge (BUCK_OFF) past 50.0 C (overheat) and below 0.0 C (fast charge
+	 * there plates lithium -- permanent damage), and refuses to charge on an
+	 * unreadable temperature.  Mirror that: a missing/implausible read fails
+	 * SAFE to a cut, and an inner caution band throttles current to the floor
+	 * before the hard cut.  Dead-bands on both keep the state from oscillating.
+	 */
+	if (vbus) {
+		if (!sm5714_read_batt_temp(&temp)) {
+			sv->charge_cut = true;		/* no temp -> do not charge */
+		} else {
+			if (temp >= SM5714_BATT_TEMP_HOT_CUT ||
+			    temp <= SM5714_BATT_TEMP_COLD_CUT)
+				sv->charge_cut = true;
+			else if (temp <= SM5714_BATT_TEMP_HOT_CUT_OK &&
+				 temp >= SM5714_BATT_TEMP_COLD_CUT_OK)
+				sv->charge_cut = false;
+
+			if (temp >= SM5714_BATT_TEMP_HOT ||
+			    temp <= SM5714_BATT_TEMP_COLD)
+				sv->charge_throttled = true;
+			else if (temp <= SM5714_BATT_TEMP_HOT_OK &&
+				 temp >= SM5714_BATT_TEMP_COLD_OK)
+				sv->charge_throttled = false;
+
+			if (charger)
+				charge_ma = sv->charge_throttled ?
+						SM5714_CHARGE_CURRENT_MIN :
+						SM5714_CHARGE_CURRENT_TA;
+		}
+	}
+
+	/*
+	 * Arm the charge FET only with a source present AND the cell in the safe
+	 * temperature window; otherwise open it.  This is the dual-role device-mode
+	 * fix: the bootloader-armed FET is lost when the role driver selects sink
+	 * and nothing re-arms it.  Arming happens BEFORE the input limit is raised
+	 * below, so the FET closes while VBUSCNTL is still at the 500 mA default
+	 * (inrush damping).  Even an SDP (500 mA) charges, so arm on VBUS_POK, not
+	 * only when the class beats the SDP ceiling.
+	 *
+	 * Before closing the FET, force the charger op_mode to CHG_ON_VBUS.  On a
+	 * charger-attached boot the poll can run (probe schedules it at delay 0)
+	 * before the Type-C role driver has set op_mode for the sink role, with
+	 * CNTL2 still at the bootloader default; closing the FET while op_mode is
+	 * USB_OTG would source the boost into a closed charge path (back-feed).  We
+	 * are host-off here (sv->enabled is false), so this never fights the role
+	 * driver's OTG selection.  Disarm on no-source / out-of-window is a driver
+	 * policy choice (VBUS_POK + temperature as the arm signal), not a stock
+	 * transcription; opening the FET with no input path is harmless.
+	 */
+	if (vbus && !sv->charge_cut) {
+		int cntl2 = i2c_smbus_read_byte_data(sv->chg, SM5714_CHG_REG_CNTL2);
+
+		if (cntl2 >= 0 && (cntl2 & SM5714_CHG_CNTL2_OPMODE_MASK) !=
+		    SM5714_CHG_CNTL2_OFF)
+			i2c_smbus_write_byte_data(sv->chg, SM5714_CHG_REG_CNTL2,
+				(cntl2 & ~SM5714_CHG_CNTL2_OPMODE_MASK) |
+				SM5714_CHG_CNTL2_OFF);
+		sm5714_set_charge_fet(sv, true);
+	} else {
+		sm5714_set_charge_fet(sv, false);
 	}
 
 	/* 1) input-current limit (VBUSCNTL); clamp (not wrap) for safety */
@@ -347,23 +504,8 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 			 input_ma);
 	}
 
-	/*
-	 * 2) cell charge current (CHGCNTL2): raise to the device-own TA value
-	 * only inside a safe temperature window.  Throttle to the floor when the
-	 * cell is HOT (>=45 C) or COLD (<=10 C -- fast charge there risks lithium
-	 * plating), with a dead-band so the state cannot oscillate.  Any failed or
-	 * implausible temperature read leaves charge_ma at the 500 mA floor.
-	 */
-	if (charger && sm5714_read_batt_temp(&temp)) {
-		if (temp >= SM5714_BATT_TEMP_HOT || temp <= SM5714_BATT_TEMP_COLD)
-			sv->charge_throttled = true;
-		else if (temp <= SM5714_BATT_TEMP_HOT_OK &&
-			 temp >= SM5714_BATT_TEMP_COLD_OK)
-			sv->charge_throttled = false;
-		charge_ma = sv->charge_throttled ? SM5714_CHARGE_CURRENT_MIN
-						 : SM5714_CHARGE_CURRENT_TA;
-	}
-
+	/* 2) cell charge current (CHGCNTL2); 500 mA floor unless the temp gate
+	 * above raised it to the device-own TA value */
 	offset = sm5714_chgcurr_offset(charge_ma);
 	cur = i2c_smbus_read_byte_data(sv->chg, SM5714_CHG_REG_CHGCNTL2);
 	if (cur >= 0 && cur != offset) {
@@ -403,12 +545,12 @@ static struct attribute *sm5714_vbus_attrs[] = {
 ATTRIBUTE_GROUPS(sm5714_vbus);
 
 /*
- * Report-only charger presence.  The SM5714 charger autonomously charges the
- * battery whenever valid VBUS is present (the bootloader leaves it in
- * CHG_ON_VBUS mode with the charge FET armed), so this driver does not touch
- * the charge path -- it only exposes whether a charger is online so the desktop
- * shows a line-power source.  VBUS_POK reads set when our own OTG boost sources
- * 5 V, so the report is gated on host mode being off.
+ * Charger presence indicator.  The SM5714 charger autonomously regulates the
+ * charge (current / float-voltage / top-off) once its charge FET is closed; the
+ * poll worker arms that FET when an input source is present (see
+ * sm5714_set_charge_fet()), and this attribute exposes whether a charger is
+ * online so the desktop shows a line-power source.  VBUS_POK reads set when our
+ * own OTG boost sources 5 V, so the report is gated on host mode being off.
  */
 static int sm5714_chg_get_property(struct power_supply *psy,
 				   enum power_supply_property psp,
