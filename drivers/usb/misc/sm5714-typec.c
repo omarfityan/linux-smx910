@@ -14,7 +14,11 @@
  *     on the cable (a USB peripheral) means we are the HOST/source;
  *   - it drives the standard mainline usb_role_switch so dwc3 flips its data
  *     role (host <-> gadget) accordingly, and asks the SM5714 VBUS driver to
- *     source 5 V (host) or stay off (device/disconnected).
+ *     source 5 V (host) or stay off (device/disconnected);
+ *   - it registers a USB Type-C port (/sys/class/typec/portN) that reports the
+ *     hardware-decided data/power role, the attached partner, and the plug
+ *     orientation -- the standard userspace surface and the foundation for
+ *     DP-altmode.
  *
  * This replaces the manual "host_vbus" sysfs toggle with automatic, cable-driven
  * role switching.  All register values are transcribed from the device's own
@@ -31,6 +35,7 @@
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/usb/role.h>
+#include <linux/usb/typec.h>
 #include <linux/workqueue.h>
 
 #include "sm5714-usb-vbus.h"
@@ -53,6 +58,7 @@
 #define SM5714_TYPEC_CC_ATTACH_SRC	0x01	/* source on cable -> we DEVICE */
 #define SM5714_TYPEC_CC_ATTACH_SNK	0x02	/* sink on cable   -> we HOST   */
 #define SM5714_TYPEC_CC_ATTACH_AUDIO	0x03	/* audio accessory             */
+#define SM5714_TYPEC_CC_CABLE_FLIP	BIT(5)	/* 0=CC1 (normal), 1=CC2 (reverse) */
 #define SM5714_TYPEC_REG_CC_CNTL1	0x29
 #define SM5714_TYPEC_CC_CNTL1_DRP	0x40	/* autonomous Dual-Role toggling */
 
@@ -62,13 +68,17 @@
 struct sm5714_typec {
 	struct i2c_client *client;
 	struct usb_role_switch *role_sw;
+	struct typec_port *port;
+	struct typec_partner *partner;
+	struct typec_capability cap;
 	struct mutex lock;
 	struct delayed_work resync;
 	enum usb_role role;
 };
 
 /* Apply a decoded role: VBUS first toward the fail-safe, then the data role. */
-static void sm5714_typec_apply(struct sm5714_typec *t, enum usb_role role)
+static void sm5714_typec_apply(struct sm5714_typec *t, enum usb_role role,
+			       enum typec_orientation orientation)
 {
 	bool host = (role == USB_ROLE_HOST);
 	int ret;
@@ -100,6 +110,44 @@ static void sm5714_typec_apply(struct sm5714_typec *t, enum usb_role role)
 	if (t->role_sw)
 		usb_role_switch_set_role(t->role_sw, role);
 
+	/*
+	 * Report the new connection to the Type-C class (only if the port
+	 * registered; the role switching above is independent of it).  The
+	 * partner is unconditionally re-registered on every change -- mirroring
+	 * the in-tree standalone port controllers (e.g. wusb3801) -- so a
+	 * DEVICE<->HOST transition that skips the disconnected (NONE) state
+	 * (a DETACH edge seen only by the periodic resync) cannot leave a stale
+	 * partner of the wrong role attached.  We are SINK+DEVICE when a source
+	 * is on the cable and SOURCE+HOST when a sink is, matching the device's
+	 * own downstream driver.
+	 */
+	if (t->port) {
+		if (t->partner) {
+			typec_unregister_partner(t->partner);
+			t->partner = NULL;
+		}
+		if (role == USB_ROLE_NONE) {
+			typec_set_pwr_role(t->port, TYPEC_SINK);
+			typec_set_data_role(t->port, TYPEC_DEVICE);
+			typec_set_orientation(t->port, TYPEC_ORIENTATION_NONE);
+		} else {
+			struct typec_partner_desc desc = {};
+
+			t->partner = typec_register_partner(t->port, &desc);
+			if (IS_ERR(t->partner)) {
+				dev_warn(&t->client->dev,
+					 "failed to register partner (%ld)\n",
+					 PTR_ERR(t->partner));
+				t->partner = NULL;
+			}
+			typec_set_pwr_role(t->port,
+					   host ? TYPEC_SOURCE : TYPEC_SINK);
+			typec_set_data_role(t->port,
+					    host ? TYPEC_HOST : TYPEC_DEVICE);
+			typec_set_orientation(t->port, orientation);
+		}
+	}
+
 	t->role = role;
 	dev_info(&t->client->dev, "USB-C role -> %s\n", usb_role_string(role));
 }
@@ -107,6 +155,7 @@ static void sm5714_typec_apply(struct sm5714_typec *t, enum usb_role role)
 /* Read CC_STATUS and map the cable to a USB role; fail safe to NONE on error. */
 static void sm5714_typec_update(struct sm5714_typec *t)
 {
+	enum typec_orientation orientation;
 	enum usb_role role;
 	int status, cc;
 
@@ -121,11 +170,11 @@ static void sm5714_typec_update(struct sm5714_typec *t)
 	if (status < 0) {
 		dev_warn(&t->client->dev, "STATUS1 read failed (%d); role->none\n",
 			 status);
-		sm5714_typec_apply(t, USB_ROLE_NONE);
+		sm5714_typec_apply(t, USB_ROLE_NONE, TYPEC_ORIENTATION_NONE);
 		return;
 	}
 	if (!(status & SM5714_TYPEC_STATUS1_ATTACH)) {
-		sm5714_typec_apply(t, USB_ROLE_NONE);
+		sm5714_typec_apply(t, USB_ROLE_NONE, TYPEC_ORIENTATION_NONE);
 		return;
 	}
 
@@ -133,9 +182,13 @@ static void sm5714_typec_update(struct sm5714_typec *t)
 	if (cc < 0) {
 		dev_warn(&t->client->dev, "CC_STATUS read failed (%d); role->none\n",
 			 cc);
-		sm5714_typec_apply(t, USB_ROLE_NONE);
+		sm5714_typec_apply(t, USB_ROLE_NONE, TYPEC_ORIENTATION_NONE);
 		return;
 	}
+
+	/* CC_STATUS bit5 resolves the plug orientation (CC1 normal / CC2 reverse). */
+	orientation = (cc & SM5714_TYPEC_CC_CABLE_FLIP) ?
+		TYPEC_ORIENTATION_REVERSE : TYPEC_ORIENTATION_NORMAL;
 
 	switch (cc & SM5714_TYPEC_CC_ATTACH_MASK) {
 	case SM5714_TYPEC_CC_ATTACH_SNK:
@@ -149,7 +202,7 @@ static void sm5714_typec_update(struct sm5714_typec *t)
 		break;
 	}
 
-	sm5714_typec_apply(t, role);
+	sm5714_typec_apply(t, role, orientation);
 }
 
 static irqreturn_t sm5714_typec_irq(int irq, void *data)
@@ -178,31 +231,53 @@ static void sm5714_typec_resync_work(struct work_struct *work)
 	schedule_delayed_work(&t->resync, msecs_to_jiffies(SM5714_TYPEC_POLL_MS));
 }
 
-static struct usb_role_switch *sm5714_typec_get_role_sw(struct device *dev)
+/*
+ * Register a Type-C port so the connector shows up under /sys/class/typec
+ * (data/power role, partner, orientation) and to provide the foundation for
+ * DP-altmode.  The capability (DRP / DRD / try-sink) is read straight from the
+ * "usb-c-connector" DT node via typec_get_fw_cap() -- the device's own
+ * description is the source of truth.  No typec_operations are supplied: the
+ * SM5714 runs autonomous DRP and this driver carries no USB-PD policy engine,
+ * so a userspace-requested role swap cannot be honoured (the Type-C class
+ * returns -EOPNOTSUPP); the port only reports the hardware-decided state.
+ *
+ * Non-fatal by design: the port is an addition to the already-working role
+ * switching + VBUS, so a failure here must leave t->port NULL and carry on
+ * rather than take the working driver down (the reporting paths guard on it).
+ */
+static void sm5714_typec_register_port(struct sm5714_typec *t,
+				       struct fwnode_handle *connector)
 {
-	struct fwnode_handle *connector;
-	struct usb_role_switch *sw;
+	struct device *dev = &t->client->dev;
+	struct typec_port *port;
+	int ret;
 
-	/*
-	 * dwc3 (dr_mode=otg, usb-role-switch) registers the role switch; we are
-	 * the provider that drives it.  The link is the OF graph from our
-	 * usb-c-connector child node to the dwc3 HS port.  Fall back to a direct
-	 * lookup from our own node if no connector child is present.
-	 */
-	connector = device_get_named_child_node(dev, "connector");
-	if (connector) {
-		sw = fwnode_usb_role_switch_get(connector);
-		fwnode_handle_put(connector);
-	} else {
-		sw = usb_role_switch_get(dev);
+	ret = typec_get_fw_cap(&t->cap, connector);
+	if (ret) {
+		dev_warn(dev, "no Type-C port: bad connector capabilities (%d)\n",
+			 ret);
+		return;
 	}
 
-	return sw;
+	t->cap.revision = USB_TYPEC_REV_1_2;
+	t->cap.orientation_aware = true;
+	t->cap.driver_data = t;
+	t->cap.ops = NULL;
+
+	port = typec_register_port(dev, &t->cap);
+	if (IS_ERR(port)) {
+		dev_warn(dev,
+			 "failed to register Type-C port (%ld); role switching still active\n",
+			 PTR_ERR(port));
+		return;
+	}
+	t->port = port;
 }
 
 static int sm5714_typec_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
+	struct fwnode_handle *connector;
 	struct sm5714_typec *t;
 	int ret;
 
@@ -216,17 +291,34 @@ static int sm5714_typec_probe(struct i2c_client *client)
 	INIT_DELAYED_WORK(&t->resync, sm5714_typec_resync_work);
 	i2c_set_clientdata(client, t);
 
-	t->role_sw = sm5714_typec_get_role_sw(dev);
-	if (IS_ERR(t->role_sw))
-		return dev_err_probe(dev, PTR_ERR(t->role_sw),
-				     "failed to get usb_role_switch\n");
+	/*
+	 * dwc3 (dr_mode=otg, usb-role-switch) registers the role switch; we are
+	 * the provider that drives it.  The link is the OF graph from our
+	 * "usb-c-connector" child node to the dwc3 HS port; that same node also
+	 * describes the Type-C port capability.  Fall back to a direct lookup
+	 * from our own node (and no Type-C port) if no connector child exists.
+	 */
+	connector = device_get_named_child_node(dev, "connector");
+	if (connector)
+		t->role_sw = fwnode_usb_role_switch_get(connector);
+	else
+		t->role_sw = usb_role_switch_get(dev);
+	if (IS_ERR(t->role_sw)) {
+		ret = dev_err_probe(dev, PTR_ERR(t->role_sw),
+				    "failed to get usb_role_switch\n");
+		goto err_put_connector;
+	}
+
+	/* Register the Type-C port before the first update() reflects state. */
+	if (connector)
+		sm5714_typec_register_port(t, connector);
 
 	/* Program autonomous DRP so the controller toggles Rp/Rd on its own. */
 	ret = i2c_smbus_write_byte_data(client, SM5714_TYPEC_REG_CC_CNTL1,
 					SM5714_TYPEC_CC_CNTL1_DRP);
 	if (ret) {
 		dev_err_probe(dev, ret, "failed to enable DRP\n");
-		goto err_put;
+		goto err_unregister_port;
 	}
 
 	/* Unmask only attach/detach, then clear any latched state. */
@@ -246,7 +338,7 @@ static int sm5714_typec_probe(struct i2c_client *client)
 						"sm5714-typec", t);
 		if (ret) {
 			dev_err_probe(dev, ret, "failed to request IRQ\n");
-			goto err_put;
+			goto err_unregister_port;
 		}
 	} else {
 		dev_warn(dev, "no IRQ; relying on %d ms poll\n",
@@ -258,10 +350,17 @@ static int sm5714_typec_probe(struct i2c_client *client)
 
 	dev_info(dev, "SM5714 Type-C role controller ready (role=%s)\n",
 		 usb_role_string(t->role));
+	fwnode_handle_put(connector);
 	return 0;
 
-err_put:
+err_unregister_port:
+	if (t->partner)
+		typec_unregister_partner(t->partner);
+	if (t->port)
+		typec_unregister_port(t->port);
 	usb_role_switch_put(t->role_sw);
+err_put_connector:
+	fwnode_handle_put(connector);
 	return ret;
 }
 
@@ -270,10 +369,12 @@ static void sm5714_typec_remove(struct i2c_client *client)
 	struct sm5714_typec *t = i2c_get_clientdata(client);
 
 	cancel_delayed_work_sync(&t->resync);
-	/* Leave the port disconnected + VBUS off. */
+	/* Leave the port disconnected + VBUS off (also unregisters the partner). */
 	mutex_lock(&t->lock);
-	sm5714_typec_apply(t, USB_ROLE_NONE);
+	sm5714_typec_apply(t, USB_ROLE_NONE, TYPEC_ORIENTATION_NONE);
 	mutex_unlock(&t->lock);
+	if (t->port)
+		typec_unregister_port(t->port);
 	usb_role_switch_put(t->role_sw);
 }
 

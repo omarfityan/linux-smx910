@@ -381,6 +381,7 @@ config USB_SM5714_TYPEC
 	tristate "Silicon Mitus SM5714 USB Type-C role (PDIC) controller"
 	depends on I2C && OF
 	depends on USB_SM5714_VBUS
+	depends on TYPEC
 	select USB_ROLE_SWITCH
 	help
 	  Say Y here for automatic USB-C role switching on boards with a Silicon
@@ -391,7 +392,9 @@ config USB_SM5714_TYPEC
 	  The driver programs the controller for autonomous Dual-Role toggling,
 	  decodes CC_STATUS on each attach/detach, and drives the standard
 	  usb_role_switch (so dwc3 flips host <-> gadget) plus the SM5714 OTG
-	  VBUS via USB_SM5714_VBUS. This replaces the manual "host_vbus" sysfs
+	  VBUS via USB_SM5714_VBUS. It also registers a USB Type-C port under
+	  /sys/class/typec that reports the data/power role, attached partner,
+	  and plug orientation. This replaces the manual "host_vbus" sysfs
 	  toggle with cable-driven switching.
 
 	  If unsure, say N. If built as a module it will be called sm5714-typec.
