@@ -895,6 +895,9 @@ static void qcom_geni_serial_start_rx_dma(struct uart_port *uport)
 		dev_err(uport->dev, "unable to start RX SE DMA: %d\n", ret);
 		qcom_geni_serial_stop_rx_dma(uport);
 	}
+
+	if (port->no_hw_flow_control)
+		dev_info(uport->dev, "BTDBG start_rx_dma armed ret=%d\n", ret);
 }
 
 static void qcom_geni_serial_handle_rx_dma(struct uart_port *uport, bool drop)
@@ -913,6 +916,8 @@ static void qcom_geni_serial_handle_rx_dma(struct uart_port *uport, bool drop)
 	port->rx_dma_addr = 0;
 
 	rx_in = readl(uport->membase + SE_DMA_RX_LEN_IN);
+	if (port->no_hw_flow_control)
+		dev_info(uport->dev, "BTDBG rx_dma rx_in=%u drop=%d\n", rx_in, drop);
 	if (!rx_in) {
 		dev_warn(uport->dev, "serial engine reports 0 RX bytes in!\n");
 		return;
@@ -1089,6 +1094,12 @@ static irqreturn_t qcom_geni_serial_isr(int isr, void *dev)
 	writel(s_irq_status, uport->membase + SE_GENI_S_IRQ_CLEAR);
 	writel(dma_tx_status, uport->membase + SE_DMA_TX_IRQ_CLR);
 	writel(dma_rx_status, uport->membase + SE_DMA_RX_IRQ_CLR);
+
+	if (port->no_hw_flow_control)
+		dev_info(uport->dev,
+			 "BTDBG isr m=0x%x s=0x%x dma_tx=0x%x dma_rx=0x%x geni=0x%x dma_en=%u\n",
+			 m_irq_status, s_irq_status, dma_tx_status, dma_rx_status,
+			 geni_status, dma);
 
 	if (WARN_ON(m_irq_status & M_ILLEGAL_CMD_EN))
 		goto out_unlock;
@@ -1310,6 +1321,11 @@ static int geni_serial_set_rate(struct uart_port *uport, unsigned int baud)
 
 	dev_dbg(port->se.dev, "desired_rate = %u, clk_rate = %lu, clk_div = %u\n, clk_idx = %u\n",
 		baud * sampling_rate, clk_rate, clk_div, clk_idx);
+
+	if (port->no_hw_flow_control)
+		dev_info(port->se.dev,
+			 "BTDBG set_rate baud=%u clk_rate=%lu clk_div=%u clk_idx=%u samp=%u\n",
+			 baud, clk_rate, clk_div, clk_idx, sampling_rate);
 
 	uport->uartclk = clk_rate;
 	port->clk_rate = clk_rate;
