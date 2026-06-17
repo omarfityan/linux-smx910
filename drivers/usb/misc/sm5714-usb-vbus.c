@@ -76,6 +76,38 @@
 #define SM5714_MUIC_DEVTYPE1_SDP	BIT(1)	/* PC USB port */
 
 /*
+ * MUIC AFC (Samsung Adaptive Fast Charging) high-voltage negotiation block.  AFC
+ * is a Samsung-proprietary protocol the MUIC speaks over the D+/D- data lines: it
+ * sends a serial "ping" requesting a VBUS level and an AFC-capable charger steps
+ * VBUS up in response.  Stepping 5 V -> 9 V is the rung-2 fast-charge lever: the
+ * SM5714 is a buck charger, and from a 5 V input the cell cannot reach its full
+ * charge current (cable IR-drop pulls VBUS toward the AICL fold-back reference); at
+ * 9 V the same cell power draws far less input current, so the cell-side limit
+ * becomes the only cap.  All register addresses/bits/the request byte are
+ * transcribed from the device's own downstream sm5714-muic-afc.c, and the exact
+ * 5V->8.8V negotiation was validated by hand on this charger before this code.
+ *
+ * The HV-capable TRIGGER is DEVICETYPE2 bit6 (AFC_TA_ATTACHED), which the MUIC sets
+ * on attach (matching downstream sm5714_hv_muic_init_detect's `dev2 & 0x40` gate).
+ * DEVTYPE1 bit5 (AFC) only sets AFTER a successful negotiation, so it is NOT the
+ * right trigger for the first request.
+ */
+#define SM5714_MUIC_REG_INT2		0x02	/* AFC event status (read clears it) */
+#define SM5714_MUIC_INT2_AFC_ACCEPTED	BIT(1)	/* TA accepted the AFC request */
+#define SM5714_MUIC_INT2_VBUS_UPDATE	BIT(2)	/* a VBUS measurement has latched */
+#define SM5714_MUIC_INT2_AFC_ERROR	BIT(5)	/* AFC ping errored (non-AFC TA / parity) */
+#define SM5714_MUIC_REG_DEVTYPE2	0x08
+#define SM5714_MUIC_DEVTYPE2_AFC_TA	BIT(6)	/* HV-capable TA attached (the AFC trigger) */
+#define SM5714_MUIC_REG_AFCCNTL		0x09
+#define SM5714_MUIC_AFCCNTL_ENAFC	BIT(0)	/* 1 -> send the AFC ping */
+#define SM5714_MUIC_AFCCNTL_VBUS_READ	BIT(3)	/* 1 -> latch a VBUS measurement */
+#define SM5714_MUIC_REG_AFCTXD		0x0a	/* request byte: hi nibble = V-5, lo = current */
+#define SM5714_MUIC_AFCTXD_9V_1_65A	0x46	/* request 9 V / 1.65 A */
+#define SM5714_MUIC_REG_VBUS_VOLTAGE	0x0c	/* measured VBUS, x100 mV (after VBUS_READ) */
+#define SM5714_MUIC_REG_VBUS		0x3b
+#define SM5714_MUIC_VBUS_VALID		BIT(2)
+
+/*
  * Device-own input-current limits (gts9u sec_battery cable-info table): SDP must
  * stay <= the USB-spec 500 mA; CDP = 1500 mA; every wall-charger class (DCP /
  * unofficial TA / AFC / QC at 5V) = the 1800 mA TA default.  These are ceilings
@@ -129,6 +161,31 @@
 /* poll period: no IRQ wired, so re-evaluate the attached charger periodically */
 #define SM5714_CHG_POLL_MS		3000
 
+/*
+ * AFC 9V negotiation parameters.  The handshake is attempted once per charger
+ * attach when the MUIC flags an HV-capable TA, with a few retries to cover a
+ * transient ping error before giving up (and staying at 5 V -- never a regression).
+ * Each attempt: drop the input current, request 9 V, poll INT2 for ACCEPTED/ERROR,
+ * then confirm VBUS read back inside [7, 10] V -- the device-own +1/-2 V window
+ * around the 9 V request (real AFC chargers settle ~8.8 V under cable drop, as this
+ * one did).  The ~1 s handshake runs under the poll worker's lock, which correctly
+ * serialises it against the Type-C role switch rather than racing it.
+ */
+#define SM5714_AFC_9V_MIN_MV		7000
+#define SM5714_AFC_9V_MAX_MV		10000
+#define SM5714_AFC_PREPARE_MS		300	/* settle after the input-current drop */
+#define SM5714_AFC_POLL_TRIES		10	/* INT2 polls for ACCEPTED/ERROR */
+#define SM5714_AFC_POLL_MS		50
+#define SM5714_AFC_VBUS_TRIES		5	/* INT2 polls for the VBUS measurement */
+#define SM5714_AFC_MAX_TRIES		3	/* negotiation attempts before giving up */
+
+/* AFC 9V negotiation state -- one-shot per charger attach, reset on detach. */
+enum sm5714_afc_state {
+	SM5714_AFC_IDLE,	/* not yet attempted (also the reset-on-detach state) */
+	SM5714_AFC_DONE,	/* 9 V negotiated and confirmed */
+	SM5714_AFC_FAILED,	/* gave up after retries; stay at 5 V */
+};
+
 struct sm5714_vbus {
 	struct i2c_client *chg;		/* 0x49 - the bound device */
 	struct i2c_client *muic;	/* 0x25 - secondary client */
@@ -136,6 +193,8 @@ struct sm5714_vbus {
 	bool enabled;
 	bool charge_throttled;		/* hot/cold current-throttle hysteresis */
 	bool charge_cut;		/* hot/cold FET-cut hysteresis */
+	enum sm5714_afc_state afc_state;	/* AFC 9V negotiation (per attach) */
+	int afc_tries;			/* negotiation attempts this attach */
 	struct power_supply *psy;	/* charger online indicator */
 	struct delayed_work charger_work;	/* input-current management */
 };
@@ -303,6 +362,13 @@ static int sm5714_vbus_set(struct sm5714_vbus *sv, bool on)
 	if (!ret) {
 		sv->enabled = on;
 		changed = true;
+		/*
+		 * Role changed -> re-arm AFC.  A charger present on the return to
+		 * sink mode then re-negotiates 9 V from 5 V rather than trusting a
+		 * stale DONE/FAILED from before the host excursion.
+		 */
+		sv->afc_state = SM5714_AFC_IDLE;
+		sv->afc_tries = 0;
 	}
 out:
 	mutex_unlock(&sv->lock);
@@ -380,6 +446,104 @@ static bool sm5714_read_batt_temp(int *temp)
 }
 
 /*
+ * Read VBUS through the MUIC's measurement path: trigger a conversion (AFCCNTL
+ * VBUS_READ), wait for the INT2 VBUS_UPDATE latch, read VBUS_VOLTAGE (units of
+ * 100 mV), then drop the trigger.  Returns VBUS in mV, or negative on error.
+ * Caller holds sv->lock.
+ */
+static int sm5714_afc_read_vbus_mv(struct sm5714_vbus *sv)
+{
+	int i, int2, vbus, raw;
+
+	vbus = i2c_smbus_read_byte_data(sv->muic, SM5714_MUIC_REG_VBUS);
+	if (vbus < 0)
+		return vbus;
+	if (!(vbus & SM5714_MUIC_VBUS_VALID))
+		return -ENODEV;
+
+	i2c_smbus_write_byte_data(sv->muic, SM5714_MUIC_REG_AFCCNTL,
+				  SM5714_MUIC_AFCCNTL_VBUS_READ);
+	for (i = 0; i < SM5714_AFC_VBUS_TRIES; i++) {
+		usleep_range(5000, 5500);
+		int2 = i2c_smbus_read_byte_data(sv->muic, SM5714_MUIC_REG_INT2);
+		if (int2 >= 0 && (int2 & SM5714_MUIC_INT2_VBUS_UPDATE))
+			break;
+	}
+	raw = i2c_smbus_read_byte_data(sv->muic, SM5714_MUIC_REG_VBUS_VOLTAGE);
+	i2c_smbus_write_byte_data(sv->muic, SM5714_MUIC_REG_AFCCNTL, 0);
+	if (raw < 0)
+		return raw;
+	return raw * 100;
+}
+
+/*
+ * Run one AFC 9V negotiation.  Drop the input current to the 500 mA floor (the
+ * device-own "PREPARE" step -- the D+/D- handshake briefly disturbs VBUS, so we
+ * must not be drawing heavily across it), request 9 V (AFCTXD), fire the ping
+ * (ENAFC), and poll INT2 for ACCEPTED or ERROR.  On ACCEPTED, confirm VBUS actually
+ * read back at ~9 V before declaring success -- an accepted-but-not-9V result is
+ * treated as failure so the caller retries / stays at 5 V.  Returns 0 with VBUS at
+ * 9 V, or negative.  Caller holds sv->lock; only valid host-off.
+ *
+ * This only ever RAISES VBUS.  The SM5714's VBUS-input OVP is a fixed silicon
+ * default this driver never lowers, and stock fast-charges AFC 9V/12V through this
+ * same charger, so 9 V is inside the hardware's tolerated input window.  The input
+ * limit is left at the 500 mA floor on return; the poll worker raises it to the
+ * charger-class ceiling immediately afterwards (now at 9 V), with hardware AICL and
+ * the cell-side current cap unchanged.
+ */
+static int sm5714_afc_request_9v(struct sm5714_vbus *sv)
+{
+	int i, int2, lim, vbus_mv;
+	bool accepted = false;
+
+	/* PREPARE: hold the input current at the 500 mA floor across the ping. */
+	lim = i2c_smbus_read_byte_data(sv->chg, SM5714_CHG_REG_VBUSCNTL);
+	if (lim >= 0 && (lim & SM5714_CHG_VBUSCNTL_MASK) > SM5714_CHG_VBUSCNTL_500MA)
+		i2c_smbus_write_byte_data(sv->chg, SM5714_CHG_REG_VBUSCNTL,
+			(lim & ~SM5714_CHG_VBUSCNTL_MASK) | SM5714_CHG_VBUSCNTL_500MA);
+	msleep(SM5714_AFC_PREPARE_MS);
+
+	/* Clear any stale INT2, request 9 V, then fire the ping. */
+	i2c_smbus_read_byte_data(sv->muic, SM5714_MUIC_REG_INT2);
+	i2c_smbus_write_byte_data(sv->muic, SM5714_MUIC_REG_AFCTXD,
+				  SM5714_MUIC_AFCTXD_9V_1_65A);
+	i2c_smbus_write_byte_data(sv->muic, SM5714_MUIC_REG_AFCCNTL,
+				  SM5714_MUIC_AFCCNTL_ENAFC);
+
+	for (i = 0; i < SM5714_AFC_POLL_TRIES; i++) {
+		msleep(SM5714_AFC_POLL_MS);
+		int2 = i2c_smbus_read_byte_data(sv->muic, SM5714_MUIC_REG_INT2);
+		if (int2 < 0)
+			continue;
+		if (int2 & SM5714_MUIC_INT2_AFC_ACCEPTED) {
+			accepted = true;
+			break;
+		}
+		if (int2 & SM5714_MUIC_INT2_AFC_ERROR)
+			break;
+	}
+
+	/* Stop driving the ping regardless of outcome. */
+	i2c_smbus_write_byte_data(sv->muic, SM5714_MUIC_REG_AFCCNTL, 0);
+	if (!accepted)
+		return -EIO;
+
+	vbus_mv = sm5714_afc_read_vbus_mv(sv);
+	if (vbus_mv < 0)
+		return vbus_mv;
+	if (vbus_mv < SM5714_AFC_9V_MIN_MV || vbus_mv > SM5714_AFC_9V_MAX_MV) {
+		dev_warn(&sv->chg->dev,
+			 "AFC accepted but VBUS=%d mV not ~9 V; staying low\n",
+			 vbus_mv);
+		return -ERANGE;
+	}
+
+	dev_info(&sv->chg->dev, "AFC negotiated 9 V (VBUS=%d mV)\n", vbus_mv);
+	return 0;
+}
+
+/*
  * Charger management poll (no IRQ wired).  When host-off and an input source is
  * present, this: (a) gates charging on cell temperature -- cut the FET outside
  * the device-own stop-lines (>=50 C / <=0 C / unreadable), throttle current in
@@ -426,6 +590,10 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 			/* a source above SDP can charge faster than the default */
 			charger = input_ma > SM5714_INPUT_CURRENT_SDP;
 		}
+	} else {
+		/* input source gone -> re-arm AFC for the next charger attach */
+		sv->afc_state = SM5714_AFC_IDLE;
+		sv->afc_tries = 0;
 	}
 
 	/*
@@ -459,6 +627,30 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 				charge_ma = sv->charge_throttled ?
 						SM5714_CHARGE_CURRENT_MIN :
 						SM5714_CHARGE_CURRENT_TA;
+		}
+	}
+
+	/*
+	 * AFC 9V negotiation (rung-2 fast charge).  Once per attach, when the MUIC
+	 * flags an HV-capable TA (DEVTYPE2 AFC_TA) and we intend to charge (source
+	 * present, cell inside the safe window so not cut), ask the charger to step
+	 * VBUS 5 V -> 9 V.  The ~1 s handshake runs here under sv->lock; on success the
+	 * input-/cell-current writes below apply at 9 V.  A handful of failures latch
+	 * AFC_FAILED and we stay at 5 V -- never a regression.  Skipped in host mode
+	 * (the worker has already returned) and while charge-cut (no point at 9 V if we
+	 * will not charge; a cut that arrives AFTER 9 V just opens the FET, which is
+	 * safe with 9 V on VBUS).
+	 */
+	if (vbus && !sv->charge_cut && sv->afc_state == SM5714_AFC_IDLE) {
+		int dev_type2 = i2c_smbus_read_byte_data(sv->muic,
+							 SM5714_MUIC_REG_DEVTYPE2);
+
+		if (dev_type2 >= 0 && (dev_type2 & SM5714_MUIC_DEVTYPE2_AFC_TA)) {
+			sv->afc_tries++;
+			if (sm5714_afc_request_9v(sv) == 0)
+				sv->afc_state = SM5714_AFC_DONE;
+			else if (sv->afc_tries >= SM5714_AFC_MAX_TRIES)
+				sv->afc_state = SM5714_AFC_FAILED;
 		}
 	}
 
