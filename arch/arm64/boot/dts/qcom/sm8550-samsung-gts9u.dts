@@ -1213,6 +1213,15 @@
 	compatible = "qcom,geni-uart";
 	status = "okay";
 
+	/*
+	 * The WCN7850 BT link is 2-wire (TX=gpio26, RX=gpio27); its CTS/RTS
+	 * pins (gpio24/25) belong to the Goodix touchscreen, so no flow-control
+	 * wires are routed to BT. hci_qca forces HW flow control on serdev,
+	 * gating TX on the absent CTS, so run this UART without HW flow control
+	 * to match the device's stock 2-wire HS-UART.
+	 */
+	qcom,disable-hw-flow-control;
+
 	bluetooth {
 		compatible = "qcom,wcn7850-bt";
 

@@ -154,6 +154,7 @@ struct qcom_geni_serial_port {
 	int wakeup_irq;
 	bool rx_tx_swap;
 	bool cts_rts_swap;
+	bool no_hw_flow_control;
 
 	struct qcom_geni_private_data private_data;
 	const struct qcom_geni_device_data *dev_data;
@@ -1420,6 +1421,15 @@ static void qcom_geni_serial_set_termios(struct uart_port *uport,
 	else
 		stop_bit_len = TX_STOP_BIT_LEN_1;
 
+	/*
+	 * A port wired without CTS/RTS (here the WCN7850 BT HCI, whose
+	 * flow-control pins are used by the touchscreen) must run 2-wire.
+	 * hci_qca always requests HW flow control on serdev ports, which would
+	 * gate TX on a CTS that never asserts; honour the DT opt-out instead.
+	 */
+	if (port->no_hw_flow_control)
+		termios->c_cflag &= ~CRTSCTS;
+
 	/* flow control, clear the CTS_MASK bit if using flow control. */
 	if (termios->c_cflag & CRTSCTS)
 		tx_trans_cfg &= ~UART_CTS_MASK;
@@ -1890,6 +1900,9 @@ static int qcom_geni_serial_probe(struct platform_device *pdev)
 
 	if (of_property_read_bool(pdev->dev.of_node, "cts-rts-swap"))
 		port->cts_rts_swap = true;
+
+	if (of_property_read_bool(pdev->dev.of_node, "qcom,disable-hw-flow-control"))
+		port->no_hw_flow_control = true;
 
 	port->private_data.drv = drv;
 	uport->private_data = &port->private_data;
