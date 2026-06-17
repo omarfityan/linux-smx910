@@ -986,6 +986,8 @@ static void qcom_geni_serial_handle_tx_fifo(struct uart_port *uport,
 
 	/* All data has been transmitted or command has been cancelled */
 	if (!pending && done) {
+		if (port->no_hw_flow_control)
+			dev_info(uport->dev, "BTDBG tx_fifo DONE (drained to wire)\n");
 		qcom_geni_serial_stop_tx_fifo(uport);
 		goto out_write_wakeup;
 	}
@@ -1014,6 +1016,9 @@ static void qcom_geni_serial_handle_tx_fifo(struct uart_port *uport,
 
 	qcom_geni_serial_send_chunk_fifo(uport, chunk);
 	port->tx_queued += chunk;
+	if (port->no_hw_flow_control)
+		dev_info(uport->dev, "BTDBG tx_fifo wrote chunk=%u tx_remaining=%u\n",
+			 chunk, port->tx_remaining);
 
 	/*
 	 * The tx fifo watermark is level triggered and latched. Though we had
@@ -1040,6 +1045,8 @@ static void qcom_geni_serial_handle_tx_dma(struct uart_port *uport)
 	struct qcom_geni_serial_port *port = to_dev_port(uport);
 	struct tty_port *tport = &uport->state->port;
 
+	if (port->no_hw_flow_control)
+		dev_info(uport->dev, "BTDBG tx_dma DONE bytes=%u\n", port->tx_remaining);
 	uart_xmit_advance(uport, port->tx_remaining);
 	geni_se_tx_dma_unprep(&port->se, port->tx_dma_addr, port->tx_remaining);
 	port->tx_dma_addr = 0;
@@ -1427,8 +1434,14 @@ static void qcom_geni_serial_set_termios(struct uart_port *uport,
 	 * hci_qca always requests HW flow control on serdev ports, which would
 	 * gate TX on a CTS that never asserts; honour the DT opt-out instead.
 	 */
-	if (port->no_hw_flow_control)
+	if (port->no_hw_flow_control) {
+		u32 _ios = readl(uport->membase + SE_GENI_IOS);
+
+		dev_info(uport->dev, "BTDBG set_termios no_hw_flow=1 crtscts_in=%d IOS=0x%x CTS_asserted=%d\n",
+			 !!(termios->c_cflag & CRTSCTS), _ios,
+			 !(_ios & IO2_DATA_IN));
 		termios->c_cflag &= ~CRTSCTS;
+	}
 
 	/* flow control, clear the CTS_MASK bit if using flow control. */
 	if (termios->c_cflag & CRTSCTS)
@@ -1903,6 +1916,8 @@ static int qcom_geni_serial_probe(struct platform_device *pdev)
 
 	if (of_property_read_bool(pdev->dev.of_node, "qcom,disable-hw-flow-control"))
 		port->no_hw_flow_control = true;
+	dev_info(&pdev->dev, "BTDBG probe %s no_hw_flow_control=%d\n",
+		 dev_name(&pdev->dev), port->no_hw_flow_control);
 
 	port->private_data.drv = drv;
 	uport->private_data = &port->private_data;
