@@ -23,7 +23,6 @@ struct pwrseq_qcom_wcn_pdata {
 	size_t num_vregs;
 	unsigned int pwup_delay_ms;
 	unsigned int gpio_enable_delay_ms;
-	unsigned int bt_reset_dwell_ms;
 	const struct pwrseq_target_data **targets;
 	bool has_vddio; /* separate VDD IO regulator */
 	int (*match)(struct pwrseq_device *pwrseq, struct device *dev);
@@ -170,19 +169,6 @@ static int pwrseq_qcom_wcn_bt_enable(struct pwrseq_device *pwrseq)
 	struct pwrseq_qcom_wcn_ctx *ctx = pwrseq_device_get_drvdata(pwrseq);
 
 	pwrseq_qcom_wcn_ensure_gpio_delay(ctx);
-
-	/*
-	 * Some controllers (WCN7850 on this 2-wire board) need BT_EN held
-	 * asserted (low) for a defined dwell after the rails and reference
-	 * clock are up, before release, matching the device's downstream
-	 * btpower sequence (LOW -> dwell -> HIGH). The default path drives the
-	 * enable high immediately, leaving no reset-assert time once powered.
-	 */
-	if (ctx->pdata->bt_reset_dwell_ms) {
-		gpiod_set_value_cansleep(ctx->bt_gpio, 0);
-		msleep(ctx->pdata->bt_reset_dwell_ms);
-	}
-
 	gpiod_set_value_cansleep(ctx->bt_gpio, 1);
 	ctx->last_gpio_enable_jf = jiffies;
 
@@ -413,7 +399,6 @@ static const struct pwrseq_qcom_wcn_pdata pwrseq_wcn7850_of_data = {
 	.vregs = pwrseq_wcn7850_vregs,
 	.num_vregs = ARRAY_SIZE(pwrseq_wcn7850_vregs),
 	.pwup_delay_ms = 50,
-	.bt_reset_dwell_ms = 50,
 	.targets = pwrseq_qcom_wcn_targets,
 };
 

@@ -1025,6 +1025,32 @@
 			bias-pull-down;
 		};
 	};
+
+	/*
+	 * uart7 (WCN7850 BT HS-UART) TX/RX line bias. The inherited SoC default
+	 * qup_uart7_default leaves gpio26/27 bias-disable (floating); BOTH working
+	 * references PULL these lines — the device's own stock (TX gpio26
+	 * bias-pull-up, RX gpio27 bias-pull-down) and the mainline qrd reference
+	 * (bias-pull-up). A floating TX during the pre-command idle can prevent the
+	 * cold WCN7850 boot-ROM from framing the 0xfc00 version read against a clean
+	 * mark-idle. Match the device's own source; function (qup1_se7) and
+	 * drive-strength (2 mA) are unchanged from the default — only the bias.
+	 */
+	uart7_bt_pins: uart7-bt-state {
+		tx-pins {
+			pins = "gpio26";
+			function = "qup1_se7";
+			drive-strength = <2>;
+			bias-pull-up;
+		};
+
+		rx-pins {
+			pins = "gpio27";
+			function = "qup1_se7";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+	};
 };
 
 /* UFS = the rootfs path; q5q-proven supply mapping (SoC+PMIC-level). */
@@ -1212,6 +1238,11 @@
 &uart7 {
 	compatible = "qcom,geni-uart";
 	status = "okay";
+
+	/* Override the SoC default qup_uart7_default (bias-disable) with the
+	 * device-own-source line bias (TX pull-up / RX pull-down); see uart7_bt_pins. */
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart7_bt_pins>;
 
 	/*
 	 * The WCN7850 BT link is 2-wire (TX=gpio26, RX=gpio27); its CTS/RTS
