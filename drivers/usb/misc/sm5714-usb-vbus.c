@@ -446,7 +446,13 @@ static bool sm5714_read_batt_temp(struct sm5714_vbus *sv, int *temp)
 {
 	int milli, deci;
 
-	if (iio_read_channel_processed(sv->batt_therm, &milli))
+	/*
+	 * iio_read_channel_processed() returns the channel's IIO val-type on
+	 * success (IIO_VAL_INT == 1 for this temperature channel, i.e. a POSITIVE
+	 * value) and a negative errno on failure -- test for the error with < 0,
+	 * NOT for non-zero (a successful read is non-zero and must not be rejected).
+	 */
+	if (iio_read_channel_processed(sv->batt_therm, &milli) < 0)
 		return false;
 	deci = milli / 100;			/* millidegrees C -> 0.1 C */
 	/* Reject implausible (open / shorted NTC) readings -> caller uses the floor. */
