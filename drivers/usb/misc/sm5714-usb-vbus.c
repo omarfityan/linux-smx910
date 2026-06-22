@@ -28,6 +28,7 @@
 #include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/i2c.h>
+#include <linux/iio/consumer.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -189,6 +190,7 @@ enum sm5714_afc_state {
 struct sm5714_vbus {
 	struct i2c_client *chg;		/* 0x49 - the bound device */
 	struct i2c_client *muic;	/* 0x25 - secondary client */
+	struct iio_channel *batt_therm;	/* cell NTC on the gen3 PMIC ADC */
 	struct mutex lock;
 	bool enabled;
 	bool charge_throttled;		/* hot/cold current-throttle hysteresis */
@@ -424,25 +426,34 @@ static u8 sm5714_chgcurr_offset(int ma)
 	return off;
 }
 
-/* Read the cell temperature (0.1 C) from the SM5714 fuel-gauge power supply. */
-static bool sm5714_read_batt_temp(int *temp)
+/*
+ * Read the cell temperature (0.1 C) from the external battery NTC on the gen3
+ * PMIC ADC (PM8550 AMUX1, virtual channel 0x144).  This is the real cell
+ * thermistor the device's own battery layer gates charging on (its DT sets
+ * battery,thermal_source = ADC), NOT the SM5714 fuel-gauge die temperature: the
+ * fuel-gauge IC sits in the charge-current path and self-heats well above the
+ * cell while charging (measured 38-45 C on a cell flat at ~23 C), which spuriously
+ * tripped the thermal throttle on a perfectly cool cell and chopped a clean 2 A
+ * charge to the 500 mA floor.
+ *
+ * iio_read_channel_processed() returns the NTC temperature in millidegrees C (the
+ * ADC driver applies the 100k-pullup thermistor curve); convert to the 0.1 C the
+ * threshold logic uses.  The channel is resolved at probe so it is always valid
+ * here; a transient SPMI read error fails SAFE -- the caller cuts charging for one
+ * poll cycle and self-heals, exactly as with an implausible reading.
+ */
+static bool sm5714_read_batt_temp(struct sm5714_vbus *sv, int *temp)
 {
-	struct power_supply *fg;
-	union power_supply_propval val;
-	bool ok = false;
+	int milli, deci;
 
-	fg = power_supply_get_by_name("sm5714-fuelgauge");
-	if (!fg)
+	if (iio_read_channel_processed(sv->batt_therm, &milli))
 		return false;
-	/* Reject implausible (garbage / stale) readings -> caller uses the floor. */
-	if (power_supply_get_property(fg, POWER_SUPPLY_PROP_TEMP, &val) == 0 &&
-	    val.intval >= SM5714_BATT_TEMP_VALID_LO &&
-	    val.intval <= SM5714_BATT_TEMP_VALID_HI) {
-		*temp = val.intval;
-		ok = true;
-	}
-	power_supply_put(fg);
-	return ok;
+	deci = milli / 100;			/* millidegrees C -> 0.1 C */
+	/* Reject implausible (open / shorted NTC) readings -> caller uses the floor. */
+	if (deci < SM5714_BATT_TEMP_VALID_LO || deci > SM5714_BATT_TEMP_VALID_HI)
+		return false;
+	*temp = deci;
+	return true;
 }
 
 /*
@@ -606,7 +617,7 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 	 * before the hard cut.  Dead-bands on both keep the state from oscillating.
 	 */
 	if (vbus) {
-		if (!sm5714_read_batt_temp(&temp)) {
+		if (!sm5714_read_batt_temp(sv, &temp)) {
 			sv->charge_cut = true;		/* no temp -> do not charge */
 		} else {
 			if (temp >= SM5714_BATT_TEMP_HOT_CUT ||
@@ -794,6 +805,18 @@ static int sm5714_vbus_probe(struct i2c_client *client)
 
 	sv->chg = client;
 	mutex_init(&sv->lock);
+
+	/*
+	 * Resolve the cell-temperature NTC channel (gen3 PMIC ADC) up front: the
+	 * charge thermal gate depends on it, so defer the whole driver until the
+	 * ADC provider has probed rather than coming up unable to read the cell.
+	 * The ADC is a self-contained pmk8550 SPMI child (it consumes nothing from
+	 * this charger), so there is no probe-ordering cycle -- the deferral resolves.
+	 */
+	sv->batt_therm = devm_iio_channel_get(&client->dev, "batt-therm");
+	if (IS_ERR(sv->batt_therm))
+		return dev_err_probe(&client->dev, PTR_ERR(sv->batt_therm),
+				     "failed to get batt-therm (cell NTC) IIO channel\n");
 
 	sv->muic = devm_i2c_new_dummy_device(&client->dev, client->adapter,
 					     SM5714_MUIC_I2C_ADDR);

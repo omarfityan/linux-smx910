@@ -363,6 +363,7 @@ config USB_ONBOARD_DEV_USB5744
 config USB_SM5714_VBUS
 	tristate "Silicon Mitus SM5714 USB host (OTG) VBUS controller"
 	depends on I2C && OF
+	depends on IIO
 	help
 	  Say Y here to support USB host (OTG) mode on boards that source the
 	  USB-C VBUS and route the USB2 data lines through a Silicon Mitus

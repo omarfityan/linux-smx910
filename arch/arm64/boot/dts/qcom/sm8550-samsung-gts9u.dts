@@ -1393,6 +1393,14 @@
 	usb_vbus: usb-vbus@49 {
 		compatible = "siliconmitus,sm5714-usb-vbus";
 		reg = <0x49>;
+		/*
+		 * Cell-temperature NTC for the charge thermal gate: the external
+		 * battery thermistor on the PM8550 gen3 PMIC ADC (AMUX1, virtual
+		 * channel 0x144), read in place of the SM5714 fuel-gauge die temp
+		 * (the device's own stack sets battery,thermal_source = ADC).
+		 */
+		io-channels = <&pmk8550_vadc 0x144>;
+		io-channel-names = "batt-therm";
 		/* siliconmitus,vbus-always-on; */
 	};
 
