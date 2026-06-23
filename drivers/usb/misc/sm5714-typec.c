@@ -252,6 +252,14 @@ struct sm5714_typec {
 /* PD bring-up/teardown, defined below; driven from the role-apply path. */
 static int sm5714_pd_enable(struct sm5714_typec *t);
 static void sm5714_pd_disable(struct sm5714_typec *t);
+/* Request build + send, defined below; the RX handler re-Requests inline when a
+ * PPS source re-advertises its caps mid-contract. */
+static int sm5714_pd_build_request(struct sm5714_typec *t,
+				   union sm5714_pd_header *h,
+				   union sm5714_pd_obj *rdo);
+static int sm5714_pd_send(struct sm5714_typec *t,
+			  const union sm5714_pd_header *h,
+			  const union sm5714_pd_obj *objs, int n);
 
 /* Apply a decoded role: VBUS first toward the fail-safe, then the data role. */
 static void sm5714_typec_apply(struct sm5714_typec *t, enum usb_role role,
@@ -496,6 +504,34 @@ static void sm5714_pd_rx(struct sm5714_typec *t)
 					       n * sizeof(objs[0]));
 					t->pd_npdo = n;
 					schedule_work(&t->pd_req_work);
+				} else {
+					/*
+					 * Mid-contract re-advertisement: a PPS
+					 * source periodically re-offers its caps (a
+					 * source-initiated AMS) and Hard-Resets if
+					 * the sink does not Request again within
+					 * ~tSenderResponse.  Re-Request inline -- we
+					 * must answer now, and sm5714_pd_send is
+					 * non-blocking (FIFO write + TX_REQ; the
+					 * reply lands on a later IRQ), so it is safe
+					 * in this handler (unlike the blocking
+					 * Accept/PS_RDY waits, which stay in the work
+					 * item).  No SinkTxOk gate: this is the
+					 * source's AMS, not a sink-initiated one.
+					 * Refresh the stored PDOs first so the
+					 * keepalive stays consistent.
+					 */
+					union sm5714_pd_header rh = { };
+					union sm5714_pd_obj rrdo = { };
+
+					memcpy(t->pd_pdo, objs,
+					       n * sizeof(objs[0]));
+					t->pd_npdo = n;
+					if (sm5714_pd_build_request(t, &rh,
+								    &rrdo) > 0 &&
+					    !sm5714_pd_send(t, &rh, &rrdo, 1))
+						dev_info(dev,
+							 "PD source re-advertised caps -> re-Request (renegotiate)\n");
 				}
 			} else {
 				/*
