@@ -90,11 +90,15 @@
 #define SM5714_TYPEC_REG_PD_CNTL2	0x39	/* bit0=DFP(set)/UFP(clr), bit1=src(set)/snk(clr) */
 #define SM5714_TYPEC_PD_CNTL2_DFP	BIT(0)
 #define SM5714_TYPEC_PD_CNTL2_SRC	BIT(1)
+#define SM5714_TYPEC_REG_PD_CNTL4	0x3b	/* protocol-layer reset / AMS control */
+#define SM5714_TYPEC_PD_CNTL4_PRL_RESET	0x08	/* reset the PD protocol layer */
 #define SM5714_TYPEC_REG_RX_SRC		0x41	/* low nibble = SOP type (0 = SOP) */
 #define SM5714_TYPEC_REG_RX_HEADER_00	0x42	/* 2-byte block: PD message header */
 #define SM5714_TYPEC_REG_RX_PAYLOAD	0x44	/* N*4-byte block: data objects */
 #define SM5714_TYPEC_REG_RX_BUF		0x5e	/* write 0x80 = "RX read done" (mandatory) */
 #define SM5714_TYPEC_RX_BUF_READ_DONE	0x80
+#define SM5714_TYPEC_REG_RX_BUF_ST	0x5f	/* write 0x10 = flush RX buffer (protocol reset) */
+#define SM5714_TYPEC_RX_BUF_FLUSH	0x10
 #define SM5714_TYPEC_REG_TX_HEADER_00	0x60	/* 2-byte block: PD message header */
 #define SM5714_TYPEC_REG_TX_PAYLOAD	0x62	/* N*4-byte block: data objects */
 #define SM5714_TYPEC_REG_TX_REQ		0x7e	/* write 0x07 = "send queued SOP message" */
@@ -194,7 +198,12 @@ struct sm5714_typec {
 	struct delayed_work resync;
 	enum usb_role role;
 	bool pd_enabled;		/* PD protocol layer brought up (sink) */
+	bool pd_arm;			/* enable PD on the next sink-attach edge */
 };
+
+/* PD bring-up/teardown, defined below; driven from the role-apply path. */
+static int sm5714_pd_enable(struct sm5714_typec *t);
+static void sm5714_pd_disable(struct sm5714_typec *t);
 
 /* Apply a decoded role: VBUS first toward the fail-safe, then the data role. */
 static void sm5714_typec_apply(struct sm5714_typec *t, enum usb_role role,
@@ -270,6 +279,24 @@ static void sm5714_typec_apply(struct sm5714_typec *t, enum usb_role role,
 
 	t->role = role;
 	dev_info(&t->client->dev, "USB-C role -> %s\n", usb_role_string(role));
+
+	/*
+	 * Bring the PD protocol layer up at the sink-attach edge (when armed via
+	 * the pd_caps trigger) so it is live the moment the source sends its
+	 * initial Source_Capabilities -- a PD source only advertises caps early
+	 * in attach, so enabling here (not seconds later) is what lets us catch
+	 * them.  Tear PD down on any move away from sink.  One-shot: the arm is
+	 * consumed so a later Hard-Reset re-attach does not re-loop.
+	 */
+	if (role == USB_ROLE_DEVICE) {
+		if (t->pd_arm && !t->pd_enabled) {
+			t->pd_arm = false;
+			if (sm5714_pd_enable(t))
+				dev_warn(&t->client->dev, "PD enable failed\n");
+		}
+	} else if (t->pd_enabled) {
+		sm5714_pd_disable(t);
+	}
 }
 
 /* Read CC_STATUS and map the cable to a USB role; fail safe to NONE on error. */
@@ -404,15 +431,26 @@ static void sm5714_pd_rx(struct sm5714_typec *t)
 		 hdr.msg_type, hdr.num_data_objs, hdr.spec_revision,
 		 src < 0 ? 0xff : src, hdr.word);
 
-	if (hdr.num_data_objs > 0 && hdr.msg_type == SM5714_PD_DATA_SOURCE_CAP)
+	if (hdr.num_data_objs > 0 && hdr.msg_type == SM5714_PD_DATA_SOURCE_CAP) {
 		sm5714_pd_dump_source_caps(t, objs, n);
+		/*
+		 * Caps captured -- this is a receive-only bring-up.  Drop PD now,
+		 * before the source's no-Request response timer (tSenderResponse,
+		 * ~27 ms) fires a Hard Reset that would cycle VBUS.  The negotiation
+		 * milestone replaces this with sending a Request.
+		 */
+		sm5714_pd_disable(t);
+	}
 }
 
 /*
- * Bring up the PD protocol layer for a sink: select UFP + sink roles, unmask the
- * PD interrupts we handle, then enable the protocol layer.  Caller holds the
- * lock.  The HW does CRC/GoodCRC/retry and stamps the outgoing message-ID, so
- * from here software only writes/reads the FIFOs.
+ * Bring up the PD protocol layer for a sink, mirroring the device's own attach
+ * sequence: select UFP + sink roles, reset the protocol layer (flush the RX
+ * buffer + PD_CNTL4 reset, as the downstream driver does at PE_SNK_Startup so
+ * the PHY starts from a clean state), unmask the PD interrupts we handle, then
+ * enable the protocol layer.  Caller holds the lock.  The HW does
+ * CRC/GoodCRC/retry and stamps the outgoing message-ID, so from here software
+ * only writes/reads the FIFOs.
  */
 static int sm5714_pd_enable(struct sm5714_typec *t)
 {
@@ -426,6 +464,12 @@ static int sm5714_pd_enable(struct sm5714_typec *t)
 	ret = i2c_smbus_write_byte_data(c, SM5714_TYPEC_REG_PD_CNTL2, cntl2);
 	if (ret)
 		return ret;
+
+	/* Protocol-layer reset: flush RX buffer, then reset the protocol layer. */
+	i2c_smbus_write_byte_data(c, SM5714_TYPEC_REG_RX_BUF_ST,
+				  SM5714_TYPEC_RX_BUF_FLUSH);
+	i2c_smbus_write_byte_data(c, SM5714_TYPEC_REG_PD_CNTL4,
+				  SM5714_TYPEC_PD_CNTL4_PRL_RESET);
 
 	ret = i2c_smbus_write_byte_data(c, SM5714_TYPEC_REG_INT_MASK4,
 					SM5714_TYPEC_INT_MASK4_PD);
@@ -442,36 +486,14 @@ static int sm5714_pd_enable(struct sm5714_typec *t)
 	return 0;
 }
 
-/*
- * Send a Get_Source_Cap control message to solicit the source's PDO list.  A PD
- * source only volunteers Source_Capabilities a few times early in attach; once
- * it has given up (e.g. because our PD PHY was off), this asks for them again.
- * Fire-and-forget: the reply arrives asynchronously as an RX_DONE interrupt.
- */
-static int sm5714_pd_send_get_source_cap(struct sm5714_typec *t)
+/* Tear the PD protocol layer back down (disable PD; the layer's INT4 events
+ * stop mattering once pd_enabled is clear). */
+static void sm5714_pd_disable(struct sm5714_typec *t)
 {
-	union sm5714_pd_header hdr = { };
-	int ret;
-
-	hdr.msg_type = SM5714_PD_CTRL_GET_SOURCE_CAP;
-	hdr.port_data_role = SM5714_PD_DATA_ROLE_UFP;
-	hdr.port_power_role = SM5714_PD_POWER_ROLE_SINK;
-	hdr.spec_revision = SM5714_PD_SPEC_REV_30;
-	hdr.num_data_objs = 0;		/* control message; msg_id HW-stamped */
-
-	ret = i2c_smbus_write_i2c_block_data(t->client,
-					     SM5714_TYPEC_REG_TX_HEADER_00, 2,
-					     hdr.byte);
-	if (ret)
-		return ret;
-	ret = i2c_smbus_write_byte_data(t->client, SM5714_TYPEC_REG_TX_REQ,
-					SM5714_TYPEC_TX_REQ_SOP);
-	if (ret)
-		return ret;
-
-	dev_info(&t->client->dev, "PD TX: Get_Source_Cap (hdr=0x%04x)\n",
-		 hdr.word);
-	return 0;
+	i2c_smbus_write_byte_data(t->client, SM5714_TYPEC_REG_PD_CNTL1,
+				  SM5714_TYPEC_PD_CNTL1_DISABLE);
+	t->pd_enabled = false;
+	dev_info(&t->client->dev, "PD protocol layer disabled\n");
 }
 
 static irqreturn_t sm5714_typec_irq(int irq, void *data)
@@ -533,32 +555,25 @@ static void sm5714_typec_resync_work(struct work_struct *work)
 }
 
 /*
- * Debug/bring-up trigger (write-only sysfs): enable the PD protocol layer (if
- * not already up) and solicit the source's capabilities.  This makes the PD/PPS
- * negotiation independently exercisable on an attached charger without relying
- * on attach-edge timing.  Gated on being attached as a sink so it can never be
- * fired while we are the source (host, boosting VBUS).
+ * Debug/bring-up trigger (write-only sysfs): ARM PD for the next sink attach.
+ * A PD source only advertises Source_Capabilities early in attach and a charger
+ * that has already settled into a non-PD high-voltage mode (e.g. AFC) will not
+ * answer PD on the existing attach -- so PD must be live at the attach edge.
+ * Writing here arms a one-shot enable that fires when the cable next resolves to
+ * sink; the operator then replugs the charger.  The captured caps are logged and
+ * PD is dropped again (receive-only bring-up).
  */
 static ssize_t pd_caps_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t len)
 {
 	struct sm5714_typec *t = i2c_get_clientdata(to_i2c_client(dev));
-	int ret = 0;
 
 	mutex_lock(&t->lock);
-	if (t->role != USB_ROLE_DEVICE) {
-		mutex_unlock(&t->lock);
-		dev_warn(dev, "PD caps request ignored: not a sink (role=%s)\n",
-			 usb_role_string(t->role));
-		return -ENODEV;
-	}
-	if (!t->pd_enabled)
-		ret = sm5714_pd_enable(t);
-	if (!ret)
-		ret = sm5714_pd_send_get_source_cap(t);
+	t->pd_arm = true;
 	mutex_unlock(&t->lock);
-
-	return ret ? ret : len;
+	dev_info(dev,
+		 "PD armed: will enable PD + capture Source_Capabilities on the next sink attach -- replug the charger\n");
+	return len;
 }
 static DEVICE_ATTR_WO(pd_caps);
 
