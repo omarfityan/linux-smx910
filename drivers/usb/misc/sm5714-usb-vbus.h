@@ -13,8 +13,18 @@
 
 #if IS_ENABLED(CONFIG_USB_SM5714_VBUS)
 int sm5714_usb_vbus_set_host(bool on);
+/*
+ * Inhibit (or re-allow) the charging worker's Samsung-AFC high-voltage
+ * handshake.  The role driver calls this with true while a USB-PD contract is
+ * active so the AFC handshake (which perturbs D+/D- and VBUS) does not race and
+ * break the PD contract on the shared cable; false on PD teardown re-allows AFC
+ * as the fallback high-voltage path.  Mirrors the downstream pdic_afc_state
+ * PDIC->MUIC inhibit signal.
+ */
+void sm5714_usb_vbus_inhibit_afc(bool inhibit);
 #else
 static inline int sm5714_usb_vbus_set_host(bool on) { return -ENODEV; }
+static inline void sm5714_usb_vbus_inhibit_afc(bool inhibit) { }
 #endif
 
 #endif /* __SM5714_USB_VBUS_H */

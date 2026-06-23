@@ -197,6 +197,7 @@ struct sm5714_vbus {
 	bool charge_cut;		/* hot/cold FET-cut hysteresis */
 	enum sm5714_afc_state afc_state;	/* AFC 9V negotiation (per attach) */
 	int afc_tries;			/* negotiation attempts this attach */
+	bool afc_inhibited;		/* PD contract active: skip AFC (set by the role driver) */
 	struct power_supply *psy;	/* charger online indicator */
 	struct delayed_work charger_work;	/* input-current management */
 };
@@ -399,6 +400,22 @@ int sm5714_usb_vbus_set_host(bool on)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(sm5714_usb_vbus_set_host);
+
+/*
+ * Inhibit / re-allow the AFC handshake (see the header).  The charging worker
+ * reads afc_inhibited under its own lock; a single WRITE_ONCE here pairs with a
+ * READ_ONCE there, so no lock ordering against the worker is introduced.  The
+ * worker polls every few seconds and PD comes up at the attach edge, so the flag
+ * is always set well before the next AFC attempt.
+ */
+void sm5714_usb_vbus_inhibit_afc(bool inhibit)
+{
+	mutex_lock(&sm5714_vbus_instance_lock);
+	if (sm5714_vbus_instance)
+		WRITE_ONCE(sm5714_vbus_instance->afc_inhibited, inhibit);
+	mutex_unlock(&sm5714_vbus_instance_lock);
+}
+EXPORT_SYMBOL_GPL(sm5714_usb_vbus_inhibit_afc);
 
 /* Map the MUIC BC1.2 classification to its device-own input-current ceiling. */
 static int sm5714_input_current_ma(u8 dev_type1)
@@ -658,7 +675,8 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 	 * will not charge; a cut that arrives AFTER 9 V just opens the FET, which is
 	 * safe with 9 V on VBUS).
 	 */
-	if (vbus && !sv->charge_cut && sv->afc_state == SM5714_AFC_IDLE) {
+	if (vbus && !sv->charge_cut && !READ_ONCE(sv->afc_inhibited) &&
+	    sv->afc_state == SM5714_AFC_IDLE) {
 		int dev_type2 = i2c_smbus_read_byte_data(sv->muic,
 							 SM5714_MUIC_REG_DEVTYPE2);
 

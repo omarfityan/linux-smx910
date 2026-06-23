@@ -574,6 +574,9 @@ static int sm5714_pd_enable(struct sm5714_typec *t)
 
 	t->pd_contract_lost = false;
 	t->pd_enabled = true;
+	/* Keep the charging worker's AFC handshake off the shared cable while PD
+	 * owns it -- an AFC ping mid-contract perturbs VBUS and breaks PPS. */
+	sm5714_usb_vbus_inhibit_afc(true);
 	dev_info(&c->dev, "PD protocol layer enabled (sink)\n");
 	return 0;
 }
@@ -595,6 +598,8 @@ static void sm5714_pd_disable(struct sm5714_typec *t)
 	t->pd_do_request = false;	/* one-shot: a fresh attach must re-arm */
 	t->pd_negotiating = false;
 	t->pd_contract_lost = false;
+	/* PD gone: re-allow AFC as the high-voltage fallback (the worker re-AFCs). */
+	sm5714_usb_vbus_inhibit_afc(false);
 	dev_info(&t->client->dev, "PD protocol layer disabled\n");
 }
 
