@@ -37,6 +37,7 @@
 #include <linux/usb/role.h>
 #include <linux/usb/typec.h>
 #include <linux/workqueue.h>
+#include <linux/completion.h>
 
 #include "sm5714-usb-vbus.h"
 
@@ -126,6 +127,28 @@
 
 #define SM5714_PD_MAX_OBJ		7	/* max data objects in a PD message */
 
+/* Control-message events the IRQ raises for the Request work item.  Sticky in
+ * pd_evt so an event arriving before the work waits for it is never lost. */
+#define SM5714_PD_EVT_ACCEPT		BIT(0)
+#define SM5714_PD_EVT_REJECT		BIT(1)
+#define SM5714_PD_EVT_WAIT		BIT(2)
+#define SM5714_PD_EVT_PS_RDY		BIT(3)
+
+/*
+ * PPS Request target.  9 V is also reachable by Samsung AFC, so to make a
+ * successful PD contract electrically falsifiable (not merely visible in dmesg)
+ * we request a voltage AFC physically cannot produce -- AFC is 5 V/9 V quantized
+ * -- yet inside PDO[5]'s 5-11 V PPS window and under the charger's fixed-PDO OVP.
+ * Success is then VBUS rising 5 V -> ~10 V on the SM5440 telemetry, an outcome no
+ * AFC negotiation can fake.  The op-current is only a ceiling; the buck draws
+ * what it needs.
+ */
+#define SM5714_PD_REQ_MV		10000
+#define SM5714_PD_REQ_MA		3000
+#define SM5714_PD_T_ACCEPT_MS		400	/* tSenderResponse ~27 ms; generous */
+#define SM5714_PD_T_PSRDY_MS		600	/* tPSTransition ~450-550 ms */
+#define SM5714_PD_HOLD_MS		800	/* hold the contract for the VBUS read */
+
 /*
  * PD message header (16 bits) and data object (32 bits).  Bitfields transcribed
  * verbatim from the device's own headers (common/pdic_core.h msg_header_type and
@@ -199,6 +222,13 @@ struct sm5714_typec {
 	enum usb_role role;
 	bool pd_enabled;		/* PD protocol layer brought up (sink) */
 	bool pd_arm;			/* enable PD on the next sink-attach edge */
+	bool pd_do_request;		/* negotiate (not just capture) on this attach */
+	bool pd_negotiating;		/* a Request flow is in flight (work scheduled) */
+	struct work_struct pd_req_work;	/* PD negotiation; runs off-IRQ (it blocks) */
+	struct completion pd_reply;	/* IRQ wakes the work on a control message */
+	u32 pd_evt;			/* sticky SM5714_PD_EVT_* control-msg events */
+	union sm5714_pd_obj pd_pdo[SM5714_PD_MAX_OBJ];	/* last captured source caps */
+	int pd_npdo;
 };
 
 /* PD bring-up/teardown, defined below; driven from the role-apply path. */
@@ -431,16 +461,59 @@ static void sm5714_pd_rx(struct sm5714_typec *t)
 		 hdr.msg_type, hdr.num_data_objs, hdr.spec_revision,
 		 src < 0 ? 0xff : src, hdr.word);
 
-	if (hdr.num_data_objs > 0 && hdr.msg_type == SM5714_PD_DATA_SOURCE_CAP) {
-		sm5714_pd_dump_source_caps(t, objs, n);
-		/*
-		 * Caps captured -- this is a receive-only bring-up.  Drop PD now,
-		 * before the source's no-Request response timer (tSenderResponse,
-		 * ~27 ms) fires a Hard Reset that would cycle VBUS.  The negotiation
-		 * milestone replaces this with sending a Request.
-		 */
-		sm5714_pd_disable(t);
+	if (hdr.num_data_objs > 0) {
+		if (hdr.msg_type == SM5714_PD_DATA_SOURCE_CAP) {
+			sm5714_pd_dump_source_caps(t, objs, n);
+			if (t->pd_do_request) {
+				/*
+				 * Negotiate: hand the caps to the work item,
+				 * which sends a Request and blocks for the reply
+				 * -- which cannot happen here, as this IRQ is
+				 * ONESHOT-masked.  PD stays up; pd_negotiating
+				 * stops a re-sent caps re-scheduling the work.
+				 */
+				if (!t->pd_negotiating) {
+					t->pd_negotiating = true;
+					memcpy(t->pd_pdo, objs,
+					       n * sizeof(objs[0]));
+					t->pd_npdo = n;
+					schedule_work(&t->pd_req_work);
+				}
+			} else {
+				/*
+				 * Receive-only bring-up: caps captured, drop PD
+				 * before the source's no-Request timer
+				 * (tSenderResponse ~27 ms) fires a Hard Reset
+				 * that would cycle VBUS.
+				 */
+				sm5714_pd_disable(t);
+			}
+		}
+		return;
 	}
+
+	/*
+	 * Control message (no data objects): record it for the negotiation work
+	 * item and wake it.  pd_evt is sticky so an event that arrives before
+	 * the work starts waiting is not lost; the completion only cuts latency.
+	 */
+	switch (hdr.msg_type) {
+	case SM5714_PD_CTRL_ACCEPT:
+		t->pd_evt |= SM5714_PD_EVT_ACCEPT;
+		break;
+	case SM5714_PD_CTRL_REJECT:
+		t->pd_evt |= SM5714_PD_EVT_REJECT;
+		break;
+	case SM5714_PD_CTRL_WAIT:
+		t->pd_evt |= SM5714_PD_EVT_WAIT;
+		break;
+	case SM5714_PD_CTRL_PS_RDY:
+		t->pd_evt |= SM5714_PD_EVT_PS_RDY;
+		break;
+	default:
+		return;
+	}
+	complete(&t->pd_reply);
 }
 
 /*
@@ -493,7 +566,182 @@ static void sm5714_pd_disable(struct sm5714_typec *t)
 	i2c_smbus_write_byte_data(t->client, SM5714_TYPEC_REG_PD_CNTL1,
 				  SM5714_TYPEC_PD_CNTL1_DISABLE);
 	t->pd_enabled = false;
+	t->pd_do_request = false;	/* one-shot: a fresh attach must re-arm */
+	t->pd_negotiating = false;
 	dev_info(&t->client->dev, "PD protocol layer disabled\n");
+}
+
+/*
+ * Queue one PD message into the TX FIFO and fire it: header (2 bytes) + any data
+ * objects (n*4 bytes) + TX_REQ.  The PHY does CRC/GoodCRC/retry and stamps the
+ * message-ID, so this is the whole send.  Caller holds the lock.
+ */
+static int sm5714_pd_send(struct sm5714_typec *t,
+			  const union sm5714_pd_header *h,
+			  const union sm5714_pd_obj *objs, int n)
+{
+	struct i2c_client *c = t->client;
+	int ret;
+
+	ret = i2c_smbus_write_i2c_block_data(c, SM5714_TYPEC_REG_TX_HEADER_00,
+					     2, h->byte);
+	if (ret)
+		return ret;
+	if (n > 0) {
+		ret = i2c_smbus_write_i2c_block_data(c,
+						     SM5714_TYPEC_REG_TX_PAYLOAD,
+						     n * 4, (const u8 *)objs);
+		if (ret)
+			return ret;
+	}
+	return i2c_smbus_write_byte_data(c, SM5714_TYPEC_REG_TX_REQ,
+					 SM5714_TYPEC_TX_REQ_SOP);
+}
+
+/*
+ * Find a PPS APDO in the captured caps whose programmable range covers
+ * target_mv; return its 1-based object position (PD Request object_position) or
+ * 0 if none.  Caller holds the lock (reads pd_pdo/pd_npdo).
+ */
+static int sm5714_pd_pick_pps(struct sm5714_typec *t, unsigned int target_mv)
+{
+	int i;
+
+	for (i = 0; i < t->pd_npdo; i++) {
+		union sm5714_pd_obj o = t->pd_pdo[i];
+
+		if (o.supply.supply_type == SM5714_PD_SUPPLY_APDO &&
+		    o.apdo.pps_supply == 0 &&
+		    target_mv >= o.apdo.min_voltage * 100u &&
+		    target_mv <= o.apdo.max_voltage * 100u)
+			return i + 1;
+	}
+	return 0;
+}
+
+/*
+ * Wait until any bit in mask is set in pd_evt, or timeout.  pd_evt is read under
+ * the lock; the wait is done WITHOUT the lock so the IRQ can take it to signal
+ * (waiting under the lock would deadlock against the very handler that sets the
+ * event).  The completion is just a wakeup; the sticky pd_evt is the truth, so a
+ * lost/extra completion at most costs one non-blocking re-check.
+ */
+static u32 sm5714_pd_wait(struct sm5714_typec *t, u32 mask,
+			  unsigned int timeout_ms)
+{
+	unsigned long left = msecs_to_jiffies(timeout_ms);
+	u32 hit;
+
+	for (;;) {
+		mutex_lock(&t->lock);
+		hit = t->pd_evt & mask;
+		mutex_unlock(&t->lock);
+		if (hit || !left)
+			return hit;
+		left = wait_for_completion_timeout(&t->pd_reply, left);
+	}
+}
+
+/*
+ * The PD sink Policy Engine, minimal: build a PPS Request for the chosen APDO,
+ * send it, wait for Accept then PS_RDY, and -- on success -- hold the contract
+ * briefly so the VBUS rise is observable before tearing PD down.  This runs in
+ * its own work item, NOT the IRQ thread: it blocks waiting for the source's
+ * replies, which the IRQ delivers (an inline wait would mask the line that
+ * carries the reply).  One-shot: there is no keepalive, so the source
+ * Hard-Resets after ~tPPSTimeout and the charger re-AFCs -- the same benign
+ * revert the capture-only path already showed.
+ */
+static void sm5714_pd_req_work(struct work_struct *work)
+{
+	struct sm5714_typec *t = container_of(work, struct sm5714_typec,
+					      pd_req_work);
+	struct device *dev = &t->client->dev;
+	union sm5714_pd_header h = { };
+	union sm5714_pd_obj rdo = { };
+	unsigned int op_ma, pdo_max_ma;
+	int pos, ret;
+	u32 evt;
+
+	mutex_lock(&t->lock);
+	if (!t->pd_enabled) {		/* attach went away before we ran */
+		mutex_unlock(&t->lock);
+		return;
+	}
+
+	pos = sm5714_pd_pick_pps(t, SM5714_PD_REQ_MV);
+	if (!pos) {
+		dev_warn(dev, "PD: no PPS APDO covers %u mV; not requesting\n",
+			 SM5714_PD_REQ_MV);
+		mutex_unlock(&t->lock);
+		return;
+	}
+
+	/* Never request above the chosen APDO's advertised max current. */
+	pdo_max_ma = t->pd_pdo[pos - 1].apdo.max_current * 50;
+	op_ma = SM5714_PD_REQ_MA;
+	if (op_ma > pdo_max_ma)
+		op_ma = pdo_max_ma;
+
+	/* PPS Request data object: output_voltage in 20 mV, op_current in 50 mA. */
+	rdo.rdo_pps.output_voltage = SM5714_PD_REQ_MV / 20;
+	rdo.rdo_pps.op_current = op_ma / 50;
+	rdo.rdo_pps.object_position = pos;
+	rdo.rdo_pps.no_usb_suspend = 1;
+	rdo.rdo_pps.usb_comm_capable = 1;
+
+	/* Request: one data object, PD rev 3.0 (PPS), UFP + sink roles. */
+	h.msg_type = SM5714_PD_DATA_REQUEST;
+	h.num_data_objs = 1;
+	h.spec_revision = SM5714_PD_SPEC_REV_30;
+	h.port_data_role = SM5714_PD_DATA_ROLE_UFP;
+	h.port_power_role = SM5714_PD_POWER_ROLE_SINK;
+
+	/* Arm the reply path BEFORE sending: clear stale events, reinit the
+	 * completion -- otherwise a fast Accept could be missed or a stale one
+	 * could false-fire. */
+	t->pd_evt = 0;
+	reinit_completion(&t->pd_reply);
+
+	ret = sm5714_pd_send(t, &h, &rdo, 1);
+	mutex_unlock(&t->lock);
+
+	if (ret) {
+		dev_warn(dev, "PD Request send failed (%d)\n", ret);
+		goto teardown;
+	}
+	/* Log the exact packed objects so the bitfield transcription is
+	 * verifiable on-device (expect rdo=0x5303e83c hdr=0x1082 for the
+	 * 10 V/3 A pos-5 Request), independent of whether the source accepts. */
+	dev_info(dev,
+		 "PD Request sent: PPS PDO[%d] %u mV / %u mA (rdo=0x%08x hdr=0x%04x)\n",
+		 pos, SM5714_PD_REQ_MV, op_ma, rdo.object, h.word);
+
+	evt = sm5714_pd_wait(t, SM5714_PD_EVT_ACCEPT | SM5714_PD_EVT_REJECT |
+				SM5714_PD_EVT_WAIT, SM5714_PD_T_ACCEPT_MS);
+	if (!(evt & SM5714_PD_EVT_ACCEPT)) {
+		dev_warn(dev, "PD Request not accepted (evt=0x%x)\n", evt);
+		goto teardown;
+	}
+	dev_info(dev, "PD Request ACCEPTED -- waiting for PS_RDY\n");
+
+	evt = sm5714_pd_wait(t, SM5714_PD_EVT_PS_RDY, SM5714_PD_T_PSRDY_MS);
+	if (!(evt & SM5714_PD_EVT_PS_RDY)) {
+		dev_warn(dev, "PD: Accept but no PS_RDY (evt=0x%x)\n", evt);
+		goto teardown;
+	}
+	dev_info(dev,
+		 "PD PPS contract ESTABLISHED: %u mV requested -- read VBUS on the SM5440 now\n",
+		 SM5714_PD_REQ_MV);
+
+	/* Hold so the VBUS rise is readable, then drop (one-shot spike). */
+	msleep(SM5714_PD_HOLD_MS);
+
+teardown:
+	mutex_lock(&t->lock);
+	if (t->pd_enabled)
+		sm5714_pd_disable(t);
+	mutex_unlock(&t->lock);
 }
 
 static irqreturn_t sm5714_typec_irq(int irq, void *data)
@@ -578,6 +826,30 @@ static ssize_t pd_caps_store(struct device *dev, struct device_attribute *attr,
 static DEVICE_ATTR_WO(pd_caps);
 
 /*
+ * Debug/bring-up trigger (write-only sysfs): ARM a full PPS negotiation for the
+ * next sink attach.  Same attach-edge timing as pd_caps, but instead of dropping
+ * PD after capturing the caps, the driver sends a PPS Request (~10 V), waits for
+ * Accept + PS_RDY, and holds the contract briefly -- the operator reads VBUS on
+ * the SM5440 to confirm it actually moved.  One-shot; the operator then replugs.
+ */
+static ssize_t pd_request_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct sm5714_typec *t = i2c_get_clientdata(to_i2c_client(dev));
+
+	mutex_lock(&t->lock);
+	t->pd_arm = true;
+	t->pd_do_request = true;
+	mutex_unlock(&t->lock);
+	dev_info(dev,
+		 "PD armed: will negotiate a %u mV PPS contract on the next sink attach -- replug the charger\n",
+		 SM5714_PD_REQ_MV);
+	return len;
+}
+static DEVICE_ATTR_WO(pd_request);
+
+/*
  * Register a Type-C port so the connector shows up under /sys/class/typec
  * (data/power role, partner, orientation) and to provide the foundation for
  * DP-altmode.  The capability (DRP / DRD / try-sink) is read straight from the
@@ -635,6 +907,8 @@ static int sm5714_typec_probe(struct i2c_client *client)
 	t->role = USB_ROLE_NONE;
 	mutex_init(&t->lock);
 	INIT_DELAYED_WORK(&t->resync, sm5714_typec_resync_work);
+	INIT_WORK(&t->pd_req_work, sm5714_pd_req_work);
+	init_completion(&t->pd_reply);
 	i2c_set_clientdata(client, t);
 
 	/*
@@ -694,9 +968,11 @@ static int sm5714_typec_probe(struct i2c_client *client)
 	/* Slow re-sync backstop regardless of IRQ. */
 	schedule_delayed_work(&t->resync, msecs_to_jiffies(SM5714_TYPEC_POLL_MS));
 
-	/* PD capability-solicitation bring-up trigger (non-fatal addition). */
+	/* PD bring-up triggers (non-fatal additions): capture-only + negotiate. */
 	if (device_create_file(dev, &dev_attr_pd_caps))
 		dev_warn(dev, "could not create pd_caps sysfs attribute\n");
+	if (device_create_file(dev, &dev_attr_pd_request))
+		dev_warn(dev, "could not create pd_request sysfs attribute\n");
 
 	dev_info(dev, "SM5714 Type-C role controller ready (role=%s)\n",
 		 usb_role_string(t->role));
@@ -719,7 +995,9 @@ static void sm5714_typec_remove(struct i2c_client *client)
 	struct sm5714_typec *t = i2c_get_clientdata(client);
 
 	device_remove_file(&client->dev, &dev_attr_pd_caps);
+	device_remove_file(&client->dev, &dev_attr_pd_request);
 	cancel_delayed_work_sync(&t->resync);
+	cancel_work_sync(&t->pd_req_work);
 	/* Leave the port disconnected + VBUS off (also unregisters the partner). */
 	mutex_lock(&t->lock);
 	sm5714_typec_apply(t, USB_ROLE_NONE, TYPEC_ORIENTATION_NONE);
