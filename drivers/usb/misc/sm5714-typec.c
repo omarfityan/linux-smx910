@@ -40,6 +40,7 @@
 #include <linux/completion.h>
 
 #include "sm5714-usb-vbus.h"
+#include "sm5714-typec.h"
 
 /* Interrupt / status registers (latched INT read-to-clear; STATUS is live). */
 #define SM5714_TYPEC_REG_INT1		0x01
@@ -247,7 +248,19 @@ struct sm5714_typec {
 	u32 pd_evt;			/* sticky SM5714_PD_EVT_* control-msg events */
 	union sm5714_pd_obj pd_pdo[SM5714_PD_MAX_OBJ];	/* last captured source caps */
 	int pd_npdo;
+	u32 pd_target_mv;		/* commanded PPS request voltage; the keepalive
+					 * carries it.  Seeded to SM5714_PD_REQ_MV; the
+					 * SM5440 pump loop steps it via
+					 * sm5714_pd_request_voltage(). */
+	u32 pd_target_ma;		/* commanded PPS request current ceiling */
 };
+
+/*
+ * The single bound PDIC instance, for the cross-driver PPS hooks the SM5440
+ * charge-pump driver calls.  Read with READ_ONCE; set at the end of probe,
+ * cleared at the start of remove.
+ */
+static struct sm5714_typec *sm5714_typec_instance;
 
 /* PD bring-up/teardown, defined below; driven from the role-apply path. */
 static int sm5714_pd_enable(struct sm5714_typec *t);
@@ -721,20 +734,20 @@ static int sm5714_pd_build_request(struct sm5714_typec *t,
 				   union sm5714_pd_obj *rdo)
 {
 	unsigned int op_ma, pdo_max_ma;
-	int pos = sm5714_pd_pick_pps(t, SM5714_PD_REQ_MV);
+	int pos = sm5714_pd_pick_pps(t, t->pd_target_mv);
 
 	if (!pos)
 		return 0;
 
 	/* Never request above the chosen APDO's advertised max current. */
 	pdo_max_ma = t->pd_pdo[pos - 1].apdo.max_current * 50;
-	op_ma = SM5714_PD_REQ_MA;
+	op_ma = t->pd_target_ma;
 	if (op_ma > pdo_max_ma)
 		op_ma = pdo_max_ma;
 
 	/* PPS Request data object: output_voltage in 20 mV, op_current in 50 mA. */
 	rdo->object = 0;
-	rdo->rdo_pps.output_voltage = SM5714_PD_REQ_MV / 20;
+	rdo->rdo_pps.output_voltage = t->pd_target_mv / 20;
 	rdo->rdo_pps.op_current = op_ma / 50;
 	rdo->rdo_pps.object_position = pos;
 	rdo->rdo_pps.no_usb_suspend = 1;
@@ -780,7 +793,7 @@ static void sm5714_pd_req_work(struct work_struct *work)
 	pos = sm5714_pd_build_request(t, &h, &rdo);
 	if (!pos) {
 		dev_warn(dev, "PD: no PPS APDO covers %u mV; not requesting\n",
-			 SM5714_PD_REQ_MV);
+			 t->pd_target_mv);
 		mutex_unlock(&t->lock);
 		return;
 	}
@@ -803,7 +816,7 @@ static void sm5714_pd_req_work(struct work_struct *work)
 	 * 10 V/3 A pos-5 Request), independent of whether the source accepts. */
 	dev_info(dev,
 		 "PD Request sent: PPS PDO[%d] %u mV / %u mA (rdo=0x%08x hdr=0x%04x)\n",
-		 pos, SM5714_PD_REQ_MV, rdo.rdo_pps.op_current * 50, rdo.object,
+		 pos, t->pd_target_mv, rdo.rdo_pps.op_current * 50, rdo.object,
 		 h.word);
 
 	evt = sm5714_pd_wait(t, SM5714_PD_EVT_ACCEPT | SM5714_PD_EVT_REJECT |
@@ -821,7 +834,7 @@ static void sm5714_pd_req_work(struct work_struct *work)
 	}
 	dev_info(dev,
 		 "PD PPS contract ESTABLISHED: %u mV requested -- read VBUS on the SM5440 now\n",
-		 SM5714_PD_REQ_MV);
+		 t->pd_target_mv);
 
 	/*
 	 * Contract is up.  Instead of the one-shot hold-then-drop, arm the
@@ -914,11 +927,62 @@ static void sm5714_pd_keepalive_work(struct work_struct *work)
 		dev_warn(dev, "PD keepalive re-Request failed (%d)\n", ret);
 	else
 		dev_info(dev, "PD keepalive re-Request: %u mV (rdo=0x%08x)\n",
-			 SM5714_PD_REQ_MV, rdo.object);
+			 t->pd_target_mv, rdo.object);
 
 	schedule_delayed_work(&t->pd_keepalive,
 			      msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
 }
+
+/*
+ * Cross-driver hooks for the SM5440 charge-pump loop (declared in
+ * sm5714-typec.h).
+ *
+ * sm5714_pd_request_voltage(): command the sustained PPS contract to a new
+ * voltage / current ceiling.  The pump's CC/CV loop calls this to step the PPS
+ * input as it regulates; the keepalive then re-Requests the new target.  We kick
+ * the keepalive to fire immediately (mod_delayed_work .. 0) so the stepped
+ * voltage is requested promptly rather than up to one keepalive period later.
+ * Returns -ENODEV (no bound instance) or -ENOTCONN (no PPS contract held).
+ */
+int sm5714_pd_request_voltage(unsigned int mv, unsigned int ma)
+{
+	struct sm5714_typec *t = READ_ONCE(sm5714_typec_instance);
+	bool active;
+
+	if (!t)
+		return -ENODEV;
+
+	mutex_lock(&t->lock);
+	active = t->pd_enabled && !t->pd_contract_lost;
+	if (active) {
+		t->pd_target_mv = mv;
+		t->pd_target_ma = ma;
+	}
+	mutex_unlock(&t->lock);
+
+	if (!active)
+		return -ENOTCONN;
+
+	mod_delayed_work(system_wq, &t->pd_keepalive, 0);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(sm5714_pd_request_voltage);
+
+/* True while a sink PPS contract is held (PD enabled and not lost). */
+bool sm5714_pd_contract_active(void)
+{
+	struct sm5714_typec *t = READ_ONCE(sm5714_typec_instance);
+	bool active;
+
+	if (!t)
+		return false;
+
+	mutex_lock(&t->lock);
+	active = t->pd_enabled && !t->pd_contract_lost;
+	mutex_unlock(&t->lock);
+	return active;
+}
+EXPORT_SYMBOL_GPL(sm5714_pd_contract_active);
 
 static irqreturn_t sm5714_typec_irq(int irq, void *data)
 {
@@ -1100,6 +1164,8 @@ static int sm5714_typec_probe(struct i2c_client *client)
 
 	t->client = client;
 	t->role = USB_ROLE_NONE;
+	t->pd_target_mv = SM5714_PD_REQ_MV;
+	t->pd_target_ma = SM5714_PD_REQ_MA;
 	mutex_init(&t->lock);
 	INIT_DELAYED_WORK(&t->resync, sm5714_typec_resync_work);
 	INIT_WORK(&t->pd_req_work, sm5714_pd_req_work);
@@ -1172,6 +1238,8 @@ static int sm5714_typec_probe(struct i2c_client *client)
 
 	dev_info(dev, "SM5714 Type-C role controller ready (role=%s)\n",
 		 usb_role_string(t->role));
+	/* Fully initialised: publish the instance for the cross-driver PPS hooks. */
+	WRITE_ONCE(sm5714_typec_instance, t);
 	fwnode_handle_put(connector);
 	return 0;
 
@@ -1190,6 +1258,8 @@ static void sm5714_typec_remove(struct i2c_client *client)
 {
 	struct sm5714_typec *t = i2c_get_clientdata(client);
 
+	/* Stop the cross-driver PPS hooks finding us before we tear down. */
+	WRITE_ONCE(sm5714_typec_instance, NULL);
 	device_remove_file(&client->dev, &dev_attr_pd_caps);
 	device_remove_file(&client->dev, &dev_attr_pd_request);
 	cancel_delayed_work_sync(&t->resync);

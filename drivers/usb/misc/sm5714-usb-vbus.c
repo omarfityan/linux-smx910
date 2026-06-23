@@ -198,6 +198,7 @@ struct sm5714_vbus {
 	enum sm5714_afc_state afc_state;	/* AFC 9V negotiation (per attach) */
 	int afc_tries;			/* negotiation attempts this attach */
 	bool afc_inhibited;		/* PD contract active: skip AFC (set by the role driver) */
+	bool buck_inhibited;		/* pump engaged: keep the cell FET open (set by the SM5440 driver) */
 	struct power_supply *psy;	/* charger online indicator */
 	struct delayed_work charger_work;	/* input-current management */
 };
@@ -416,6 +417,33 @@ void sm5714_usb_vbus_inhibit_afc(bool inhibit)
 	mutex_unlock(&sm5714_vbus_instance_lock);
 }
 EXPORT_SYMBOL_GPL(sm5714_usb_vbus_inhibit_afc);
+
+/*
+ * Inhibit / re-allow the buck charge path (see the header).  Unlike AFC-inhibit
+ * this also acts immediately: on inhibit it disarms the cell FET so the SM5440
+ * pump can take the cell without the buck fighting it (the buck-OFF-before-
+ * pump-ON handoff), and the worker's FET-arm gate (which reads buck_inhibited)
+ * keeps it open until re-allowed.  Lock order is instance_lock -> sv->lock; the
+ * worker only ever takes sv->lock, so no inversion is introduced.
+ */
+int sm5714_charger_inhibit_buck(bool inhibit)
+{
+	struct sm5714_vbus *sv;
+
+	mutex_lock(&sm5714_vbus_instance_lock);
+	sv = sm5714_vbus_instance;
+	if (sv) {
+		WRITE_ONCE(sv->buck_inhibited, inhibit);
+		if (inhibit) {
+			mutex_lock(&sv->lock);
+			sm5714_set_charge_fet(sv, false);
+			mutex_unlock(&sv->lock);
+		}
+	}
+	mutex_unlock(&sm5714_vbus_instance_lock);
+	return sv ? 0 : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(sm5714_charger_inhibit_buck);
 
 /* Map the MUIC BC1.2 classification to its device-own input-current ceiling. */
 static int sm5714_input_current_ma(u8 dev_type1)
@@ -708,7 +736,7 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 	 * policy choice (VBUS_POK + temperature as the arm signal), not a stock
 	 * transcription; opening the FET with no input path is harmless.
 	 */
-	if (vbus && !sv->charge_cut) {
+	if (vbus && !sv->charge_cut && !READ_ONCE(sv->buck_inhibited)) {
 		int cntl2 = i2c_smbus_read_byte_data(sv->chg, SM5714_CHG_REG_CNTL2);
 
 		if (cntl2 >= 0 && (cntl2 & SM5714_CHG_CNTL2_OPMODE_MASK) !=

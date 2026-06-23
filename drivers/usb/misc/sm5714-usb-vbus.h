@@ -22,9 +22,18 @@ int sm5714_usb_vbus_set_host(bool on);
  * PDIC->MUIC inhibit signal.
  */
 void sm5714_usb_vbus_inhibit_afc(bool inhibit);
+/*
+ * Inhibit (or re-allow) the SM5714 buck charge path.  The SM5440 charge-pump
+ * driver calls this with true before engaging the pump: it disarms the cell
+ * charge FET immediately and stops the charging worker re-arming it, so the
+ * pump owns the cell while engaged (the device-own buck-OFF-before-pump-ON
+ * handoff).  false on disengage re-allows the worker to resume buck charging.
+ */
+int sm5714_charger_inhibit_buck(bool inhibit);
 #else
 static inline int sm5714_usb_vbus_set_host(bool on) { return -ENODEV; }
 static inline void sm5714_usb_vbus_inhibit_afc(bool inhibit) { }
+static inline int sm5714_charger_inhibit_buck(bool inhibit) { return -ENODEV; }
 #endif
 
 #endif /* __SM5714_USB_VBUS_H */
