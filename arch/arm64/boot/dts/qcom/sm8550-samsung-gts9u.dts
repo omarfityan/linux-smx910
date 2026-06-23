@@ -76,6 +76,21 @@
 		 * Console is tty0 (panel) + the USB CDC-ACM gadget (ttyGS0).
 		 */
 		serial0 = &uart7;
+
+		/*
+		 * Pin the SM5714 charger/PDIC i2c-hub bus numbers, and place the
+		 * SM5440 charge-pump bus at a fixed i2c-2. Without these, i2c bus
+		 * ids are dynamic (assigned in probe order): enabling &i2c_hub_3
+		 * (i2c@98c000, the SM5440 bus) below would perturb the numbering and
+		 * could move the SM5714 charger off bus 0, breaking every tool that
+		 * addresses it there. of_alias_get_highest_id() raises the dynamic
+		 * base above the highest i2c alias, so these pins are race-free; the
+		 * unrelated regular-QUP buses (currently i2c-2/i2c-3 = touch/sensors,
+		 * DT-bound with no bus-number dependency) float up accordingly.
+		 */
+		i2c0 = &i2c_hub_8;	/* SM5714 charger 0x49 / MUIC 0x25 / FG 0x71 */
+		i2c1 = &i2c_hub_9;	/* SM5714 PDIC 0x33 */
+		i2c2 = &i2c_hub_3;	/* SM5440 charge-pump 0x63 (rung-3 45 W) */
 	};
 
 	chosen {
@@ -1384,6 +1399,22 @@
  */
 &i2c_master_hub_0 {
 	status = "okay";
+};
+
+/*
+ * SM5440 switched-capacitor 2:1 charge-pump bus (rung-3 45 W fast charge).
+ * The SM5440 lives at i2c 7-bit 0x63 on i2c-hub serial-engine SE3
+ * (i2c@98c000 = mainline &i2c_hub_3), a third SE inside the same
+ * &i2c_master_hub_0 wrapper as the SM5714 buses below. The device's own
+ * downstream DT places it on qupv3_hub_i2c3. Pinned to i2c-2 via the root
+ * aliases node so enabling it does not renumber the SM5714 buses. The
+ * sm5440@63 child node + its charge-pump driver land separately (rung-3
+ * Component 1); enabling the bus here lets the chip's presence and
+ * addressing be confirmed first (i2cget -f -y 2 0x63 0x2b -> DEVICEID).
+ */
+&i2c_hub_3 {
+	status = "okay";
+	clock-frequency = <400000>;
 };
 
 &i2c_hub_8 {
