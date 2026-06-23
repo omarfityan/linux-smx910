@@ -62,6 +62,125 @@
 #define SM5714_TYPEC_REG_CC_CNTL1	0x29
 #define SM5714_TYPEC_CC_CNTL1_DRP	0x40	/* autonomous Dual-Role toggling */
 
+/*
+ * USB Power Delivery (PD) protocol-layer window.  This is a register window on
+ * the SAME 0x33 PDIC client, fully disjoint from the role/CC window above (the
+ * SM5714 is one chip with two non-intersecting register sets).  The PD PHY does
+ * the PD protocol layer -- CRC32, the GoodCRC handshake, and message-ID stamping
+ * -- in HARDWARE; software only writes/reads the message FIFOs and reacts to the
+ * INT4 protocol-layer interrupts.  All values transcribed from the device's own
+ * downstream driver (drivers/usb/typec/sm/sm5714/{sm5714_typec.c,sm5714_pd.c}).
+ */
+#define SM5714_TYPEC_REG_INT4		0x04	/* PD protocol-layer interrupt (latched) */
+#define SM5714_TYPEC_REG_INT_MASK4	0x09	/* active-low: a SET bit MASKS the source */
+#define SM5714_TYPEC_INT4_RX_DONE	BIT(0)	/* a PD message was received */
+#define SM5714_TYPEC_INT4_TX_DONE	BIT(1)	/* our TX got the partner's GoodCRC */
+#define SM5714_TYPEC_INT4_TX_SOP_ERR	BIT(2)	/* TX failed after HW retries */
+#define SM5714_TYPEC_INT4_HRST_RCVED	BIT(5)	/* hard reset received */
+#define SM5714_TYPEC_INT4_TX_DISCARD	BIT(7)	/* TX aborted (pre-empted by an RX) */
+/* Unmask only the INT4 bits we read+handle (0xff & ~(RX|TX|TXERR|HRST|DISCARD)). */
+#define SM5714_TYPEC_INT_MASK4_PD \
+	((u8)~(SM5714_TYPEC_INT4_RX_DONE | SM5714_TYPEC_INT4_TX_DONE | \
+	       SM5714_TYPEC_INT4_TX_SOP_ERR | SM5714_TYPEC_INT4_HRST_RCVED | \
+	       SM5714_TYPEC_INT4_TX_DISCARD))
+
+#define SM5714_TYPEC_REG_PD_CNTL1	0x38
+#define SM5714_TYPEC_PD_CNTL1_ENABLE	0x08	/* enable PD protocol layer for SOP */
+#define SM5714_TYPEC_PD_CNTL1_DISABLE	0x00
+#define SM5714_TYPEC_REG_PD_CNTL2	0x39	/* bit0=DFP(set)/UFP(clr), bit1=src(set)/snk(clr) */
+#define SM5714_TYPEC_PD_CNTL2_DFP	BIT(0)
+#define SM5714_TYPEC_PD_CNTL2_SRC	BIT(1)
+#define SM5714_TYPEC_REG_RX_SRC		0x41	/* low nibble = SOP type (0 = SOP) */
+#define SM5714_TYPEC_REG_RX_HEADER_00	0x42	/* 2-byte block: PD message header */
+#define SM5714_TYPEC_REG_RX_PAYLOAD	0x44	/* N*4-byte block: data objects */
+#define SM5714_TYPEC_REG_RX_BUF		0x5e	/* write 0x80 = "RX read done" (mandatory) */
+#define SM5714_TYPEC_RX_BUF_READ_DONE	0x80
+#define SM5714_TYPEC_REG_TX_HEADER_00	0x60	/* 2-byte block: PD message header */
+#define SM5714_TYPEC_REG_TX_PAYLOAD	0x62	/* N*4-byte block: data objects */
+#define SM5714_TYPEC_REG_TX_REQ		0x7e	/* write 0x07 = "send queued SOP message" */
+#define SM5714_TYPEC_TX_REQ_SOP		0x07
+
+/* PD message-type codes (control: num_data_objs==0; data: num_data_objs 1-7). */
+#define SM5714_PD_CTRL_GOODCRC		0x1
+#define SM5714_PD_CTRL_ACCEPT		0x3
+#define SM5714_PD_CTRL_REJECT		0x4
+#define SM5714_PD_CTRL_PS_RDY		0x6
+#define SM5714_PD_CTRL_GET_SOURCE_CAP	0x7
+#define SM5714_PD_CTRL_WAIT		0xc
+#define SM5714_PD_CTRL_SOFT_RESET	0xd
+#define SM5714_PD_DATA_SOURCE_CAP	0x1
+#define SM5714_PD_DATA_REQUEST		0x2
+/* PD header field values. */
+#define SM5714_PD_DATA_ROLE_UFP		0
+#define SM5714_PD_POWER_ROLE_SINK	0
+#define SM5714_PD_SPEC_REV_30		2	/* PPS requires PD revision 3.0 */
+/* data_obj supply_type (bits 30-31). */
+#define SM5714_PD_SUPPLY_FIXED		0
+#define SM5714_PD_SUPPLY_BATTERY	1
+#define SM5714_PD_SUPPLY_VARIABLE	2
+#define SM5714_PD_SUPPLY_APDO		3	/* augmented; PPS when pps_supply==0 */
+
+#define SM5714_PD_MAX_OBJ		7	/* max data objects in a PD message */
+
+/*
+ * PD message header (16 bits) and data object (32 bits).  Bitfields transcribed
+ * verbatim from the device's own headers (common/pdic_core.h msg_header_type and
+ * sm/sm5714/sm5714_pd.h data_obj_type) so the on-wire packing matches byte-for-
+ * byte; they are LSB-first, which is correct for this little-endian arm64 target.
+ */
+union sm5714_pd_header {
+	u16 word;
+	u8 byte[2];
+	struct {
+		unsigned msg_type:5;
+		unsigned port_data_role:1;
+		unsigned spec_revision:2;
+		unsigned port_power_role:1;
+		unsigned msg_id:3;		/* HW-stamped on TX; leave 0 */
+		unsigned num_data_objs:3;
+		unsigned extended:1;
+	};
+};
+
+union sm5714_pd_obj {
+	u32 object;
+	u8 byte[4];
+	struct {
+		unsigned :30;
+		unsigned supply_type:2;
+	} supply;
+	struct {				/* fixed supply PDO (source) */
+		unsigned max_current:10;	/* 10 mA units */
+		unsigned voltage:10;		/* 50 mV units */
+		unsigned :10;
+		unsigned supply_type:2;
+	} fixed;
+	struct {				/* augmented PDO (PPS) */
+		unsigned max_current:7;		/* 50 mA units */
+		unsigned :1;
+		unsigned min_voltage:8;		/* 100 mV units */
+		unsigned :1;
+		unsigned max_voltage:8;		/* 100 mV units */
+		unsigned :2;
+		unsigned pps_power_limited:1;
+		unsigned pps_supply:2;		/* 0 = PPS */
+		unsigned supply_type:2;
+	} apdo;
+	struct {				/* programmable request data object (PPS) */
+		unsigned op_current:7;		/* 50 mA units */
+		unsigned :2;
+		unsigned output_voltage:11;	/* 20 mV units */
+		unsigned :3;
+		unsigned unchunked_ext_msg_support:1;
+		unsigned no_usb_suspend:1;
+		unsigned usb_comm_capable:1;
+		unsigned capability_mismatch:1;
+		unsigned :1;
+		unsigned object_position:3;	/* 1-based PDO index */
+		unsigned :1;
+	} rdo_pps;
+};
+
 /* No edge can be missed without leaving VBUS mis-sourced, so re-sync slowly. */
 #define SM5714_TYPEC_POLL_MS		2000
 
@@ -74,6 +193,7 @@ struct sm5714_typec {
 	struct mutex lock;
 	struct delayed_work resync;
 	enum usb_role role;
+	bool pd_enabled;		/* PD protocol layer brought up (sink) */
 };
 
 /* Apply a decoded role: VBUS first toward the fail-safe, then the data role. */
@@ -205,14 +325,195 @@ static void sm5714_typec_update(struct sm5714_typec *t)
 	sm5714_typec_apply(t, role, orientation);
 }
 
+/* Decode and log a received Source_Capabilities PDO array (one line per PDO). */
+static void sm5714_pd_dump_source_caps(struct sm5714_typec *t,
+				       union sm5714_pd_obj *objs, int n)
+{
+	struct device *dev = &t->client->dev;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		union sm5714_pd_obj o = objs[i];
+
+		switch (o.supply.supply_type) {
+		case SM5714_PD_SUPPLY_FIXED:
+			dev_info(dev, "  PDO[%d] FIXED %u mV %u mA\n", i + 1,
+				 o.fixed.voltage * 50, o.fixed.max_current * 10);
+			break;
+		case SM5714_PD_SUPPLY_APDO:
+			if (o.apdo.pps_supply == 0)
+				dev_info(dev,
+					 "  PDO[%d] PPS %u-%u mV %u mA (pos %d)\n",
+					 i + 1, o.apdo.min_voltage * 100,
+					 o.apdo.max_voltage * 100,
+					 o.apdo.max_current * 50, i + 1);
+			else
+				dev_info(dev, "  PDO[%d] APDO non-PPS raw=0x%08x\n",
+					 i + 1, o.object);
+			break;
+		default:
+			dev_info(dev, "  PDO[%d] type=%u raw=0x%08x\n", i + 1,
+				 o.supply.supply_type, o.object);
+			break;
+		}
+	}
+}
+
+/*
+ * Read one received PD message out of the RX FIFO and (if it is a
+ * Source_Capabilities) dump the advertised PDOs.  Runs in the IRQ thread; it
+ * does not block, so there is no risk of waiting for an interrupt while holding
+ * one off.  The final RX_BUF write is mandatory -- without it the controller
+ * will not release the buffer for the next message.
+ */
+static void sm5714_pd_rx(struct sm5714_typec *t)
+{
+	union sm5714_pd_header hdr = { };
+	union sm5714_pd_obj objs[SM5714_PD_MAX_OBJ] = { };
+	struct device *dev = &t->client->dev;
+	int ret, n, src;
+
+	ret = i2c_smbus_read_i2c_block_data(t->client,
+					    SM5714_TYPEC_REG_RX_HEADER_00, 2,
+					    hdr.byte);
+	if (ret < 0) {
+		dev_warn(dev, "PD RX header read failed (%d)\n", ret);
+		return;
+	}
+
+	n = hdr.num_data_objs;
+	if (n > SM5714_PD_MAX_OBJ)
+		n = SM5714_PD_MAX_OBJ;
+	if (n > 0) {
+		ret = i2c_smbus_read_i2c_block_data(t->client,
+						    SM5714_TYPEC_REG_RX_PAYLOAD,
+						    n * 4, (u8 *)objs);
+		if (ret < 0) {
+			dev_warn(dev, "PD RX payload read failed (%d)\n", ret);
+			n = 0;
+		}
+	}
+
+	src = i2c_smbus_read_byte_data(t->client, SM5714_TYPEC_REG_RX_SRC);
+
+	/* Mandatory: acknowledge the read so the HW frees the RX buffer. */
+	i2c_smbus_write_byte_data(t->client, SM5714_TYPEC_REG_RX_BUF,
+				  SM5714_TYPEC_RX_BUF_READ_DONE);
+
+	dev_info(dev, "PD RX: msg_type=%u objs=%u rev=%u src=0x%02x (hdr=0x%04x)\n",
+		 hdr.msg_type, hdr.num_data_objs, hdr.spec_revision,
+		 src < 0 ? 0xff : src, hdr.word);
+
+	if (hdr.num_data_objs > 0 && hdr.msg_type == SM5714_PD_DATA_SOURCE_CAP)
+		sm5714_pd_dump_source_caps(t, objs, n);
+}
+
+/*
+ * Bring up the PD protocol layer for a sink: select UFP + sink roles, unmask the
+ * PD interrupts we handle, then enable the protocol layer.  Caller holds the
+ * lock.  The HW does CRC/GoodCRC/retry and stamps the outgoing message-ID, so
+ * from here software only writes/reads the FIFOs.
+ */
+static int sm5714_pd_enable(struct sm5714_typec *t)
+{
+	struct i2c_client *c = t->client;
+	int cntl2, ret;
+
+	cntl2 = i2c_smbus_read_byte_data(c, SM5714_TYPEC_REG_PD_CNTL2);
+	if (cntl2 < 0)
+		return cntl2;
+	cntl2 &= ~(SM5714_TYPEC_PD_CNTL2_DFP | SM5714_TYPEC_PD_CNTL2_SRC);
+	ret = i2c_smbus_write_byte_data(c, SM5714_TYPEC_REG_PD_CNTL2, cntl2);
+	if (ret)
+		return ret;
+
+	ret = i2c_smbus_write_byte_data(c, SM5714_TYPEC_REG_INT_MASK4,
+					SM5714_TYPEC_INT_MASK4_PD);
+	if (ret)
+		return ret;
+
+	ret = i2c_smbus_write_byte_data(c, SM5714_TYPEC_REG_PD_CNTL1,
+					SM5714_TYPEC_PD_CNTL1_ENABLE);
+	if (ret)
+		return ret;
+
+	t->pd_enabled = true;
+	dev_info(&c->dev, "PD protocol layer enabled (sink)\n");
+	return 0;
+}
+
+/*
+ * Send a Get_Source_Cap control message to solicit the source's PDO list.  A PD
+ * source only volunteers Source_Capabilities a few times early in attach; once
+ * it has given up (e.g. because our PD PHY was off), this asks for them again.
+ * Fire-and-forget: the reply arrives asynchronously as an RX_DONE interrupt.
+ */
+static int sm5714_pd_send_get_source_cap(struct sm5714_typec *t)
+{
+	union sm5714_pd_header hdr = { };
+	int ret;
+
+	hdr.msg_type = SM5714_PD_CTRL_GET_SOURCE_CAP;
+	hdr.port_data_role = SM5714_PD_DATA_ROLE_UFP;
+	hdr.port_power_role = SM5714_PD_POWER_ROLE_SINK;
+	hdr.spec_revision = SM5714_PD_SPEC_REV_30;
+	hdr.num_data_objs = 0;		/* control message; msg_id HW-stamped */
+
+	ret = i2c_smbus_write_i2c_block_data(t->client,
+					     SM5714_TYPEC_REG_TX_HEADER_00, 2,
+					     hdr.byte);
+	if (ret)
+		return ret;
+	ret = i2c_smbus_write_byte_data(t->client, SM5714_TYPEC_REG_TX_REQ,
+					SM5714_TYPEC_TX_REQ_SOP);
+	if (ret)
+		return ret;
+
+	dev_info(&t->client->dev, "PD TX: Get_Source_Cap (hdr=0x%04x)\n",
+		 hdr.word);
+	return 0;
+}
+
 static irqreturn_t sm5714_typec_irq(int irq, void *data)
 {
 	struct sm5714_typec *t = data;
+	u8 intr[5];
+	int ret;
 
 	mutex_lock(&t->lock);
-	/* Read-to-clear the latched attach/detach interrupt, then re-evaluate. */
-	i2c_smbus_read_byte_data(t->client, SM5714_TYPEC_REG_INT1);
+
+	/*
+	 * Read all five latched INT registers in one block.  They are read-to-
+	 * clear and the IRQ is level-low / ONESHOT, so once INT4 (the PD layer)
+	 * is unmasked, any unmasked-but-unread bit would hold the line asserted.
+	 * Reading the whole bank each time -- as the device's own driver does --
+	 * prevents that.  Fall back to clearing INT1 alone if the block read
+	 * fails, so the role-switching path keeps working regardless.
+	 */
+	ret = i2c_smbus_read_i2c_block_data(t->client, SM5714_TYPEC_REG_INT1,
+					    5, intr);
+	if (ret < 0) {
+		i2c_smbus_read_byte_data(t->client, SM5714_TYPEC_REG_INT1);
+		intr[3] = 0;
+	}
+
+	/* INT1 attach/detach is handled by re-reading CC/STATUS. */
 	sm5714_typec_update(t);
+
+	/* INT4 is the PD protocol layer (only meaningful once PD is enabled). */
+	if (t->pd_enabled) {
+		if (intr[3] & SM5714_TYPEC_INT4_RX_DONE)
+			sm5714_pd_rx(t);
+		if (intr[3] & SM5714_TYPEC_INT4_TX_DONE)
+			dev_info(&t->client->dev, "PD TX delivered (GoodCRC)\n");
+		if (intr[3] & (SM5714_TYPEC_INT4_TX_SOP_ERR |
+			       SM5714_TYPEC_INT4_TX_DISCARD))
+			dev_warn(&t->client->dev, "PD TX failed (INT4=0x%02x)\n",
+				 intr[3]);
+		if (intr[3] & SM5714_TYPEC_INT4_HRST_RCVED)
+			dev_info(&t->client->dev, "PD hard reset received\n");
+	}
+
 	mutex_unlock(&t->lock);
 
 	return IRQ_HANDLED;
@@ -230,6 +531,36 @@ static void sm5714_typec_resync_work(struct work_struct *work)
 
 	schedule_delayed_work(&t->resync, msecs_to_jiffies(SM5714_TYPEC_POLL_MS));
 }
+
+/*
+ * Debug/bring-up trigger (write-only sysfs): enable the PD protocol layer (if
+ * not already up) and solicit the source's capabilities.  This makes the PD/PPS
+ * negotiation independently exercisable on an attached charger without relying
+ * on attach-edge timing.  Gated on being attached as a sink so it can never be
+ * fired while we are the source (host, boosting VBUS).
+ */
+static ssize_t pd_caps_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t len)
+{
+	struct sm5714_typec *t = i2c_get_clientdata(to_i2c_client(dev));
+	int ret = 0;
+
+	mutex_lock(&t->lock);
+	if (t->role != USB_ROLE_DEVICE) {
+		mutex_unlock(&t->lock);
+		dev_warn(dev, "PD caps request ignored: not a sink (role=%s)\n",
+			 usb_role_string(t->role));
+		return -ENODEV;
+	}
+	if (!t->pd_enabled)
+		ret = sm5714_pd_enable(t);
+	if (!ret)
+		ret = sm5714_pd_send_get_source_cap(t);
+	mutex_unlock(&t->lock);
+
+	return ret ? ret : len;
+}
+static DEVICE_ATTR_WO(pd_caps);
 
 /*
  * Register a Type-C port so the connector shows up under /sys/class/typec
@@ -348,6 +679,10 @@ static int sm5714_typec_probe(struct i2c_client *client)
 	/* Slow re-sync backstop regardless of IRQ. */
 	schedule_delayed_work(&t->resync, msecs_to_jiffies(SM5714_TYPEC_POLL_MS));
 
+	/* PD capability-solicitation bring-up trigger (non-fatal addition). */
+	if (device_create_file(dev, &dev_attr_pd_caps))
+		dev_warn(dev, "could not create pd_caps sysfs attribute\n");
+
 	dev_info(dev, "SM5714 Type-C role controller ready (role=%s)\n",
 		 usb_role_string(t->role));
 	fwnode_handle_put(connector);
@@ -368,6 +703,7 @@ static void sm5714_typec_remove(struct i2c_client *client)
 {
 	struct sm5714_typec *t = i2c_get_clientdata(client);
 
+	device_remove_file(&client->dev, &dev_attr_pd_caps);
 	cancel_delayed_work_sync(&t->resync);
 	/* Leave the port disconnected + VBUS off (also unregisters the partner). */
 	mutex_lock(&t->lock);
