@@ -60,6 +60,15 @@
 #define SM5714_TYPEC_CC_ATTACH_SNK	0x02	/* sink on cable   -> we HOST   */
 #define SM5714_TYPEC_CC_ATTACH_AUDIO	0x03	/* audio accessory             */
 #define SM5714_TYPEC_CC_CABLE_FLIP	BIT(5)	/* 0=CC1 (normal), 1=CC2 (reverse) */
+/*
+ * The source's advertised Rp current (CC_STATUS bits 3-4) doubles as the PD-3.0
+ * collision-avoidance signal: Rp-3.0A means "SinkTxOk" (the sink may start an AMS,
+ * e.g. our keepalive re-Request); Rp-1.5A means "SinkTxNG" (defer).  Values from
+ * the device's own driver (sm5714_typec.c sm5714_notify_rp_current_level): 0x00 =
+ * 0.5A default, 0x08 = 1.5A, 0x10 = 3.0A.
+ */
+#define SM5714_TYPEC_CC_ADV_CURR	0x18	/* advertised-Rp-current field mask */
+#define SM5714_TYPEC_CC_ADV_CURR_3A	0x10	/* Rp-3.0A == PD-3.0 SinkTxOk */
 #define SM5714_TYPEC_REG_CC_CNTL1	0x29
 #define SM5714_TYPEC_CC_CNTL1_DRP	0x40	/* autonomous Dual-Role toggling */
 
@@ -147,7 +156,14 @@
 #define SM5714_PD_REQ_MA		3000
 #define SM5714_PD_T_ACCEPT_MS		400	/* tSenderResponse ~27 ms; generous */
 #define SM5714_PD_T_PSRDY_MS		600	/* tPSTransition ~450-550 ms */
-#define SM5714_PD_HOLD_MS		800	/* hold the contract for the VBUS read */
+/*
+ * Keepalive: once a PPS contract is established, the source expects a fresh
+ * Request within tPPSTimeout (~12-15 s) or it Hard-Resets the contract back to
+ * 5 V.  Re-Request well inside that window to hold the contract.  1 s leaves a
+ * huge margin even after SinkTxNG deferrals stack up.
+ */
+#define SM5714_PD_KEEPALIVE_MS		1000	/* re-Request period (<< tPPSTimeout) */
+#define SM5714_PD_SINKTX_RETRY_MS	200	/* re-check cadence while SinkTxNG */
 
 /*
  * PD message header (16 bits) and data object (32 bits).  Bitfields transcribed
@@ -224,7 +240,9 @@ struct sm5714_typec {
 	bool pd_arm;			/* enable PD on the next sink-attach edge */
 	bool pd_do_request;		/* negotiate (not just capture) on this attach */
 	bool pd_negotiating;		/* a Request flow is in flight (work scheduled) */
-	struct work_struct pd_req_work;	/* PD negotiation; runs off-IRQ (it blocks) */
+	bool pd_contract_lost;		/* IRQ saw HRST/TX_SOP_ERR: contract genuinely gone */
+	struct work_struct pd_req_work;	/* initial PD negotiation; runs off-IRQ (it blocks) */
+	struct delayed_work pd_keepalive; /* re-Request loop that sustains the contract */
 	struct completion pd_reply;	/* IRQ wakes the work on a control message */
 	u32 pd_evt;			/* sticky SM5714_PD_EVT_* control-msg events */
 	union sm5714_pd_obj pd_pdo[SM5714_PD_MAX_OBJ];	/* last captured source caps */
@@ -554,6 +572,7 @@ static int sm5714_pd_enable(struct sm5714_typec *t)
 	if (ret)
 		return ret;
 
+	t->pd_contract_lost = false;
 	t->pd_enabled = true;
 	dev_info(&c->dev, "PD protocol layer enabled (sink)\n");
 	return 0;
@@ -563,11 +582,19 @@ static int sm5714_pd_enable(struct sm5714_typec *t)
  * stop mattering once pd_enabled is clear). */
 static void sm5714_pd_disable(struct sm5714_typec *t)
 {
+	/*
+	 * Stop the keepalive.  The non-sync cancel only drops a pending timer and
+	 * never sleeps, so it is safe to call under t->lock (the detach/IRQ callers
+	 * hold it); a keepalive already running re-checks pd_enabled below and
+	 * self-exits.  The sleeping sync-cancel lives in remove() (no lock held).
+	 */
+	cancel_delayed_work(&t->pd_keepalive);
 	i2c_smbus_write_byte_data(t->client, SM5714_TYPEC_REG_PD_CNTL1,
 				  SM5714_TYPEC_PD_CNTL1_DISABLE);
 	t->pd_enabled = false;
 	t->pd_do_request = false;	/* one-shot: a fresh attach must re-arm */
 	t->pd_negotiating = false;
+	t->pd_contract_lost = false;
 	dev_info(&t->client->dev, "PD protocol layer disabled\n");
 }
 
@@ -643,14 +670,55 @@ static u32 sm5714_pd_wait(struct sm5714_typec *t, u32 mask,
 }
 
 /*
- * The PD sink Policy Engine, minimal: build a PPS Request for the chosen APDO,
- * send it, wait for Accept then PS_RDY, and -- on success -- hold the contract
- * briefly so the VBUS rise is observable before tearing PD down.  This runs in
- * its own work item, NOT the IRQ thread: it blocks waiting for the source's
- * replies, which the IRQ delivers (an inline wait would mask the line that
- * carries the reply).  One-shot: there is no keepalive, so the source
- * Hard-Resets after ~tPPSTimeout and the charger re-AFCs -- the same benign
- * revert the capture-only path already showed.
+ * Build the PPS Request (header + RDO) for the 10 V target from the captured
+ * source caps.  Returns the chosen APDO's 1-based object position, or 0 if no
+ * PPS APDO covers the target.  Shared by the initial negotiation and the
+ * keepalive so both emit a byte-identical Request.  Caller holds the lock.
+ */
+static int sm5714_pd_build_request(struct sm5714_typec *t,
+				   union sm5714_pd_header *h,
+				   union sm5714_pd_obj *rdo)
+{
+	unsigned int op_ma, pdo_max_ma;
+	int pos = sm5714_pd_pick_pps(t, SM5714_PD_REQ_MV);
+
+	if (!pos)
+		return 0;
+
+	/* Never request above the chosen APDO's advertised max current. */
+	pdo_max_ma = t->pd_pdo[pos - 1].apdo.max_current * 50;
+	op_ma = SM5714_PD_REQ_MA;
+	if (op_ma > pdo_max_ma)
+		op_ma = pdo_max_ma;
+
+	/* PPS Request data object: output_voltage in 20 mV, op_current in 50 mA. */
+	rdo->object = 0;
+	rdo->rdo_pps.output_voltage = SM5714_PD_REQ_MV / 20;
+	rdo->rdo_pps.op_current = op_ma / 50;
+	rdo->rdo_pps.object_position = pos;
+	rdo->rdo_pps.no_usb_suspend = 1;
+	rdo->rdo_pps.usb_comm_capable = 1;
+
+	/* Request: one data object, PD rev 3.0 (PPS), UFP + sink roles. */
+	h->word = 0;
+	h->msg_type = SM5714_PD_DATA_REQUEST;
+	h->num_data_objs = 1;
+	h->spec_revision = SM5714_PD_SPEC_REV_30;
+	h->port_data_role = SM5714_PD_DATA_ROLE_UFP;
+	h->port_power_role = SM5714_PD_POWER_ROLE_SINK;
+
+	return pos;
+}
+
+/*
+ * The PD sink Policy Engine's INITIAL negotiation: build a PPS Request for the
+ * chosen APDO, send it, wait for Accept then PS_RDY, and -- on success -- arm
+ * the keepalive that sustains the contract.  Runs in its own work item, NOT the
+ * IRQ thread: it blocks waiting for the source's replies, which the IRQ delivers
+ * (an inline wait would mask the line that carries the reply).  Any failure here
+ * means no contract was established, so PD is torn down; the source's collision
+ * toggles and tPPSTimeout only start mattering once a contract is held, which
+ * the keepalive then maintains.
  */
 static void sm5714_pd_req_work(struct work_struct *work)
 {
@@ -659,7 +727,6 @@ static void sm5714_pd_req_work(struct work_struct *work)
 	struct device *dev = &t->client->dev;
 	union sm5714_pd_header h = { };
 	union sm5714_pd_obj rdo = { };
-	unsigned int op_ma, pdo_max_ma;
 	int pos, ret;
 	u32 evt;
 
@@ -669,33 +736,13 @@ static void sm5714_pd_req_work(struct work_struct *work)
 		return;
 	}
 
-	pos = sm5714_pd_pick_pps(t, SM5714_PD_REQ_MV);
+	pos = sm5714_pd_build_request(t, &h, &rdo);
 	if (!pos) {
 		dev_warn(dev, "PD: no PPS APDO covers %u mV; not requesting\n",
 			 SM5714_PD_REQ_MV);
 		mutex_unlock(&t->lock);
 		return;
 	}
-
-	/* Never request above the chosen APDO's advertised max current. */
-	pdo_max_ma = t->pd_pdo[pos - 1].apdo.max_current * 50;
-	op_ma = SM5714_PD_REQ_MA;
-	if (op_ma > pdo_max_ma)
-		op_ma = pdo_max_ma;
-
-	/* PPS Request data object: output_voltage in 20 mV, op_current in 50 mA. */
-	rdo.rdo_pps.output_voltage = SM5714_PD_REQ_MV / 20;
-	rdo.rdo_pps.op_current = op_ma / 50;
-	rdo.rdo_pps.object_position = pos;
-	rdo.rdo_pps.no_usb_suspend = 1;
-	rdo.rdo_pps.usb_comm_capable = 1;
-
-	/* Request: one data object, PD rev 3.0 (PPS), UFP + sink roles. */
-	h.msg_type = SM5714_PD_DATA_REQUEST;
-	h.num_data_objs = 1;
-	h.spec_revision = SM5714_PD_SPEC_REV_30;
-	h.port_data_role = SM5714_PD_DATA_ROLE_UFP;
-	h.port_power_role = SM5714_PD_POWER_ROLE_SINK;
 
 	/* Arm the reply path BEFORE sending: clear stale events, reinit the
 	 * completion -- otherwise a fast Accept could be missed or a stale one
@@ -715,7 +762,8 @@ static void sm5714_pd_req_work(struct work_struct *work)
 	 * 10 V/3 A pos-5 Request), independent of whether the source accepts. */
 	dev_info(dev,
 		 "PD Request sent: PPS PDO[%d] %u mV / %u mA (rdo=0x%08x hdr=0x%04x)\n",
-		 pos, SM5714_PD_REQ_MV, op_ma, rdo.object, h.word);
+		 pos, SM5714_PD_REQ_MV, rdo.rdo_pps.op_current * 50, rdo.object,
+		 h.word);
 
 	evt = sm5714_pd_wait(t, SM5714_PD_EVT_ACCEPT | SM5714_PD_EVT_REJECT |
 				SM5714_PD_EVT_WAIT, SM5714_PD_T_ACCEPT_MS);
@@ -734,14 +782,101 @@ static void sm5714_pd_req_work(struct work_struct *work)
 		 "PD PPS contract ESTABLISHED: %u mV requested -- read VBUS on the SM5440 now\n",
 		 SM5714_PD_REQ_MV);
 
-	/* Hold so the VBUS rise is readable, then drop (one-shot spike). */
-	msleep(SM5714_PD_HOLD_MS);
+	/*
+	 * Contract is up.  Instead of the one-shot hold-then-drop, arm the
+	 * keepalive so the source holds the contract past tPPSTimeout.  Re-check
+	 * pd_enabled under the lock first -- a detach could have torn PD down while
+	 * we waited for the replies above.
+	 */
+	mutex_lock(&t->lock);
+	if (t->pd_enabled) {
+		t->pd_contract_lost = false;
+		schedule_delayed_work(&t->pd_keepalive,
+				      msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
+		dev_info(dev, "PD keepalive armed (%u ms) -- sustaining contract\n",
+			 SM5714_PD_KEEPALIVE_MS);
+	}
+	mutex_unlock(&t->lock);
+	return;
 
 teardown:
 	mutex_lock(&t->lock);
 	if (t->pd_enabled)
 		sm5714_pd_disable(t);
 	mutex_unlock(&t->lock);
+}
+
+/*
+ * Keepalive: once the contract is established, periodically re-Request the same
+ * PPS voltage so the source does not Hard-Reset it on tPPSTimeout.  Self-
+ * rescheduling delayed work (the device's own sm_dc loop uses the same shape).
+ * Fire-and-forget by design: a keepalive ping's only job is to reset the
+ * source's timeout, which the HW confirms with GoodCRC (TX_DONE); it does NOT
+ * block for a fresh Accept/PS_RDY, because a source may legally answer a
+ * same-voltage re-Request without one.  Genuine loss is detected out-of-band --
+ * the IRQ sets pd_contract_lost on HRST or TX_SOP_ERR -- and checked here; VBUS
+ * on the SM5440 is the electrical health signal.
+ */
+static void sm5714_pd_keepalive_work(struct work_struct *work)
+{
+	struct sm5714_typec *t = container_of(work, struct sm5714_typec,
+					      pd_keepalive.work);
+	struct device *dev = &t->client->dev;
+	union sm5714_pd_header h = { };
+	union sm5714_pd_obj rdo = { };
+	int pos, cc, ret;
+
+	mutex_lock(&t->lock);
+
+	if (!t->pd_enabled) {		/* detached: nothing to sustain or tear down */
+		mutex_unlock(&t->lock);
+		return;
+	}
+	if (t->pd_contract_lost) {	/* HRST / TX_SOP_ERR: the source dropped us */
+		dev_info(dev,
+			 "PD keepalive: contract lost -- tearing down (charger re-AFCs)\n");
+		sm5714_pd_disable(t);
+		mutex_unlock(&t->lock);
+		return;
+	}
+
+	/*
+	 * PD-3.0 collision avoidance: our re-Request is a sink-initiated AMS, so it
+	 * may only start when the source advertises Rp-3.0A (SinkTxOk).  If it is
+	 * SinkTxNG, defer and re-check shortly rather than colliding; the deferrals
+	 * stay far inside tPPSTimeout.
+	 */
+	cc = i2c_smbus_read_byte_data(t->client, SM5714_TYPEC_REG_CC_STATUS);
+	if (cc < 0 ||
+	    (cc & SM5714_TYPEC_CC_ADV_CURR) != SM5714_TYPEC_CC_ADV_CURR_3A) {
+		/* Diagnostic: silent when the source idles at SinkTxOk (no defer);
+		 * if deferrals pile up it shows the Rp the source is advertising. */
+		dev_info(dev, "PD keepalive: SinkTxNG (CC_STATUS=0x%02x) -- deferring\n",
+			 cc);
+		mutex_unlock(&t->lock);
+		schedule_delayed_work(&t->pd_keepalive,
+				      msecs_to_jiffies(SM5714_PD_SINKTX_RETRY_MS));
+		return;
+	}
+
+	pos = sm5714_pd_build_request(t, &h, &rdo);
+	if (!pos) {			/* caps should still be valid; reschedule */
+		mutex_unlock(&t->lock);
+		schedule_delayed_work(&t->pd_keepalive,
+				      msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
+		return;
+	}
+	ret = sm5714_pd_send(t, &h, &rdo, 1);
+	mutex_unlock(&t->lock);
+
+	if (ret)
+		dev_warn(dev, "PD keepalive re-Request failed (%d)\n", ret);
+	else
+		dev_info(dev, "PD keepalive re-Request: %u mV (rdo=0x%08x)\n",
+			 SM5714_PD_REQ_MV, rdo.object);
+
+	schedule_delayed_work(&t->pd_keepalive,
+			      msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
 }
 
 static irqreturn_t sm5714_typec_irq(int irq, void *data)
@@ -776,12 +911,30 @@ static irqreturn_t sm5714_typec_irq(int irq, void *data)
 			sm5714_pd_rx(t);
 		if (intr[3] & SM5714_TYPEC_INT4_TX_DONE)
 			dev_info(&t->client->dev, "PD TX delivered (GoodCRC)\n");
-		if (intr[3] & (SM5714_TYPEC_INT4_TX_SOP_ERR |
-			       SM5714_TYPEC_INT4_TX_DISCARD))
-			dev_warn(&t->client->dev, "PD TX failed (INT4=0x%02x)\n",
-				 intr[3]);
-		if (intr[3] & SM5714_TYPEC_INT4_HRST_RCVED)
-			dev_info(&t->client->dev, "PD hard reset received\n");
+		/*
+		 * TX_SOP_ERR = transmitted but no partner GoodCRC after the HW
+		 * retries -> the link is gone.  HRST = the source reset the
+		 * contract.  Either means the contract is genuinely lost; flag it
+		 * so the keepalive tears PD down -- as opposed to a same-voltage
+		 * re-Request the source simply answers without a fresh PS_RDY,
+		 * which is benign and must NOT trigger a teardown.  TX_DISCARD =
+		 * our TX was pre-empted by an incoming message (a collision) ->
+		 * the source is alive, so treat it as a transient and let the next
+		 * keepalive retry.
+		 */
+		if (intr[3] & SM5714_TYPEC_INT4_TX_SOP_ERR) {
+			dev_warn(&t->client->dev,
+				 "PD TX failed (no GoodCRC) -- contract lost\n");
+			t->pd_contract_lost = true;
+		}
+		if (intr[3] & SM5714_TYPEC_INT4_TX_DISCARD)
+			dev_info(&t->client->dev,
+				 "PD TX discarded (collision; transient)\n");
+		if (intr[3] & SM5714_TYPEC_INT4_HRST_RCVED) {
+			dev_info(&t->client->dev,
+				 "PD hard reset received -- contract lost\n");
+			t->pd_contract_lost = true;
+		}
 	}
 
 	mutex_unlock(&t->lock);
@@ -829,8 +982,9 @@ static DEVICE_ATTR_WO(pd_caps);
  * Debug/bring-up trigger (write-only sysfs): ARM a full PPS negotiation for the
  * next sink attach.  Same attach-edge timing as pd_caps, but instead of dropping
  * PD after capturing the caps, the driver sends a PPS Request (~10 V), waits for
- * Accept + PS_RDY, and holds the contract briefly -- the operator reads VBUS on
- * the SM5440 to confirm it actually moved.  One-shot; the operator then replugs.
+ * Accept + PS_RDY, and then SUSTAINS the contract via the keepalive (re-Request
+ * loop) until the cable is unplugged -- the operator reads VBUS on the SM5440 to
+ * confirm it holds ~10 V past tPPSTimeout.  One-shot arm; the operator replugs.
  */
 static ssize_t pd_request_store(struct device *dev,
 				struct device_attribute *attr,
@@ -843,7 +997,7 @@ static ssize_t pd_request_store(struct device *dev,
 	t->pd_do_request = true;
 	mutex_unlock(&t->lock);
 	dev_info(dev,
-		 "PD armed: will negotiate a %u mV PPS contract on the next sink attach -- replug the charger\n",
+		 "PD armed: will negotiate + sustain a %u mV PPS contract on the next sink attach -- replug the charger\n",
 		 SM5714_PD_REQ_MV);
 	return len;
 }
@@ -908,6 +1062,7 @@ static int sm5714_typec_probe(struct i2c_client *client)
 	mutex_init(&t->lock);
 	INIT_DELAYED_WORK(&t->resync, sm5714_typec_resync_work);
 	INIT_WORK(&t->pd_req_work, sm5714_pd_req_work);
+	INIT_DELAYED_WORK(&t->pd_keepalive, sm5714_pd_keepalive_work);
 	init_completion(&t->pd_reply);
 	i2c_set_clientdata(client, t);
 
@@ -998,6 +1153,7 @@ static void sm5714_typec_remove(struct i2c_client *client)
 	device_remove_file(&client->dev, &dev_attr_pd_request);
 	cancel_delayed_work_sync(&t->resync);
 	cancel_work_sync(&t->pd_req_work);
+	cancel_delayed_work_sync(&t->pd_keepalive);
 	/* Leave the port disconnected + VBUS off (also unregisters the partner). */
 	mutex_lock(&t->lock);
 	sm5714_typec_apply(t, USB_ROLE_NONE, TYPEC_ORIENTATION_NONE);
