@@ -1407,14 +1407,30 @@
  * (i2c@98c000 = mainline &i2c_hub_3), a third SE inside the same
  * &i2c_master_hub_0 wrapper as the SM5714 buses below. The device's own
  * downstream DT places it on qupv3_hub_i2c3. Pinned to i2c-2 via the root
- * aliases node so enabling it does not renumber the SM5714 buses. The
- * sm5440@63 child node + its charge-pump driver land separately (rung-3
- * Component 1); enabling the bus here lets the chip's presence and
- * addressing be confirmed first (i2cget -f -y 2 0x63 0x2b -> DEVICEID).
+ * aliases node so enabling it does not renumber the SM5714 buses.
  */
 &i2c_hub_3 {
 	status = "okay";
 	clock-frequency = <400000>;
+
+	/*
+	 * SM5440 charge pump.  The sm5440_charger telemetry/register driver
+	 * (rung-3 Component 1) probes here, gates on the DEVICEID (low nibble
+	 * 0x1), enables the on-chip ADC, and exposes input voltage / input
+	 * current / die temperature as a power_supply.  It leaves op-mode at
+	 * its CHG_OFF default and never controls charging.  The freq / r_ttl /
+	 * freq_siop / en_vbatreg properties are the device's own values
+	 * (downstream qupv3_hub_i2c3: sm5440@63), carried for the later
+	 * fast-charge control components; the telemetry driver ignores them.
+	 */
+	charger@63 {
+		compatible = "siliconmitus,sm5440";
+		reg = <0x63>;
+		sm5440,freq = <450>;
+		sm5440,r_ttl = <500000>;
+		sm5440,freq_siop = <250 250>;
+		sm5440,en_vbatreg = <0>;
+	};
 };
 
 &i2c_hub_8 {

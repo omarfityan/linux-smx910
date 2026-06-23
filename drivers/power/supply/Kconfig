@@ -828,6 +828,18 @@ config CHARGER_BQ256XX
 	  charge management and system power path management devices for single
 	  cell Li-ion and Li-polymer batteries.
 
+config CHARGER_SM5440
+	tristate "Silicon Mitus SM5440 charge-pump telemetry driver"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Say Y or M to enable telemetry for the Silicon Mitus SM5440
+	  switched-capacitor 2:1 charge pump, the cell-side fast-charge pump
+	  on the Samsung Galaxy Tab S9 Ultra (SM-X910).  It probes the chip,
+	  gates on the chip DEVICEID, enables the on-chip ADC, and exposes the
+	  input voltage / input current / die temperature as a power_supply.
+	  This driver only reads telemetry; it does not control charging.
+
 config CHARGER_RK817
 	tristate "Rockchip RK817 PMIC Battery Charger"
 	depends on MFD_RK8XX
