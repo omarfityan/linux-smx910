@@ -172,6 +172,15 @@ struct sm_dc_info {
 		u32 chg_float_voltage;
 		char *sec_dc_name;
 	} config;
+
+	/*
+	 * "charging done" notify.  The downstream engine reports topoff to the
+	 * sec-battery supervisor via psy_do_property(POWER_SUPPLY_EXT_PROP_DIRECT_DONE);
+	 * mainline has no such supervisor, so the pump driver registers a callback
+	 * here (sm_dc_set_done_notify) that the CV topoff event invokes instead.
+	 */
+	void (*done_cb)(void *ctx);
+	void *done_ctx;
 };
 
 extern struct sm_dc_info *sm_dc_create_pd_instance(const char *name, struct i2c_client *i2c);

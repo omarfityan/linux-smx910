@@ -45,6 +45,9 @@
 #include "../../usb/misc/sm5714-typec.h"
 #include "../../usb/misc/sm5714-usb-vbus.h"
 
+/* The ported sm_dc CC/CV direct-charging engine (sm5440_direct_charger.c). */
+#include "sm5440_direct_charger.h"
+
 /* Register map (device-own sm5440_charger.h). */
 #define SM5440_REG_INT1		0x00
 #define SM5440_REG_INT2		0x01
@@ -125,6 +128,7 @@
 #define SM5440_STATUS3_VBUS_POK	BIT(5)
 #define SM5440_STATUS3_VBUSOVP	BIT(7)
 #define SM5440_STATUS3_VBUSUVLO	BIT(6)
+#define SM5440_STATUS3_THEMSHDN_ALM	BIT(4)	/* thermal-shutdown alarm (SW-OCP) */
 #define SM5440_STATUS3_STUP_FAIL	BIT(2)
 #define SM5440_STATUS3_REVBLK	BIT(1)
 #define SM5440_STATUS3_CFLY_SHORT	BIT(0)
@@ -182,16 +186,52 @@
 #define SM5440_ENGAGE_VBAT_MV	4250
 #define SM5440_ENGAGE_MAX_TICKS	30	/* monitor ticks (1 s each) before auto-off */
 
+/*
+ * Increment-2 sm_dc engine config + step-0 test targets (device-own values,
+ * sm5440_charger.{c,h}).  IBUSLIM = ci_gl + CI_OFFSET (the chip targets the
+ * input-current goal plus headroom); SIOP freq de-rating is unused in our test
+ * range (ci_gl >= 2000 > SIOP_LEV2), so set_charging_config uses the single
+ * 450 kHz.  TOPOFF/CHG_FLOAT drive the CV done-event only when target == float
+ * (step-0's 4250 mV != 4440, so DONE does not fire -- disengage is by WDT/stop).
+ */
+#define SM5440_CI_OFFSET	300
+#define SM5440_TA_MIN_CURRENT	1000
+#define SM5440_SIOP_LEV2	1700
+#define SM5440_DC_TOPOFF_MA	1000
+#define SM5440_DC_CHG_FLOAT_MV	4440
+#define SM5440_DC_STEP0_VBAT_MV	4250	/* step-0 (<=62% SoC) cell-V ceiling */
+#define SM5440_VBAT_MIN		3300	/* device-own SM5440_VBAT_MIN / dc_min_vbat */
+
 struct sm5440 {
 	struct device *dev;
 	struct regmap *regmap;
 	struct power_supply *psy;
 	struct power_supply *fg;	/* sm5714-fuelgauge, for the engage cross-check */
 	struct delayed_work pump_monitor;
-	struct mutex engage_lock;	/* serialises the sysfs engage/disengage path */
+	/*
+	 * engage_lock serialises BOTH manual bring-up triggers (the Inc-1 pump_test
+	 * one-shot engage AND the Inc-2 dc_test engine run) + their monitors.  They
+	 * are mutually exclusive: each path checks the other's pump_engaged/dc_running
+	 * flag under this one lock before touching the shared pump / FG handle (a
+	 * single lock, not two disjoint ones, is what makes that check race-free).
+	 */
+	struct mutex engage_lock;
 	bool pump_engaged;
 	int monitor_ticks;
 	u8 rev_id;
+
+	/*
+	 * Increment-2: the ported sm_dc CC/CV engine drives the closed-loop ramp.
+	 * dc is the engine instance (its ops are this driver's sm5440_dc_ops);
+	 * ocp_check_work is the device-faithful SW-OCP backstop; dc_monitor is a
+	 * LOG-ONLY telemetry logger for the engine run (it does NOT auto-disengage --
+	 * disengage is owned by the engine / chip WDT / dc_test=0).
+	 */
+	struct sm_dc_info *dc;
+	struct delayed_work ocp_check_work;
+	struct delayed_work dc_monitor;
+	bool dc_running;
+	int dc_ticks;
 };
 
 /*
@@ -651,7 +691,9 @@ static ssize_t pump_test_store(struct device *dev, struct device_attribute *attr
 
 	if (engage) {
 		mutex_lock(&chip->engage_lock);
-		ret = chip->pump_engaged ? -EBUSY : sm5440_pump_engage(chip);
+		/* mutually exclusive with the Inc-2 dc_test engine run (shared pump/FG). */
+		ret = (chip->pump_engaged || chip->dc_running) ? -EBUSY :
+		      sm5440_pump_engage(chip);
 		mutex_unlock(&chip->engage_lock);
 		return ret ? ret : count;
 	}
@@ -668,6 +710,469 @@ static ssize_t pump_test_store(struct device *dev, struct device_attribute *attr
 	return count;
 }
 static DEVICE_ATTR_WO(pump_test);
+
+/* ===================================================================== *
+ * Increment-2: the sm_dc CC/CV engine integration.
+ *
+ * The 9 sm_dc_ops are thin wrappers over the Inc-1 register helpers above.
+ * The engine (sm5440_direct_charger.c) is hardware-agnostic and drives the
+ * SM5440 only through this vtable + the single send_power_source_msg seam,
+ * which routes the engine's stepped PPS target to the SM5714 sustained PD
+ * contract via sm5714_pd_request_voltage().
+ * ===================================================================== */
+
+/* op 1: ADC read.  Engine units are mV (voltages) / mA (currents). */
+static int sm5440_dc_get_adc_value(struct i2c_client *i2c, u8 adc_ch)
+{
+	struct sm5440 *chip = i2c_get_clientdata(i2c);
+	int val = 0;
+
+	switch (adc_ch) {
+	case SM_DC_ADC_VBAT:
+		sm5440_get_vbat_mv(chip, &val);
+		return val;			/* mV */
+	case SM_DC_ADC_VBUS:
+		sm5440_get_vbus_uv(chip, &val);
+		return val / 1000;		/* uV -> mV */
+	case SM_DC_ADC_IBUS:
+		sm5440_get_ibus_ua(chip, &val);
+		return val / 1000;		/* uA -> mA */
+	case SM_DC_ADC_VOUT:
+		sm5440_get_vout_mv(chip, &val);
+		return val;			/* mV */
+	case SM_DC_ADC_DIETEMP:
+		sm5440_get_dietemp_dc(chip, &val);
+		return val;			/* deci-C (logged only) */
+	case SM_DC_ADC_THEM:
+	case SM_DC_ADC_IBAT:		/* no IBAT ADC on this chip (device-own: 0) */
+	default:
+		return 0;
+	}
+}
+
+/*
+ * op 2: ADC mode.  The device-own ONESHOT needs a 200 ms re-poll for freshness
+ * that we drop; alias ONESHOT->CONTINUOUS (every read fresh, zero cost) and keep
+ * the ADC continuously enabled even on OFF so the telemetry psy + monitor keep
+ * reading.  All modes -> ADCCNTL1 = enable|continuous|32-avg.
+ */
+static int sm5440_dc_set_adc_mode(struct i2c_client *i2c, u8 mode)
+{
+	struct sm5440 *chip = i2c_get_clientdata(i2c);
+
+	return regmap_write(chip->regmap, SM5440_REG_ADCCNTL1, SM5440_ADCCNTL1_ENABLE);
+}
+
+/* op 3: is the pump switching? */
+static int sm5440_dc_get_charging_enable(struct i2c_client *i2c)
+{
+	struct sm5440 *chip = i2c_get_clientdata(i2c);
+
+	return sm5440_get_op_mode(chip) == SM5440_OPMODE_CHG_ON ? 1 : 0;
+}
+
+/*
+ * op 4: enable/disable the pump (op-mode + WDT).  ENHIZ stays cleared by init
+ * (CNTL6=0x09).  The device-own set_charging_enable also high-Zs the VBUS input
+ * (ENHIZ=1) on a disable-with-VBUS-present; we deliberately omit that here --
+ * Inc-1's pump_test disengage proved op-mode CHG_OFF alone is a clean teardown
+ * on this hardware, and the 11 V VBUS-OVP plus the buck-restore handoff protect
+ * the path, so we do not add an untested input-isolation write on the disable.
+ */
+static int sm5440_dc_set_charging_enable(struct i2c_client *i2c, bool enable)
+{
+	struct sm5440 *chip = i2c_get_clientdata(i2c);
+
+	sm5440_set_op_mode(chip, enable ? SM5440_OPMODE_CHG_ON : SM5440_OPMODE_CHG_OFF);
+	sm5440_enable_wdt(chip, enable);
+	return 0;
+}
+
+/*
+ * op 5: program the regulation targets.  en_vbatreg=0 on gts9u -> the chip
+ * VBATREG ceiling sits CV_OFFSET above the cell-V goal; IBUSLIM = ci_gl +
+ * CI_OFFSET (the input-current goal plus headroom).  freq is the single 450 kHz
+ * (SIOP de-rating unused in our ci_gl >= 2000 range).
+ */
+static int sm5440_dc_set_charging_config(struct i2c_client *i2c, u32 cv_gl, u32 ci_gl, u32 cc_gl)
+{
+	struct sm5440 *chip = i2c_get_clientdata(i2c);
+	u32 vbatreg, ibuslim;
+
+	vbatreg = cv_gl + SM5440_CV_OFFSET;
+	if (ci_gl <= SM5440_TA_MIN_CURRENT)
+		ibuslim = ci_gl + SM5440_CI_OFFSET * 2;
+	else
+		ibuslim = ci_gl + SM5440_CI_OFFSET;
+
+	sm5440_set_ibuslim(chip, ibuslim);
+	sm5440_set_vbatreg(chip, vbatreg);
+	sm5440_set_freq(chip, SM5440_GTS9U_FREQ_KHZ);
+
+	dev_info(chip->dev, "dc config: vbatreg=%umV ibuslim=%umA freq=%dkHz (cv_gl=%u ci_gl=%u)\n",
+		 vbatreg, ibuslim, SM5440_GTS9U_FREQ_KHZ, cv_gl, ci_gl);
+	return 0;
+}
+
+/*
+ * op 6: error status (polled adaptation -- this board has no SM5440 irq-gpio,
+ * so the 5 forced-cutoff faults the device-own checks in its IRQ are folded in
+ * here, read from the STATUS level mirrors, not the clear-on-read INT regs).
+ */
+static u32 sm5440_dc_get_dc_error_status(struct i2c_client *i2c)
+{
+	struct sm5440 *chip = i2c_get_clientdata(i2c);
+	u32 err = SM_DC_ERR_NONE;
+	int op_mode, vbat = 0;
+	u8 st[4] = { };
+
+	if (regmap_bulk_read(chip->regmap, SM5440_REG_STATUS1, st, 4)) {
+		dev_warn(chip->dev, "dc err: STATUS read failed -> retry\n");
+		return SM_DC_ERR_RETRY;
+	}
+	op_mode = sm5440_get_op_mode(chip);
+
+	if (op_mode == SM5440_OPMODE_CHG_OFF) {
+		/* the chip force-cut charging off: identify which fault latched. */
+		if (st[0] & SM5440_STATUS1_VOUTOVP)	err |= SM_DC_ERR_VOUTOVP;
+		if (st[2] & SM5440_STATUS3_VBUSOVP)	err |= SM_DC_ERR_VBUSOVP;
+		if (st[2] & SM5440_STATUS3_STUP_FAIL)	err |= SM_DC_ERR_STUP_FAIL;
+		if (st[2] & SM5440_STATUS3_REVBLK)	err |= SM_DC_ERR_REVBLK;
+		if (st[2] & SM5440_STATUS3_CFLY_SHORT)	err |= SM_DC_ERR_CFLY_SHORT;
+		if (st[2] & SM5440_STATUS3_VBUSUVLO)	err |= SM_DC_ERR_VBUSUVLO;
+		if (err == SM_DC_ERR_NONE)
+			err = SM_DC_ERR_UNKNOWN;
+		dev_err(chip->dev, "dc err: op-mode CHG_OFF, STATUS %02x:%02x:%02x:%02x -> 0x%x\n",
+			st[0], st[1], st[2], st[3], err);
+		return err;
+	}
+
+	/* charging active: VBUSUVLO is a transient worth a retry, not a stop. */
+	if (st[2] & SM5440_STATUS3_VBUSUVLO)
+		return SM_DC_ERR_RETRY;
+
+	sm5440_get_vbat_mv(chip, &vbat);
+	if (vbat < SM5440_VBAT_MIN) {
+		dev_err(chip->dev, "dc err: abnormal vbat=%dmV\n", vbat);
+		return SM_DC_ERR_INVAL_VBAT;
+	}
+	return SM_DC_ERR_NONE;
+}
+
+/*
+ * op 7: which regulation loop is active.  The sm_dc_charging_loop enum values
+ * equal the STATUS2 bit positions (IBUSLIM=0x80, VBATREG=0x08, THEMREG=0x02),
+ * so the masked STATUS2 bits ARE the loop status.  The target_vbat<=vnow
+ * override forces CV when the cell has reached the goal regardless of the bit.
+ */
+static int sm5440_dc_get_dc_loop_status(struct i2c_client *i2c)
+{
+	struct sm5440 *chip = i2c_get_clientdata(i2c);
+	unsigned int reg = 0;
+	int loop = LOOP_INACTIVE, vnow = 0;
+
+	regmap_read(chip->regmap, SM5440_REG_STATUS2, &reg);
+	sm5440_get_vbat_mv(chip, &vnow);
+
+	if ((reg & SM5440_STATUS2_VBATREG) ||
+	    (chip->dc && chip->dc->target_vbat && chip->dc->target_vbat <= vnow))
+		loop = LOOP_VBATREG;
+	else if (reg & SM5440_STATUS2_IBUSLIM)
+		loop = (reg & SM5440_STATUS2_THEM_REG) ? LOOP_THEMREG : LOOP_IBUSLIM;
+
+	return loop;
+}
+
+/*
+ * op 8: THE SEAM.  Route the engine's stepped PPS target to the SM5714
+ * sustained contract.  sm5714_pd_request_voltage() sets the commandable target
+ * and kicks the keepalive (the sole PD requester); it returns <0 only on
+ * genuine contract loss, so a SinkTxOk deferral never surfaces here as a fatal
+ * SM_DC_ERR_SEND_PD_MSG -- exactly the behaviour the engine needs.
+ */
+static int sm5440_dc_send_power_source_msg(struct i2c_client *i2c,
+					   struct sm_dc_power_source_info *ta)
+{
+	struct sm5440 *chip = i2c_get_clientdata(i2c);
+	int ret;
+
+	ret = sm5714_pd_request_voltage(ta->v, ta->c);
+	if (ret)
+		dev_warn(chip->dev, "dc send: PPS %umV/%umA failed (%d)\n",
+			 ta->v, ta->c, ret);
+	return ret;
+}
+
+/* op 9: SW-OCP trigger (async, device-faithful -- must return 0, see below). */
+static int sm5440_dc_check_sw_ocp(struct i2c_client *i2c)
+{
+	struct sm5440 *chip = i2c_get_clientdata(i2c);
+
+	schedule_delayed_work(&chip->ocp_check_work, msecs_to_jiffies(1000));
+	return 0;
+}
+
+/*
+ * Device-faithful SW-OCP backstop (the SM5440 has HW OCP disabled in CNTL2).
+ * A sustained IBUSLIM + thermal-shutdown alarm over 3 s == a real over-current;
+ * report it out-of-band (NOT synchronously from check_sw_ocp, whose <0 return
+ * the engine treats as "the op itself failed" and bails WITHOUT stopping the
+ * pump).  sm_dc_report_error_status stops the engine; the dc_monitor then sees
+ * the engine left its active states and restores the buck.
+ */
+static void sm5440_ocp_check_work(struct work_struct *work)
+{
+	struct sm5440 *chip = container_of(work, struct sm5440, ocp_check_work.work);
+	unsigned int s2, s3;
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		if (regmap_read(chip->regmap, SM5440_REG_STATUS2, &s2) ||
+		    regmap_read(chip->regmap, SM5440_REG_STATUS3, &s3))
+			return;
+		if ((s2 & SM5440_STATUS2_IBUSLIM) && (s3 & SM5440_STATUS3_THEMSHDN_ALM)) {
+			dev_err(chip->dev, "SW-OCP: IBUSLIM+THEMSHDN (i=%d)\n", i);
+			msleep(1000);
+		} else {
+			return;
+		}
+	}
+	dev_err(chip->dev, "SW-OCP confirmed -> stopping engine (IBUSOCP)\n");
+	if (chip->dc)
+		sm_dc_report_error_status(chip->dc, SM_DC_ERR_IBUSOCP);
+}
+
+static const struct sm_dc_ops sm5440_dc_ops = {
+	.get_adc_value		= sm5440_dc_get_adc_value,
+	.set_adc_mode		= sm5440_dc_set_adc_mode,
+	.get_charging_enable	= sm5440_dc_get_charging_enable,
+	.set_charging_enable	= sm5440_dc_set_charging_enable,
+	.set_charging_config	= sm5440_dc_set_charging_config,
+	.get_dc_error_status	= sm5440_dc_get_dc_error_status,
+	.get_dc_loop_status	= sm5440_dc_get_dc_loop_status,
+	.send_power_source_msg	= sm5440_dc_send_power_source_msg,
+	.check_sw_ocp		= sm5440_dc_check_sw_ocp,
+};
+
+/*
+ * Common teardown (idempotent): stop the engine, restore the 10 V sustain
+ * baseline, re-allow the buck, release the FG handle.  Called from dc_test=0,
+ * the done callback, and the monitor's auto-restore -- so a topoff/fault/WDT
+ * stop can never leave the buck inhibited + pump off = cell not charging.
+ */
+static void sm5440_dc_teardown(struct sm5440 *chip)
+{
+	if (chip->dc)
+		sm_dc_stop_charging(chip->dc);
+	sm5714_pd_request_voltage(10000, 3000);	/* restore the 10 V sustain baseline */
+	sm5714_charger_inhibit_buck(false);	/* re-allow the buck to charge */
+	if (chip->fg) {
+		power_supply_put(chip->fg);
+		chip->fg = NULL;
+	}
+	chip->dc_running = false;
+}
+
+/*
+ * LOG-ONLY engine monitor.  Unlike Inc-1's pump_monitor it does NOT auto-
+ * disengage on a tick count (that would rip control from the engine); it only
+ * logs telemetry (incl. the headline FG cell-current) and, if the engine has
+ * left its active states (topoff/fault/WDT-drop), runs the unconditional
+ * restore.  Takes engage_lock; dc_test=0 sync-cancels it WITHOUT the lock.
+ */
+static void sm5440_dc_monitor_work(struct work_struct *work)
+{
+	struct sm5440 *chip = container_of(work, struct sm5440, dc_monitor.work);
+	int state, vbus = 0, ibus = 0, vout = 0, vbat = 0, die = 0, fg_ua = 0, opmode;
+	union power_supply_propval pv;
+
+	mutex_lock(&chip->engage_lock);
+	if (!chip->dc_running) {
+		mutex_unlock(&chip->engage_lock);
+		return;
+	}
+
+	state = chip->dc ? sm_dc_get_current_state(chip->dc) : SM_DC_CHG_OFF;
+	opmode = sm5440_get_op_mode(chip);
+	sm5440_get_vbus_uv(chip, &vbus);
+	sm5440_get_ibus_ua(chip, &ibus);
+	sm5440_get_vout_mv(chip, &vout);
+	sm5440_get_vbat_mv(chip, &vbat);
+	sm5440_get_dietemp_dc(chip, &die);
+	if (chip->fg && !power_supply_get_property(chip->fg,
+			POWER_SUPPLY_PROP_CURRENT_NOW, &pv))
+		fg_ua = pv.intval;
+
+	dev_info(chip->dev,
+		 "dc[%3d] st=%d op=%d VBUS=%dmV 2xVOUT=%dmV IBUS=%dmA | cell-VBAT=%dmV FG-I=%dmA | die=%d.%dC\n",
+		 chip->dc_ticks++, state, opmode, vbus / 1000, vout * 2, ibus / 1000,
+		 vbat, fg_ua / 1000, die / 10, die % 10);
+
+	/* engine left the active states (CHG_OFF/ERR/EOC) -> restore the buck. */
+	if (state < SM_DC_CHECK_VBAT) {
+		dev_warn(chip->dev, "dc engine stopped (state=%d) -> restoring buck\n", state);
+		sm5440_dc_teardown(chip);
+		mutex_unlock(&chip->engage_lock);
+		return;
+	}
+
+	schedule_delayed_work(&chip->dc_monitor, msecs_to_jiffies(1000));
+	mutex_unlock(&chip->engage_lock);
+}
+
+/* The engine's topoff "done" event (CV, target==float).  Stop the engine; the
+ * monitor's next tick sees CHG_OFF and restores the buck. */
+static void sm5440_dc_done_cb(void *ctx)
+{
+	struct sm5440 *chip = ctx;
+
+	dev_info(chip->dev, "dc: charging done (topoff) -> stopping engine\n");
+	if (chip->dc)
+		sm_dc_stop_charging(chip->dc);
+}
+
+/*
+ * Engine START.  Caller holds engage_lock and has checked !dc_running.  Reuses the
+ * Inc-1 proven precondition (buck OFF -> chip sw_reset+init -> step PPS to
+ * ~2*Vcell and VERIFY VBUS settled) so the engine's preset re-send is a near
+ * no-op against an already-2:1-ready source, THEN hands control to the engine.
+ */
+static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma)
+{
+	struct sm_dc_power_source_info ta = { };
+	int vbat_mv = 0, target_mv, off_mv, vbus_mv, diff, ret;
+
+	if (!sm5714_pd_contract_active()) {
+		dev_warn(chip->dev, "dc start: no PPS contract -- arm pd_request + plug first\n");
+		return -ENOTCONN;
+	}
+
+	ret = sm5714_charger_inhibit_buck(true);	/* buck OFF before pump ON */
+	if (ret) {
+		dev_warn(chip->dev, "dc start: buck inhibit failed (%d)\n", ret);
+		return ret;
+	}
+
+	/* chip prep: sw_reset + device-faithful init + continuous ADC, NO op-mode
+	 * (the engine flips op-mode itself in preset's set_charging_enable). */
+	ret = sm5440_sw_reset(chip);
+	if (ret)
+		goto err_restore;
+	sm5440_init_reg_param(chip);
+	regmap_write(chip->regmap, SM5440_REG_ADCCNTL1, SM5440_ADCCNTL1_ENABLE);
+
+	/* precondition the PPS input to ~2*Vcell + IR offset, clamped to
+	 * [ta_min_voltage, dc_vbus_ovp_th - 500], and verify VBUS transitioned. */
+	ret = sm5440_get_vbat_mv(chip, &vbat_mv);
+	if (ret || vbat_mv < 2500 || vbat_mv > 4500) {
+		dev_warn(chip->dev, "dc start: implausible VBAT %dmV -- abort\n", vbat_mv);
+		ret = ret ? ret : -EIO;
+		goto err_restore;
+	}
+	off_mv = (target_ibus_ma * (SM5440_GTS9U_R_TTL_UOHM / 1000)) / 1000 + 200;
+	target_mv = 2 * vbat_mv + off_mv;
+	target_mv = min(target_mv, SM5440_DC_VBUS_OVP_TH - 500);
+	target_mv = max(target_mv, SM5440_TA_MIN_VOLTAGE);
+
+	ret = sm5714_pd_request_voltage(target_mv, target_ibus_ma);
+	if (ret) {
+		dev_warn(chip->dev, "dc start: PPS request %dmV failed (%d)\n", target_mv, ret);
+		goto err_restore;
+	}
+	dev_info(chip->dev, "dc start: VBAT=%dmV -> PPS target=%dmV; settling 300 ms\n",
+		 vbat_mv, target_mv);
+	msleep(300);
+
+	vbus_mv = 0;
+	sm5440_get_vbus_uv(chip, &vbus_mv);
+	vbus_mv /= 1000;
+	diff = vbus_mv - target_mv;
+	if (diff < 0)
+		diff = -diff;
+	if (diff > target_mv / 10) {
+		dev_warn(chip->dev, "dc start: VBUS=%dmV not within 10%% of %dmV (PPS not transitioned) -- abort\n",
+			 vbus_mv, target_mv);
+		ret = -EIO;
+		goto err_restore;
+	}
+	dev_info(chip->dev, "dc start: VBUS settled to %dmV -- handing to the engine\n", vbus_mv);
+
+	/* TA descriptor: our 10 V APDO (pos 5); the engine ramps within it.  c_max =
+	 * the step target (the PD layer clamps to the APDO's advertised max current);
+	 * p_max in uW (= v_max * c_max) is a generous bound -- IBUSLIM + the APDO
+	 * clamp are the real limiters. */
+	ta.pdo_pos = 5;
+	ta.v_max = SM5440_DC_VBUS_OVP_TH - 500;		/* 10500 mV */
+	ta.c_max = target_ibus_ma;
+	ta.p_max = ta.v_max * ta.c_max;
+
+	sm_dc_set_target_vbat(chip->dc, SM5440_DC_STEP0_VBAT_MV);
+	sm_dc_set_target_ibus(chip->dc, target_ibus_ma);
+
+	chip->fg = power_supply_get_by_name("sm5714-fuelgauge");
+	chip->dc_running = true;
+	chip->dc_ticks = 0;
+
+	ret = sm_dc_start_charging(chip->dc, &ta);
+	if (ret) {
+		dev_err(chip->dev, "dc start: sm_dc_start_charging failed (%d)\n", ret);
+		sm5440_dc_teardown(chip);	/* clears dc_running, restores buck */
+		return ret;
+	}
+
+	schedule_delayed_work(&chip->dc_monitor, msecs_to_jiffies(1000));
+	dev_info(chip->dev, "dc ENGINE STARTED: target_vbat=%dmV target_ibus=%umA -- monitoring\n",
+		 SM5440_DC_STEP0_VBAT_MV, target_ibus_ma);
+	return 0;
+
+err_restore:
+	sm5714_charger_inhibit_buck(false);
+	sm5714_pd_request_voltage(10000, 3000);
+	return ret;
+}
+
+/*
+ * Engine test trigger: "<mA>" starts the CC/CV engine at that input-current
+ * target (e.g. 3000 then 4500); "0" stops + restores.  Per-execution gated;
+ * never auto-starts.
+ */
+static ssize_t dc_test_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct sm5440 *chip = dev_get_drvdata(dev);
+	u32 target_ibus;
+	int ret;
+
+	if (kstrtou32(buf, 0, &target_ibus))
+		return -EINVAL;
+
+	if (target_ibus == 0) {		/* stop + unconditional restore */
+		cancel_delayed_work_sync(&chip->dc_monitor);
+		mutex_lock(&chip->engage_lock);
+		if (chip->dc_running)
+			sm5440_dc_teardown(chip);
+		mutex_unlock(&chip->engage_lock);
+		return count;
+	}
+
+	/*
+	 * Lower bound is SIOP_LEV2 (1700), not ta_min_current: below it the
+	 * device-own set_charging_config de-rates the switching frequency
+	 * (freq_siop[]), which this port does not model -- so keep test targets in
+	 * the single-450 kHz range (the documented steps are 3000 / 4500 anyway).
+	 */
+	if (target_ibus <= SM5440_SIOP_LEV2 || target_ibus > 5000)
+		return -EINVAL;
+
+	mutex_lock(&chip->engage_lock);
+	/* mutually exclusive with the Inc-1 pump_test manual engage (shared pump/FG). */
+	ret = (chip->dc_running || chip->pump_engaged) ? -EBUSY :
+	      sm5440_dc_start(chip, target_ibus);
+	mutex_unlock(&chip->engage_lock);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(dc_test);
 
 static int sm5440_get_property(struct power_supply *psy,
 			       enum power_supply_property psp,
@@ -745,6 +1250,8 @@ static int sm5440_probe(struct i2c_client *client)
 	i2c_set_clientdata(client, chip);
 	mutex_init(&chip->engage_lock);
 	INIT_DELAYED_WORK(&chip->pump_monitor, sm5440_pump_monitor_work);
+	INIT_DELAYED_WORK(&chip->ocp_check_work, sm5440_ocp_check_work);
+	INIT_DELAYED_WORK(&chip->dc_monitor, sm5440_dc_monitor_work);
 
 	chip->regmap = devm_regmap_init_i2c(client, &sm5440_regmap_config);
 	if (IS_ERR(chip->regmap))
@@ -795,8 +1302,43 @@ static int sm5440_probe(struct i2c_client *client)
 	if (device_create_file(dev, &dev_attr_pump_test))
 		dev_warn(dev, "could not create pump_test sysfs attribute\n");
 
-	dev_info(dev, "SM5440 charge-pump telemetry ready (rev 0x%x, DEVICEID 0x%02x)\n",
-		 chip->rev_id, devid);
+	/*
+	 * Increment-2: create the sm_dc CC/CV engine instance, wire its ops to this
+	 * driver, and populate the device-own config (PD path).  Non-fatal: if the
+	 * engine fails to come up, telemetry + the Inc-1 pump_test still work; only
+	 * the closed-loop dc_test is unavailable.
+	 */
+	chip->dc = sm_dc_create_pd_instance("SM5440-PD-DC", client);
+	if (IS_ERR(chip->dc)) {
+		dev_warn(dev, "could not create sm_dc engine (%ld) -- dc_test disabled\n",
+			 PTR_ERR(chip->dc));
+		chip->dc = NULL;
+	} else {
+		chip->dc->ops = &sm5440_dc_ops;
+		chip->dc->config.ta_min_current = SM5440_TA_MIN_CURRENT;
+		chip->dc->config.ta_min_voltage = SM5440_TA_MIN_VOLTAGE;
+		chip->dc->config.dc_min_vbat = SM5440_VBAT_MIN;
+		chip->dc->config.dc_vbus_ovp_th = SM5440_DC_VBUS_OVP_TH;
+		chip->dc->config.r_ttl = SM5440_GTS9U_R_TTL_UOHM;
+		chip->dc->config.topoff_current = SM5440_DC_TOPOFF_MA;
+		chip->dc->config.need_to_sw_ocp = 1;	/* SM5440 has no HW OCP */
+		chip->dc->config.support_pd_remain = 1;	/* engine sustains the contract */
+		chip->dc->config.chg_float_voltage = SM5440_DC_CHG_FLOAT_MV;
+		chip->dc->config.sec_dc_name = "sm5440-charge-pump";
+
+		if (sm_dc_verify_configuration(chip->dc)) {
+			dev_warn(dev, "sm_dc verify failed -- dc_test disabled\n");
+			sm_dc_destroy_instance(chip->dc);
+			chip->dc = NULL;
+		} else {
+			sm_dc_set_done_notify(chip->dc, sm5440_dc_done_cb, chip);
+			if (device_create_file(dev, &dev_attr_dc_test))
+				dev_warn(dev, "could not create dc_test sysfs attribute\n");
+		}
+	}
+
+	dev_info(dev, "SM5440 charge-pump telemetry ready (rev 0x%x, DEVICEID 0x%02x)%s\n",
+		 chip->rev_id, devid, chip->dc ? " + sm_dc engine" : "");
 	return 0;
 }
 
@@ -805,12 +1347,31 @@ static void sm5440_remove(struct i2c_client *client)
 	struct sm5440 *chip = i2c_get_clientdata(client);
 
 	device_remove_file(&client->dev, &dev_attr_pump_test);
-	/* Sync-cancel the monitor without engage_lock (it takes the lock). */
+	if (chip->dc)
+		device_remove_file(&client->dev, &dev_attr_dc_test);
+
+	/*
+	 * Sync-cancel every monitor/backstop WITHOUT engage_lock (the monitors take
+	 * it; holding it here would deadlock the sync-cancel).  ocp_check_work and
+	 * dc_monitor are INIT'd unconditionally in probe, so cancelling them is safe
+	 * even when the engine never came up.  Then one locked region tears down
+	 * whichever path was live (mutually exclusive), and the engine is freed last.
+	 */
+	cancel_delayed_work_sync(&chip->dc_monitor);
+	cancel_delayed_work_sync(&chip->ocp_check_work);
 	cancel_delayed_work_sync(&chip->pump_monitor);
+
 	mutex_lock(&chip->engage_lock);
+	if (chip->dc_running)
+		sm5440_dc_teardown(chip);
 	if (chip->pump_engaged)
 		sm5440_pump_disengage_locked(chip);
 	mutex_unlock(&chip->engage_lock);
+
+	if (chip->dc) {
+		sm_dc_destroy_instance(chip->dc);
+		chip->dc = NULL;
+	}
 }
 
 static const struct i2c_device_id sm5440_i2c_id[] = {
