@@ -202,6 +202,23 @@
 #define SM5440_DC_STEP0_VBAT_MV	4250	/* step-0 (<=62% SoC) cell-V ceiling */
 #define SM5440_VBAT_MIN		3300	/* device-own SM5440_VBAT_MIN / dc_min_vbat */
 
+/*
+ * Increment-3a graceful-stop ramp-down (the buck handoff).  sess-206 run-1 showed
+ * that restoring the sustained-PPS voltage in ONE step (the engine's ~10500 mV
+ * ceiling -> 10000) while the buck simultaneously re-loaded the source Hard-Reset
+ * the PPS contract -> the source fell back to AFC 9 V, forcing a re-arm + replug.
+ * The device-own supervisor (sec_direct_charger.c:462-481) charges-off the pump
+ * BEFORE moving the TA voltage ("to prevent reverse-current into TA") and drops to
+ * a fixed 9 V for the buck.  We keep pump-off-first (the caller's sm_dc_stop_charging)
+ * and -- our PD requester being PPS-only -- step the PPS target DOWN to 9 V in small
+ * increments, letting the source settle UNLOADED (pump off, buck still inhibited)
+ * between steps before the buck re-loads it.  The unloaded settle is the fix.
+ */
+#define SM5440_DC_STOP_TA_MV	9000	/* graceful-stop PPS target (device-own 9 V, buck-OK) */
+#define SM5440_DC_STOP_TA_MA	3000	/* PPS current ceiling requested during the ramp-down */
+#define SM5440_DC_STOP_STEP_MV	300	/* PPS down-step per settle */
+#define SM5440_DC_STOP_SETTLE_MS 150	/* unloaded settle between steps */
+
 struct sm5440 {
 	struct device *dev;
 	struct regmap *regmap;
@@ -960,12 +977,48 @@ static const struct sm_dc_ops sm5440_dc_ops = {
  * the done callback, and the monitor's auto-restore -- so a topoff/fault/WDT
  * stop can never leave the buck inhibited + pump off = cell not charging.
  */
+/*
+ * Graceful PPS ramp-down toward 9 V before the buck re-loads the source (Inc-3a,
+ * comp 1).  Caller has already turned the pump op-mode OFF (sm_dc_stop_charging),
+ * so the input draws ~0 mA and the buck is still inhibited -- the source is
+ * UNLOADED.  Step the PPS request down from the present VBUS to SM5440_DC_STOP_TA_MV
+ * in SM5440_DC_STOP_STEP_MV increments, settling between each so the source tracks
+ * the change with no load fighting it (the sess-206 run-1 Hard-Reset came from the
+ * one-shot down-step + immediate buck re-load).  Stops early if the contract is
+ * already gone (request returns < 0).  Stays on the PPS APDO throughout, so the
+ * keepalive remains consistent and the next engage just re-requests a higher PPS.
+ */
+static void sm5440_dc_ramp_ta_down(struct sm5440 *chip)
+{
+	int vbus_uv = 0, mv;
+
+	if (sm5440_get_vbus_uv(chip, &vbus_uv) || vbus_uv / 1000 < SM5440_DC_STOP_TA_MV)
+		mv = SM5440_DC_STOP_TA_MV;
+	else
+		mv = vbus_uv / 1000;
+
+	while (mv > SM5440_DC_STOP_TA_MV) {
+		mv -= SM5440_DC_STOP_STEP_MV;
+		if (mv < SM5440_DC_STOP_TA_MV)
+			mv = SM5440_DC_STOP_TA_MV;
+		if (sm5714_pd_request_voltage(mv, SM5440_DC_STOP_TA_MA))
+			return;			/* contract already gone */
+		msleep(SM5440_DC_STOP_SETTLE_MS);
+	}
+	/* commit the 9 V target even if we started at/below it (e.g. post-UVLO collapse),
+	 * so the buck never re-enables against a stale/high PPS request. */
+	if (sm5714_pd_request_voltage(SM5440_DC_STOP_TA_MV, SM5440_DC_STOP_TA_MA))
+		return;
+	dev_info(chip->dev, "dc graceful-stop: PPS settled to %d mV before buck restore\n",
+		 SM5440_DC_STOP_TA_MV);
+}
+
 static void sm5440_dc_teardown(struct sm5440 *chip)
 {
 	if (chip->dc)
-		sm_dc_stop_charging(chip->dc);
-	sm5714_pd_request_voltage(10000, 3000);	/* restore the 10 V sustain baseline */
-	sm5714_charger_inhibit_buck(false);	/* re-allow the buck to charge */
+		sm_dc_stop_charging(chip->dc);	/* pump op-mode OFF first (reverse-current guard) */
+	sm5440_dc_ramp_ta_down(chip);		/* gentle PPS ramp to 9 V, settle UNLOADED */
+	sm5714_charger_inhibit_buck(false);	/* re-allow the buck (now on a settled 9 V PPS) */
 	if (chip->fg) {
 		power_supply_put(chip->fg);
 		chip->fg = NULL;
@@ -1126,8 +1179,8 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma)
 	return 0;
 
 err_restore:
+	sm5440_dc_ramp_ta_down(chip);		/* gentle PPS restore (same buck handoff as teardown) */
 	sm5714_charger_inhibit_buck(false);
-	sm5714_pd_request_voltage(10000, 3000);
 	return ret;
 }
 
