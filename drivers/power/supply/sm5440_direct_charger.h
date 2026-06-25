@@ -196,6 +196,17 @@ extern int sm_dc_stop_charging(struct sm_dc_info *sm_dc);
 extern int sm_dc_set_target_vbat(struct sm_dc_info *sm_dc, u32 target_vbat);
 extern int sm_dc_set_target_ibus(struct sm_dc_info *sm_dc, u32 target_ibus);
 
+/*
+ * Set the upper bound on the requested PPS voltage (ta.v_max).  Unlike the two
+ * setters above this changes NO target and sets NO req_update flag -- the CC
+ * loop simply re-clamps ta.v to MIN(ta.v_max, ovp-500) on its next up-step, so
+ * raising v_max lets the loop drive a higher PPS (more input current, if the
+ * source delivers) and lowering it pulls the request back down.  It is the
+ * supervisor's adaptive-probe / collapse-guard lever, with the engine's control
+ * law untouched.
+ */
+extern int sm_dc_set_ta_vmax(struct sm_dc_info *sm_dc, u32 v_max);
+
 /* The "done" callback the topoff event invokes (supervisor stops the engine). */
 extern void sm_dc_set_done_notify(struct sm_dc_info *sm_dc,
 				  void (*done)(void *ctx), void *ctx);

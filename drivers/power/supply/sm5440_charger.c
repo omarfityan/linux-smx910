@@ -218,6 +218,50 @@
 #define SM5440_DC_STOP_TA_MA	3000	/* PPS current ceiling requested during the ramp-down */
 #define SM5440_DC_STOP_STEP_MV	300	/* PPS down-step per settle */
 #define SM5440_DC_STOP_SETTLE_MS 150	/* unloaded settle between steps */
+/*
+ * Increment-3a comp-1 reload-race fix: after the final 9 V commit, the source
+ * takes ~1-2 s / several keepalive Requests to actually transition (sess-207 saw
+ * ~2.15 s) -- so VERIFY the (still-live) VBUS ADC has settled near 9 V before the
+ * caller re-loads the buck, rather than returning immediately onto a source still
+ * mid-transition (the sess-207 clean reload was buck-poll-phase luck, not a
+ * guaranteed settle).  Bounded poll, then proceed regardless (the buck restore
+ * must not be blocked indefinitely on a flaky source).
+ */
+#define SM5440_DC_STOP_VERIFY_MS	100	/* VBUS re-read interval */
+#define SM5440_DC_STOP_VERIFY_TRIES 30	/* * 100 ms = 3 s max wait for the 9 V settle */
+
+/*
+ * Increment-3b comp-2: the adaptive ta.v_max probe-up (the dc_probe path).  Keep
+ * ci_gl HIGH (the engine perpetually wants more, so it pushes ta.v toward
+ * ta.v_max every CC loop) and walk ta.v_max -- the request-voltage ceiling -- UP
+ * in small steps, reading the IBUS response, until either the input current
+ * reaches the goal (success) or the source's deliverable ceiling is found (flat
+ * IBUS below the goal).  Two independent mechanisms, by design:
+ *   - the FLAT-IBUS detector decides when to STOP CLIMBING (slow, post-settle);
+ *   - the COLLAPSE-GUARD decides when to RETREAT (fast, every tick) -- if the
+ *     device VBUS sags toward the 2*Vcell 2:1 floor, drop ta.v_max immediately,
+ *     BEFORE the sag deepens into a VBUSUVLO cliff.  This is the safety mechanism
+ *     (the flat-detector alone cannot prevent a single bump cliffing the source).
+ * ta.v_max is the PPS REQUEST; the device VBUS = request - cable IR-drop, so the
+ * guard reads VBUS (device side) while the lever moves the request.
+ */
+#define SM5440_PROBE_TICK_MS	500	/* probe + collapse-guard cadence */
+#define SM5440_PROBE_SETTLE_TICKS 20	/* * 500 ms = 10 s for the engine's ~40 mV/iter CC ramp to walk ta.v up + IBUS to settle after a bump (shorter risks a premature flat-lock mid-climb) */
+#define SM5440_PROBE_VMAX_STEP	200	/* ta.v_max (request) step per bump, mV */
+#define SM5440_PROBE_VMAX_CEIL	(SM5440_DC_VBUS_OVP_TH - 500)	/* 10500 mV hard request ceiling */
+#define SM5440_PROBE_START_MARGIN 600	/* initial ta.v_max = the engine's engage request + this */
+#define SM5440_PROBE_FLAT_MA	100	/* delta-IBUS below this == flat (matches CC_ST_IBUS_OFFSET) */
+/*
+ * Retreat if device VBUS < 2*Vcell + this.  Must sit BELOW the engine's natural
+ * engage headroom or the guard fires spuriously at startup: the engine engages at
+ * a fixed ta.v = 2*Vcell + (target/2)*r_ttl + 200, so at the ~460 mOhm test cable
+ * + the ~2250 mA engage current the device VBUS is ~2*Vcell + 290 mV.  200 leaves
+ * a ~90 mV start margin; healthy operation's headroom only GROWS as the probe
+ * climbs (the request rises faster than the IR-drop), so the guard then fires only
+ * on a genuine source sag (the CC knee), with the engine's VBUSUVLO-RETRY +
+ * dc_monitor buck-restore as the deeper backstops.
+ */
+#define SM5440_PROBE_COLLAPSE_MV 200
 
 struct sm5440 {
 	struct device *dev;
@@ -249,6 +293,21 @@ struct sm5440 {
 	struct delayed_work dc_monitor;
 	bool dc_running;
 	int dc_ticks;
+
+	/*
+	 * Increment-3b comp-2: adaptive ta.v_max probe-up state (the dc_probe path).
+	 * probe_work runs every SM5440_PROBE_TICK_MS while dc_adaptive; the
+	 * collapse-guard runs every tick, the climb only while !probe_locked and the
+	 * engine is in CC.  All accessed under engage_lock (like dc_running).
+	 */
+	struct delayed_work probe_work;
+	bool dc_adaptive;	/* this run is the adaptive probe (vs fixed-ci_gl dc_test) */
+	bool probe_locked;	/* climb settled (success or source ceiling) -- guard still runs */
+	u32 probe_vmax;		/* current ta.v_max request setpoint (mV) */
+	u32 probe_ci_gl;	/* the high ci_gl goal (mA) for the success test */
+	u32 probe_floor_off;	/* ta.v_max never retreats below 2*Vcell + this (the engage point) */
+	int probe_prev_ibus;	/* IBUS (mA) at the last bump, for the flat-detector */
+	int probe_settle;	/* probe ticks remaining before judging the last bump */
 };
 
 /*
@@ -990,7 +1049,7 @@ static const struct sm_dc_ops sm5440_dc_ops = {
  */
 static void sm5440_dc_ramp_ta_down(struct sm5440 *chip)
 {
-	int vbus_uv = 0, mv;
+	int vbus_uv = 0, mv, i;
 
 	if (sm5440_get_vbus_uv(chip, &vbus_uv) || vbus_uv / 1000 < SM5440_DC_STOP_TA_MV)
 		mv = SM5440_DC_STOP_TA_MV;
@@ -1009,8 +1068,24 @@ static void sm5440_dc_ramp_ta_down(struct sm5440 *chip)
 	 * so the buck never re-enables against a stale/high PPS request. */
 	if (sm5714_pd_request_voltage(SM5440_DC_STOP_TA_MV, SM5440_DC_STOP_TA_MA))
 		return;
-	dev_info(chip->dev, "dc graceful-stop: PPS settled to %d mV before buck restore\n",
-		 SM5440_DC_STOP_TA_MV);
+
+	/*
+	 * comp-1 reload-race fix: wait for the source to actually transition to ~9 V
+	 * before returning (the caller un-inhibits the buck immediately after).  The
+	 * VBUS ADC stays live after sm_dc_stop_charging, and with the pump off + the
+	 * buck still inhibited the source is UNLOADED, so it settles quickly once the
+	 * keepalive re-Requests 9 V.  Bounded poll; proceed regardless on timeout so a
+	 * flaky source can never block the buck restore (cell-not-charging is worse).
+	 */
+	for (i = 0; i < SM5440_DC_STOP_VERIFY_TRIES; i++) {
+		msleep(SM5440_DC_STOP_VERIFY_MS);
+		if (!sm5440_get_vbus_uv(chip, &vbus_uv) &&
+		    abs(vbus_uv / 1000 - SM5440_DC_STOP_TA_MV) <= SM5440_DC_STOP_TA_MV / 10)
+			break;
+	}
+	dev_info(chip->dev,
+		 "dc graceful-stop: PPS settled to %d mV (VBUS=%d mV after ~%d ms) before buck restore\n",
+		 SM5440_DC_STOP_TA_MV, vbus_uv / 1000, (i + 1) * SM5440_DC_STOP_VERIFY_MS);
 }
 
 static void sm5440_dc_teardown(struct sm5440 *chip)
@@ -1073,6 +1148,97 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 	mutex_unlock(&chip->engage_lock);
 }
 
+/*
+ * Adaptive ta.v_max probe (Inc-3b comp-2).  Runs every SM5440_PROBE_TICK_MS while
+ * an adaptive dc run is active.  The collapse-guard runs EVERY tick (the fast
+ * safety retreat); the climb runs only while !probe_locked AND the engine is in
+ * CC.  Once locked the guard keeps running -- only the climb stops.  Lock order
+ * is engage_lock -> st_lock (via sm_dc_set_ta_vmax), the same order teardown
+ * already uses.  dc_test/dc_probe=0 sync-cancels this WITHOUT engage_lock; teardown
+ * clears dc_running so an in-flight tick self-terminates with no explicit cancel.
+ */
+static void sm5440_dc_probe_work(struct work_struct *work)
+{
+	struct sm5440 *chip = container_of(work, struct sm5440, probe_work.work);
+	int vbus_uv = 0, vbat_mv = 0, ibus_ua = 0, vbus_mv, ibus_ma, floor, state;
+
+	mutex_lock(&chip->engage_lock);
+	if (!chip->dc_running || !chip->dc_adaptive)
+		goto out;			/* torn down -> self-terminate (no resched) */
+
+	sm5440_get_vbus_uv(chip, &vbus_uv);
+	sm5440_get_vbat_mv(chip, &vbat_mv);
+	sm5440_get_ibus_ua(chip, &ibus_ua);
+	vbus_mv = vbus_uv / 1000;
+	ibus_ma = ibus_ua / 1000;
+	floor = 2 * vbat_mv + chip->probe_floor_off;	/* never retreat below the engage point */
+
+	/*
+	 * (1) collapse-guard, EVERY tick.  The device VBUS is the PPS request minus the
+	 * cable IR-drop; if it sags toward the 2*Vcell 2:1 floor the source is being
+	 * over-drawn -> drop ta.v_max one step immediately.  Easing the pump's pull lets
+	 * the source recover BEFORE the sag deepens into a VBUSUVLO cliff (the
+	 * flat-detector below is too slow to prevent that on its own).
+	 */
+	if (vbus_mv < 2 * vbat_mv + SM5440_PROBE_COLLAPSE_MV) {
+		chip->probe_vmax = max_t(int, floor,
+					 (int)chip->probe_vmax - SM5440_PROBE_VMAX_STEP);
+		sm_dc_set_ta_vmax(chip->dc, chip->probe_vmax);
+		if (!chip->probe_locked) {
+			chip->probe_prev_ibus = ibus_ma;
+			chip->probe_settle = SM5440_PROBE_SETTLE_TICKS;
+		}
+		dev_warn(chip->dev,
+			 "probe: collapse-guard VBUS=%dmV < 2*Vcell(%d)+%d -> v_max down to %dmV\n",
+			 vbus_mv, vbat_mv, SM5440_PROBE_COLLAPSE_MV, chip->probe_vmax);
+		goto resched;
+	}
+
+	/* climb only while not locked and the engine is actually regulating in CC. */
+	state = chip->dc ? sm_dc_get_current_state(chip->dc) : SM_DC_CHG_OFF;
+	if (chip->probe_locked || state != SM_DC_CC)
+		goto resched;
+
+	/* (2) wait out the post-bump settle before judging the IBUS response. */
+	if (chip->probe_settle > 0) {
+		chip->probe_settle--;
+		goto resched;
+	}
+
+	if (ibus_ma >= (int)chip->probe_ci_gl - SM5440_PROBE_FLAT_MA) {
+		/* (3a) success: input current reached the goal -> lock, keep v_max. */
+		chip->probe_locked = true;
+		dev_info(chip->dev, "probe: IBUS=%dmA reached ci_gl(%d) -> LOCKED at v_max=%dmV\n",
+			 ibus_ma, chip->probe_ci_gl, chip->probe_vmax);
+	} else if (ibus_ma - chip->probe_prev_ibus < SM5440_PROBE_FLAT_MA) {
+		/* (3b) flat below the goal: source ceiling -> revert one step + lock. */
+		chip->probe_vmax = max_t(int, floor,
+					 (int)chip->probe_vmax - SM5440_PROBE_VMAX_STEP);
+		sm_dc_set_ta_vmax(chip->dc, chip->probe_vmax);
+		chip->probe_locked = true;
+		dev_info(chip->dev,
+			 "probe: IBUS=%dmA flat (prev %d, ci_gl %d) -> source ceiling, LOCKED at v_max=%dmV\n",
+			 ibus_ma, chip->probe_prev_ibus, chip->probe_ci_gl, chip->probe_vmax);
+	} else {
+		/* (3c) IBUS responded and is below the goal: bump v_max one step. */
+		chip->probe_vmax = min_t(u32, chip->probe_vmax + SM5440_PROBE_VMAX_STEP,
+					 SM5440_PROBE_VMAX_CEIL);
+		sm_dc_set_ta_vmax(chip->dc, chip->probe_vmax);
+		chip->probe_prev_ibus = ibus_ma;
+		chip->probe_settle = SM5440_PROBE_SETTLE_TICKS;
+		if (chip->probe_vmax >= SM5440_PROBE_VMAX_CEIL)
+			chip->probe_locked = true;	/* hit the hard request ceiling */
+		dev_info(chip->dev, "probe: IBUS=%dmA responding -> v_max up to %dmV%s\n",
+			 ibus_ma, chip->probe_vmax,
+			 chip->probe_locked ? " (request ceiling, LOCKED)" : "");
+	}
+
+resched:
+	schedule_delayed_work(&chip->probe_work, msecs_to_jiffies(SM5440_PROBE_TICK_MS));
+out:
+	mutex_unlock(&chip->engage_lock);
+}
+
 /* The engine's topoff "done" event (CV, target==float).  Stop the engine; the
  * monitor's next tick sees CHG_OFF and restores the buck. */
 static void sm5440_dc_done_cb(void *ctx)
@@ -1090,10 +1256,10 @@ static void sm5440_dc_done_cb(void *ctx)
  * ~2*Vcell and VERIFY VBUS settled) so the engine's preset re-send is a near
  * no-op against an already-2:1-ready source, THEN hands control to the engine.
  */
-static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma)
+static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptive)
 {
 	struct sm_dc_power_source_info ta = { };
-	int vbat_mv = 0, target_mv, off_mv, vbus_mv, diff, ret;
+	int vbat_mv = 0, target_mv, off_mv, vbus_mv, diff, ret, engage_off;
 
 	if (!sm5714_pd_contract_active()) {
 		dev_warn(chip->dev, "dc start: no PPS contract -- arm pd_request + plug first\n");
@@ -1150,14 +1316,25 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma)
 	}
 	dev_info(chip->dev, "dc start: VBUS settled to %dmV -- handing to the engine\n", vbus_mv);
 
-	/* TA descriptor: our 10 V APDO (pos 5); the engine ramps within it.  c_max =
-	 * the step target (the PD layer clamps to the APDO's advertised max current);
-	 * p_max in uW (= v_max * c_max) is a generous bound -- IBUSLIM + the APDO
-	 * clamp are the real limiters. */
+	/*
+	 * TA descriptor: our 10 V APDO (pos 5); the engine ramps within it.  c_max =
+	 * the step target (the PD layer clamps to the APDO's advertised max current).
+	 * For the ADAPTIVE probe ta.v_max STARTS conservative -- the engine's own
+	 * engage request (2*Vcell + the half-current IR offset) plus a small margin --
+	 * so the CC ramp settles at a safe sub-ceiling current and probe_work then
+	 * walks it up; the fixed dc_test path uses the full 10500 mV (ci_gl is the
+	 * limiter there).  p_max always uses the full 10500 ceiling so the engine's own
+	 * p_max guard never caps the probe's climb before ta.v_max does.
+	 */
+	engage_off = ((target_ibus_ma / 2) * (SM5440_GTS9U_R_TTL_UOHM / 1000)) / 1000 + 200;
+	chip->probe_floor_off = engage_off;	/* ta.v_max never retreats below 2*Vcell + this */
+	chip->probe_vmax = min_t(u32, 2 * vbat_mv + engage_off + SM5440_PROBE_START_MARGIN,
+				 SM5440_PROBE_VMAX_CEIL);
+
 	ta.pdo_pos = 5;
-	ta.v_max = SM5440_DC_VBUS_OVP_TH - 500;		/* 10500 mV */
+	ta.v_max = adaptive ? chip->probe_vmax : (SM5440_DC_VBUS_OVP_TH - 500);
 	ta.c_max = target_ibus_ma;
-	ta.p_max = ta.v_max * ta.c_max;
+	ta.p_max = (SM5440_DC_VBUS_OVP_TH - 500) * ta.c_max;
 
 	sm_dc_set_target_vbat(chip->dc, SM5440_DC_STEP0_VBAT_MV);
 	sm_dc_set_target_ibus(chip->dc, target_ibus_ma);
@@ -1165,6 +1342,11 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma)
 	chip->fg = power_supply_get_by_name("sm5714-fuelgauge");
 	chip->dc_running = true;
 	chip->dc_ticks = 0;
+	chip->dc_adaptive = adaptive;
+	chip->probe_locked = false;
+	chip->probe_ci_gl = target_ibus_ma;
+	chip->probe_prev_ibus = 0;
+	chip->probe_settle = SM5440_PROBE_SETTLE_TICKS;
 
 	ret = sm_dc_start_charging(chip->dc, &ta);
 	if (ret) {
@@ -1174,8 +1356,18 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma)
 	}
 
 	schedule_delayed_work(&chip->dc_monitor, msecs_to_jiffies(1000));
-	dev_info(chip->dev, "dc ENGINE STARTED: target_vbat=%dmV target_ibus=%umA -- monitoring\n",
-		 SM5440_DC_STEP0_VBAT_MV, target_ibus_ma);
+	if (adaptive) {
+		schedule_delayed_work(&chip->probe_work,
+				      msecs_to_jiffies(SM5440_PROBE_TICK_MS));
+		dev_info(chip->dev,
+			 "dc ENGINE STARTED (ADAPTIVE probe): ci_gl=%umA v_max start=%umV (engage~%dmV) ceil=%dmV\n",
+			 target_ibus_ma, chip->probe_vmax, 2 * vbat_mv + engage_off,
+			 SM5440_PROBE_VMAX_CEIL);
+	} else {
+		dev_info(chip->dev,
+			 "dc ENGINE STARTED (fixed): target_vbat=%dmV target_ibus=%umA -- monitoring\n",
+			 SM5440_DC_STEP0_VBAT_MV, target_ibus_ma);
+	}
 	return 0;
 
 err_restore:
@@ -1185,9 +1377,26 @@ err_restore:
 }
 
 /*
- * Engine test trigger: "<mA>" starts the CC/CV engine at that input-current
- * target (e.g. 3000 then 4500); "0" stops + restores.  Per-execution gated;
- * never auto-starts.
+ * Stop + unconditional restore, shared by dc_test=0 and dc_probe=0.  Sync-cancel
+ * the LOG monitor AND the adaptive probe WITHOUT engage_lock (both take it --
+ * holding it here would deadlock the sync-cancel), then one locked teardown.
+ */
+static void sm5440_dc_stop(struct sm5440 *chip)
+{
+	cancel_delayed_work_sync(&chip->probe_work);
+	cancel_delayed_work_sync(&chip->dc_monitor);
+	mutex_lock(&chip->engage_lock);
+	if (chip->dc_running)
+		sm5440_dc_teardown(chip);
+	mutex_unlock(&chip->engage_lock);
+}
+
+/*
+ * Engine test trigger: "<mA>" starts the CC/CV engine at that FIXED input-current
+ * target (e.g. 3000 then 4500, with ta.v_max at the full 10500 mV ceiling so the
+ * engine settles at ci_gl); "0" stops + restores.  This is the conservative path:
+ * a ci_gl chosen below the source's deliverable ceiling settles cleanly with no
+ * probe.  Per-execution gated; never auto-starts.
  */
 static ssize_t dc_test_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t count)
@@ -1200,11 +1409,7 @@ static ssize_t dc_test_store(struct device *dev, struct device_attribute *attr,
 		return -EINVAL;
 
 	if (target_ibus == 0) {		/* stop + unconditional restore */
-		cancel_delayed_work_sync(&chip->dc_monitor);
-		mutex_lock(&chip->engage_lock);
-		if (chip->dc_running)
-			sm5440_dc_teardown(chip);
-		mutex_unlock(&chip->engage_lock);
+		sm5440_dc_stop(chip);
 		return count;
 	}
 
@@ -1220,12 +1425,51 @@ static ssize_t dc_test_store(struct device *dev, struct device_attribute *attr,
 	mutex_lock(&chip->engage_lock);
 	/* mutually exclusive with the Inc-1 pump_test manual engage (shared pump/FG). */
 	ret = (chip->dc_running || chip->pump_engaged) ? -EBUSY :
-	      sm5440_dc_start(chip, target_ibus);
+	      sm5440_dc_start(chip, target_ibus, false);
 	mutex_unlock(&chip->engage_lock);
 
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(dc_test);
+
+/*
+ * Adaptive-probe trigger (Inc-3b comp-2): "<ci_gl-mA>" starts the engine with a
+ * HIGH input-current goal AND the adaptive ta.v_max probe-up -- the supervisor
+ * (probe_work) walks the PPS request ceiling toward the source's deliverable
+ * maximum while the collapse-guard prevents an over-draw VBUSUVLO cliff; "0" stops
+ * + restores (shared with dc_test).  ci_gl must sit ABOVE what the source can
+ * deliver so the engine stays unsatisfied and keeps pushing ta.v toward ta.v_max
+ * (the probe's lever); below ~3300 it would simply regulate to ci_gl -- use
+ * dc_test for a fixed target.  Capped at the step-0 input (4500 mA).  Per-execution
+ * gated; never auto-starts.
+ */
+static ssize_t dc_probe_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct sm5440 *chip = dev_get_drvdata(dev);
+	u32 ci_gl;
+	int ret;
+
+	if (kstrtou32(buf, 0, &ci_gl))
+		return -EINVAL;
+
+	if (ci_gl == 0) {		/* stop + unconditional restore */
+		sm5440_dc_stop(chip);
+		return count;
+	}
+
+	if (ci_gl < 3300 || ci_gl > 4500)
+		return -EINVAL;
+
+	mutex_lock(&chip->engage_lock);
+	/* mutually exclusive with pump_test + a fixed dc_test (shared pump/FG). */
+	ret = (chip->dc_running || chip->pump_engaged) ? -EBUSY :
+	      sm5440_dc_start(chip, ci_gl, true);
+	mutex_unlock(&chip->engage_lock);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(dc_probe);
 
 static int sm5440_get_property(struct power_supply *psy,
 			       enum power_supply_property psp,
@@ -1305,6 +1549,7 @@ static int sm5440_probe(struct i2c_client *client)
 	INIT_DELAYED_WORK(&chip->pump_monitor, sm5440_pump_monitor_work);
 	INIT_DELAYED_WORK(&chip->ocp_check_work, sm5440_ocp_check_work);
 	INIT_DELAYED_WORK(&chip->dc_monitor, sm5440_dc_monitor_work);
+	INIT_DELAYED_WORK(&chip->probe_work, sm5440_dc_probe_work);
 
 	chip->regmap = devm_regmap_init_i2c(client, &sm5440_regmap_config);
 	if (IS_ERR(chip->regmap))
@@ -1387,6 +1632,8 @@ static int sm5440_probe(struct i2c_client *client)
 			sm_dc_set_done_notify(chip->dc, sm5440_dc_done_cb, chip);
 			if (device_create_file(dev, &dev_attr_dc_test))
 				dev_warn(dev, "could not create dc_test sysfs attribute\n");
+			if (device_create_file(dev, &dev_attr_dc_probe))
+				dev_warn(dev, "could not create dc_probe sysfs attribute\n");
 		}
 	}
 
@@ -1400,16 +1647,19 @@ static void sm5440_remove(struct i2c_client *client)
 	struct sm5440 *chip = i2c_get_clientdata(client);
 
 	device_remove_file(&client->dev, &dev_attr_pump_test);
-	if (chip->dc)
+	if (chip->dc) {
 		device_remove_file(&client->dev, &dev_attr_dc_test);
+		device_remove_file(&client->dev, &dev_attr_dc_probe);
+	}
 
 	/*
 	 * Sync-cancel every monitor/backstop WITHOUT engage_lock (the monitors take
-	 * it; holding it here would deadlock the sync-cancel).  ocp_check_work and
-	 * dc_monitor are INIT'd unconditionally in probe, so cancelling them is safe
-	 * even when the engine never came up.  Then one locked region tears down
-	 * whichever path was live (mutually exclusive), and the engine is freed last.
+	 * it; holding it here would deadlock the sync-cancel).  ocp_check_work,
+	 * dc_monitor and probe_work are INIT'd unconditionally in probe, so cancelling
+	 * them is safe even when the engine never came up.  Then one locked region
+	 * tears down whichever path was live (mutually exclusive); the engine last.
 	 */
+	cancel_delayed_work_sync(&chip->probe_work);
 	cancel_delayed_work_sync(&chip->dc_monitor);
 	cancel_delayed_work_sync(&chip->ocp_check_work);
 	cancel_delayed_work_sync(&chip->pump_monitor);

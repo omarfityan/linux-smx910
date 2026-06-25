@@ -1031,6 +1031,26 @@ int sm_dc_set_target_ibus(struct sm_dc_info *sm_dc, u32 target_ibus)
 }
 EXPORT_SYMBOL_GPL(sm_dc_set_target_ibus);
 
+int sm_dc_set_ta_vmax(struct sm_dc_info *sm_dc, u32 v_max)
+{
+	pr_info("%s %s: [%dmV] to [%dmV]\n", sm_dc->name, __func__, sm_dc->ta.v_max, v_max);
+
+	/*
+	 * A bare ceiling write -- NO req_update flag, NO state change (cf.
+	 * sm_dc_set_target_ibus, whose req_update_ibus diverts the machine to a full
+	 * PRE_CC re-ramp).  st_lock for consistency with the other setters; ta.v_max
+	 * is a single aligned word the CC reader (_try_to_adjust_cc_up) sees
+	 * atomically, so the worst a concurrent read sees is the previous ceiling for
+	 * one iteration, corrected on the next.
+	 */
+	mutex_lock(&sm_dc->st_lock);
+	sm_dc->ta.v_max = v_max;
+	mutex_unlock(&sm_dc->st_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(sm_dc_set_ta_vmax);
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Silicon Mitus; mainline PD-only port by omar fityan <me@omarfityan.com>");
 MODULE_DESCRIPTION("Silicon Mitus sm_dc direct-charging (PD/PPS CC/CV) engine");
