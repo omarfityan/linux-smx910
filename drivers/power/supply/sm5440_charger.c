@@ -1157,6 +1157,23 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
  * already uses.  dc_test/dc_probe=0 sync-cancels this WITHOUT engage_lock; teardown
  * clears dc_running so an in-flight tick self-terminates with no explicit cancel.
  */
+/*
+ * ta.v_max MUST be a multiple of the 20 mV PPS request granularity (the engine's
+ * PPS_V_STEP).  The engine clamps ta.v = pps_v(MIN(.., ta.v_max)) and pps_v() rounds
+ * to the NEAREST step -- so a non-step-aligned ta.v_max (the probe derives it from
+ * 2*Vcell + the cable-IR offset, rarely a 20 mV multiple) lets the clamped request
+ * round UP past ta.v_max and trip the engine's own out-of-bounds check
+ * (send_power_source_msg "out of bounce" -> SM_DC_ERR_SEND_PD_MSG, faults in PRE_CC).
+ * Flooring ta.v_max to the step guarantees pps_v(x) <= ta.v_max for any x <= ta.v_max,
+ * keeping every engine clamp site in bounds.  The fixed dc_test path is unaffected
+ * (its ta.v_max = OVP_TH - 500 = 10500 mV is already aligned).
+ */
+#define SM5440_PPS_V_STEP	20
+static inline u32 sm5440_vmax_align(u32 mv)
+{
+	return (mv / SM5440_PPS_V_STEP) * SM5440_PPS_V_STEP;
+}
+
 static void sm5440_dc_probe_work(struct work_struct *work)
 {
 	struct sm5440 *chip = container_of(work, struct sm5440, probe_work.work);
@@ -1171,7 +1188,8 @@ static void sm5440_dc_probe_work(struct work_struct *work)
 	sm5440_get_ibus_ua(chip, &ibus_ua);
 	vbus_mv = vbus_uv / 1000;
 	ibus_ma = ibus_ua / 1000;
-	floor = 2 * vbat_mv + chip->probe_floor_off;	/* never retreat below the engage point */
+	/* PPS-step-aligned so the engine's pps_v() clamp to it can't round above it */
+	floor = sm5440_vmax_align(2 * vbat_mv + chip->probe_floor_off);	/* never retreat below the engage point */
 
 	/*
 	 * (1) collapse-guard, EVERY tick.  The device VBUS is the PPS request minus the
@@ -1328,8 +1346,9 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	 */
 	engage_off = ((target_ibus_ma / 2) * (SM5440_GTS9U_R_TTL_UOHM / 1000)) / 1000 + 200;
 	chip->probe_floor_off = engage_off;	/* ta.v_max never retreats below 2*Vcell + this */
-	chip->probe_vmax = min_t(u32, 2 * vbat_mv + engage_off + SM5440_PROBE_START_MARGIN,
-				 SM5440_PROBE_VMAX_CEIL);
+	chip->probe_vmax = sm5440_vmax_align(min_t(u32,
+				 2 * vbat_mv + engage_off + SM5440_PROBE_START_MARGIN,
+				 SM5440_PROBE_VMAX_CEIL));
 
 	ta.pdo_pos = 5;
 	ta.v_max = adaptive ? chip->probe_vmax : (SM5440_DC_VBUS_OVP_TH - 500);
