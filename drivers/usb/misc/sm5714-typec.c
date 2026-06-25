@@ -577,6 +577,44 @@ static void sm5714_pd_rx(struct sm5714_typec *t)
 	case SM5714_PD_CTRL_PS_RDY:
 		t->pd_evt |= SM5714_PD_EVT_PS_RDY;
 		break;
+	case SM5714_PD_CTRL_SOFT_RESET: {
+		/*
+		 * Soft_Reset is a recoverable message-ID resync the source
+		 * initiates on a protocol hiccup; ignoring it makes the source
+		 * escalate to a Hard Reset that drops the contract (observed:
+		 * msg_type=13 -> hard reset ~29 ms later -> charge-pump ENOTCONN).
+		 * Respond exactly as the device's own PE_SNK_Soft_Reset
+		 * (sm5714_policy.c sm5714_usbpd_policy_snk_soft_reset): reset the
+		 * protocol layer -- RX-flush + PD_CNTL4 PRL reset, byte-identical
+		 * to the downstream sm5714_protocol_layer_reset(), which re-zeroes
+		 * the HW-stamped message-ID -- then Accept.  The source then
+		 * re-advertises Source_Capabilities and the mid-contract
+		 * re-advertise path above re-Requests, completing the AMS; the
+		 * contract SURVIVES, so pd_contract_lost stays clear.  All
+		 * non-blocking i2c writes -- safe in this ONESHOT IRQ thread (like
+		 * the inline re-Request above) and lower-latency than a work item
+		 * against the source's ~30 ms response window.
+		 */
+		union sm5714_pd_header ah = { };
+
+		i2c_smbus_write_byte_data(t->client, SM5714_TYPEC_REG_RX_BUF_ST,
+					  SM5714_TYPEC_RX_BUF_FLUSH);
+		i2c_smbus_write_byte_data(t->client, SM5714_TYPEC_REG_PD_CNTL4,
+					  SM5714_TYPEC_PD_CNTL4_PRL_RESET);
+
+		ah.msg_type = SM5714_PD_CTRL_ACCEPT;
+		ah.spec_revision = SM5714_PD_SPEC_REV_30;
+		ah.port_data_role = SM5714_PD_DATA_ROLE_UFP;
+		ah.port_power_role = SM5714_PD_POWER_ROLE_SINK;
+		if (sm5714_pd_send(t, &ah, NULL, 0))
+			dev_warn(dev,
+				 "PD Soft_Reset: Accept send failed (source will Hard-Reset)\n");
+		else
+			dev_info(dev,
+				 "PD Soft_Reset received -> protocol reset + Accept (hdr=0x%04x, contract preserved)\n",
+				 ah.word);
+		return;
+	}
 	default:
 		return;
 	}
