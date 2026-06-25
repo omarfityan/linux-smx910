@@ -358,9 +358,23 @@ static inline int _pd_pre_cc_check_limitation(struct sm_dc_info *sm_dc, int adc_
 			calc_pps_v_min = (sm_dc->target_vbat * 2) + calc_reg_v_min + sm_dc->wq.v_offset;
 			calc_pps_v = MAX((sm_dc->ta.p_max / sm_dc->wq.ci_gl) - PPS_V_STEP, calc_pps_v_min);
 		}
-		sm_dc->ta.v = pps_v(MIN(calc_pps_v, sm_dc->config.dc_vbus_ovp_th - 500));
-		pr_info("%s %s: R_TTL=%d, calc_reg_v=%dmV, calc_pps_v=%dmV\n",
-			sm_dc->name, __func__, sm_dc->config.r_ttl, calc_reg_v, calc_pps_v);
+		/*
+		 * Mainline addition (NOT in the device-own engine): also clamp the
+		 * limitation-path request to ta.v_max.  Downstream this path clamps only
+		 * to the OVP ceiling because that engine never throttles via ta.v_max (it
+		 * equals the APDO max).  Our adaptive supervisor repurposes ta.v_max as a
+		 * runtime throttle, so the request must honour it HERE too -- otherwise a
+		 * low ta.v_max stalls the PRE_CC ramp, which triggers this very jump to the
+		 * ci_gl-derived target (which exceeds the throttle), and
+		 * send_power_source_msg rejects it as out-of-bounds (SM_DC_ERR_SEND_PD_MSG).
+		 * Clamping is conservative (only ever LOWERS the request) and a no-op when
+		 * ta.v_max is the APDO max, so the device-own behaviour is unchanged.
+		 */
+		sm_dc->ta.v = pps_v(MIN(MIN(calc_pps_v, sm_dc->config.dc_vbus_ovp_th - 500),
+					sm_dc->ta.v_max));
+		pr_info("%s %s: R_TTL=%d, calc_reg_v=%dmV, calc_pps_v=%dmV, v_max=%dmV\n",
+			sm_dc->name, __func__, sm_dc->config.r_ttl, calc_reg_v, calc_pps_v,
+			sm_dc->ta.v_max);
 		sm_dc->ta.c = sm_dc->ta.c;
 		sm_dc->wq.pps_cl = 1;
 	}
