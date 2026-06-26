@@ -1288,6 +1288,14 @@ static int sm5714_typec_probe(struct i2c_client *client)
 	t->role = USB_ROLE_NONE;
 	t->pd_target_mv = SM5714_PD_REQ_MV;
 	t->pd_target_ma = SM5714_PD_REQ_MA;
+	/*
+	 * A2: default-on PD = cold plug-and-go.  PD now negotiates on EVERY charger
+	 * attach with no post-boot pd_request arm.  Safe by construction: the
+	 * per-attach pd_attach_done latch stops the blind resync from re-enabling PD
+	 * after a teardown, and the no-APDO teardown tears PD down on a non-PPS source
+	 * (AFC/5 V buck fallback) instead of HRST-looping.  Persistent across detach.
+	 */
+	t->pd_negotiate_armed = true;
 	mutex_init(&t->lock);
 	INIT_DELAYED_WORK(&t->resync, sm5714_typec_resync_work);
 	INIT_WORK(&t->pd_req_work, sm5714_pd_req_work);
