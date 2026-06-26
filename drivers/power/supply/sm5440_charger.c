@@ -203,19 +203,40 @@
 #define SM5440_VBAT_MIN		3300	/* device-own SM5440_VBAT_MIN / dc_min_vbat */
 
 /*
- * Increment-3b-3 auto-engage supervisor gates.  The device-own direct-charge
- * step table (gts9u DT, battery,dc_step_chg_cond_soc = <0x3e 0x4f 0x64> =
- * 62/79/100 %) defines step-0 as SoC < 62 % at a 4250 mV cell-V target -- and
- * this port ports ONLY step-0 (dc_start always sets SM5440_DC_STEP0_VBAT_MV).
- * So 62 % is the correct engage ceiling, not merely a test precondition: above
- * it the cell is already past 4250 mV and a step-0 engine would sit in CV doing
- * nothing.  The buck owns 62 -> 100 %.  Disengage one point above with hysteresis
- * so a CC-creep across the boundary cannot chatter the pump on/off.
+ * Increment-3b-4 auto-engage supervisor gates + the device-own 3-step
+ * direct-charge ladder.  The supervisor engages at SoC < the step-0 ceiling
+ * (62 %), starts in step 0, and walks the LIVE engine up through steps 1 and 2
+ * by re-targeting vbat/ibus at each boundary (sm_dc_set_target_vbat/ibus -- the
+ * engine re-ramps inside the live PD contract, no re-negotiation); the buck owns
+ * the final dchg_end_soc -> 100 % tail.  The ongoing N->N+1 transition mirrors the
+ * device-own min(step_vol, step_input) with SoC start-only (gts9u DT
+ * dc_step_chg_type 0xe9 = SOC_INIT_ONLY|INPUT_CURRENT|FLOAT_VOLTAGE|ONLINE|
+ * VOLTAGE): advance when (FG cell-V + v_margin >= cond_vol[N]) AND
+ * (IBUS <= cond_iin[N]), debounced iin_check_cnt ticks.  All values transcribed
+ * from the device's own DT: cond_vol == val_vfloat 4250/4420/4440 mV; val_iout
+ * (CELL current) 9000/8200/4000 -> engine IBUS = val_iout/2 for the 2:1 pump =
+ * 4500/4100/2000 mA; cond_iin[N] = val_iout[N+1]/2 = 4100/2000 mA; v_margin 40 mV;
+ * iin_check_cnt 3; dchg_end_soc default 95.  This validation ships the ladder from
+ * a sub-step-0 plug; start-step-by-SoC + a high-SoC engage are a deferred
+ * completeness edge (the buck owns a high-SoC plug for now).
  */
-#define SM5440_AUTO_ENGAGE_SOC		62	/* engage only when SoC < this (device-own step-0) */
-#define SM5440_AUTO_DISENGAGE_SOC	64	/* disengage a supervisor run at/above this */
-#define SM5440_AUTO_ENGAGE_CI_GL	4500	/* fixed input-current target (sess-211 reliable; voltage-caps to ~4200) */
+#define SM5440_AUTO_ENGAGE_SOC		62	/* engage only when SoC < this (device-own step-0 start) */
+#define SM5440_AUTO_DISENGAGE_SOC	95	/* disengage at/above = device-own dchg_end_soc; buck finishes 95->100 */
+#define SM5440_AUTO_ENGAGE_CI_GL	4500	/* step-0 IBUS target = val_iout[0]/2 (voltage-caps to ~3900 at path-R) */
 #define SM5440_AUTO_RETRY_MAX		3	/* consecutive engage failures before latching off until replug */
+
+/*
+ * The device-own ladder table (gts9u DT battery,dc_step_chg_*; see the comment
+ * above for the encoding + provenance).  Index = step 0..SM5440_DC_STEP_MAX;
+ * cond_iin has one fewer entry (the last step has no "next").
+ */
+#define SM5440_DC_STEP_MAX	2	/* last step index (3 steps: 0,1,2) */
+#define SM5440_DC_STEP_V_MARGIN	40	/* device-own dc_step_chg_cond_v_margin (mV) */
+#define SM5440_DC_STEP_IIN_CNT	3	/* device-own dc_step_chg_iin_check_cnt (debounce ticks) */
+static const u32 sm5440_dc_step_vbat[SM5440_DC_STEP_MAX + 1]     = { 4250, 4420, 4440 }; /* val_vfloat (mV) */
+static const u32 sm5440_dc_step_ibus[SM5440_DC_STEP_MAX + 1]     = { 4500, 4100, 2000 }; /* val_iout/2 IBUS (mA) */
+static const u32 sm5440_dc_step_cond_vol[SM5440_DC_STEP_MAX + 1] = { 4250, 4420, 4440 }; /* cond_vol (mV) */
+static const u32 sm5440_dc_step_cond_iin[SM5440_DC_STEP_MAX]     = { 4100, 2000 };       /* val_iout[N+1]/2 (mA) */
 
 /*
  * Increment-3a graceful-stop ramp-down (the buck handoff).  sess-206 run-1 showed
@@ -339,6 +360,15 @@ struct sm5440 {
 	bool auto_engaged;	/* this dc run was started by the supervisor (gates auto-disengage) */
 	bool dc_err_latched;	/* engage failed SM5440_AUTO_RETRY_MAX times -- stop until charger replug */
 	int dc_retry_cnt;	/* consecutive auto-engage failures (device-own dc_retry_cnt analog) */
+
+	/*
+	 * Increment-3b-4: the 3-step ladder state.  dc_step is the current step
+	 * (0..SM5440_DC_STEP_MAX, the device-own step_chg_status analog); the
+	 * advance machine lives in dc_monitor and re-targets the live engine at
+	 * each boundary.  Accessed only under engage_lock (like dc_running).
+	 */
+	int dc_step;		/* current ladder step */
+	int dc_step_iin_cnt;	/* consecutive ticks the advance predicate held (debounce -> SM5440_DC_STEP_IIN_CNT) */
 };
 
 /*
@@ -1197,6 +1227,45 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 		return;
 	}
 
+	/*
+	 * The 3-step ladder (device-own sec_step_charging.c min(step_vol, step_input)).
+	 * Reached only with the engine in an ACTIVE state (we are past the teardown
+	 * check above), so a re-target can never land on a dead engine.  Advance
+	 * N->N+1 when the cell has reached this step's plateau (FG cell-V + v_margin >=
+	 * cond_vol[N]) AND the bus current has tapered (IBUS <= cond_iin[N]), debounced
+	 * SM5440_DC_STEP_IIN_CNT ticks.  FG voltage_now is the device-own VOLTAGE sensor
+	 * (matches battery->voltage_now, not the SM5440 VBAT-ADC).  The re-target is
+	 * glitch-free: vbat-up + ibus-down hits the engine's need_to_preset=0 PRE_CC
+	 * re-ramp inside the live PD contract -- no re-negotiation (no Hard-Reset risk).
+	 * Step 2 (4440 mV == chg_float) then self-terminates via the engine native
+	 * topoff; the executor's SoC >= dchg_end_soc is the ceiling backstop.
+	 */
+	if (chip->dc_step < SM5440_DC_STEP_MAX) {
+		int n = chip->dc_step, fgv_uv = 0, cell_mv;
+
+		if (chip->fg && !power_supply_get_property(chip->fg,
+				POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv))
+			fgv_uv = pv.intval;
+		cell_mv = fgv_uv / 1000;
+
+		if (cell_mv + SM5440_DC_STEP_V_MARGIN >= sm5440_dc_step_cond_vol[n] &&
+		    ibus / 1000 <= sm5440_dc_step_cond_iin[n]) {
+			if (++chip->dc_step_iin_cnt >= SM5440_DC_STEP_IIN_CNT) {
+				chip->dc_step = n + 1;
+				chip->dc_step_iin_cnt = 0;
+				sm_dc_set_target_vbat(chip->dc, sm5440_dc_step_vbat[n + 1]);
+				sm_dc_set_target_ibus(chip->dc, sm5440_dc_step_ibus[n + 1]);
+				dev_info(chip->dev,
+					 "dc ladder: step %d -> %d (vbat %u->%u mV, ibus %u->%u mA) at FG-V=%dmV IBUS=%dmA\n",
+					 n, n + 1, sm5440_dc_step_vbat[n], sm5440_dc_step_vbat[n + 1],
+					 sm5440_dc_step_ibus[n], sm5440_dc_step_ibus[n + 1],
+					 cell_mv, ibus / 1000);
+			}
+		} else {
+			chip->dc_step_iin_cnt = 0;
+		}
+	}
+
 	schedule_delayed_work(&chip->dc_monitor, msecs_to_jiffies(1000));
 	mutex_unlock(&chip->engage_lock);
 }
@@ -1414,6 +1483,8 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	sm5440_fg(chip);			/* lazy-cache the persistent FG handle */
 	chip->dc_running = true;
 	chip->dc_ticks = 0;
+	chip->dc_step = 0;		/* the ladder starts in step 0 (engage gate keeps SoC < 62) */
+	chip->dc_step_iin_cnt = 0;
 	chip->dc_adaptive = adaptive;
 	chip->probe_locked = false;
 	chip->probe_ci_gl = target_ibus_ma;
