@@ -902,12 +902,17 @@ teardown:
  * Keepalive: once the contract is established, periodically re-Request the same
  * PPS voltage so the source does not Hard-Reset it on tPPSTimeout.  Self-
  * rescheduling delayed work (the device's own sm_dc loop uses the same shape).
- * Fire-and-forget by design: a keepalive ping's only job is to reset the
- * source's timeout, which the HW confirms with GoodCRC (TX_DONE); it does NOT
- * block for a fresh Accept/PS_RDY, because a source may legally answer a
- * same-voltage re-Request without one.  Genuine loss is detected out-of-band --
- * the IRQ sets pd_contract_lost on HRST or TX_SOP_ERR -- and checked here; VBUS
- * on the SM5440 is the electrical health signal.
+ * Each keepalive completes a full AMS: send the re-Request, then WAIT for the
+ * source's PS_RDY before returning.  This serializes the contract's Requests.
+ * The engine steps the PPS voltage via sm5714_pd_request_voltage(), which kicks
+ * this same work item immediately (mod_delayed_work .. 0); without waiting for
+ * PS_RDY that stepped re-Request can fire mid-AMS -- a fresh Request arriving
+ * before the source's prior PS_RDY, i.e. two overlapping Requests in one
+ * contract, which a spec-correct source answers with a Hard Reset (observed:
+ * a 9982 mV step fired 16 ms after a 9000 mV Accept, ~53 ms before its PS_RDY,
+ * -> HRST).  Genuine loss is detected out-of-band -- the IRQ sets
+ * pd_contract_lost on HRST or TX_SOP_ERR -- and checked here; VBUS on the SM5440
+ * is the electrical health signal.
  */
 static void sm5714_pd_keepalive_work(struct work_struct *work)
 {
@@ -917,6 +922,7 @@ static void sm5714_pd_keepalive_work(struct work_struct *work)
 	union sm5714_pd_header h = { };
 	union sm5714_pd_obj rdo = { };
 	int pos, cc, ret;
+	u32 evt;
 
 	mutex_lock(&t->lock);
 
@@ -958,14 +964,36 @@ static void sm5714_pd_keepalive_work(struct work_struct *work)
 				      msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
 		return;
 	}
+	/*
+	 * Arm for THIS Request's PS_RDY before sending.  The clear and the send
+	 * are both under the lock so the IRQ -- which sets PS_RDY -- cannot
+	 * interleave between them and leave us waiting on a stale event.
+	 */
+	t->pd_evt &= ~SM5714_PD_EVT_PS_RDY;
 	ret = sm5714_pd_send(t, &h, &rdo, 1);
 	mutex_unlock(&t->lock);
 
-	if (ret)
+	if (ret) {
 		dev_warn(dev, "PD keepalive re-Request failed (%d)\n", ret);
-	else
+	} else {
 		dev_info(dev, "PD keepalive re-Request: %u mV (rdo=0x%08x)\n",
 			 t->pd_target_mv, rdo.object);
+		/*
+		 * Serialize the AMS: block until this Request's PS_RDY arrives so the
+		 * next Request (this work re-queued by the engine's voltage step, or
+		 * the next periodic tick) cannot collide with an in-flight AMS.  This
+		 * work item is single-threaded, so a mod_delayed_work(.., 0) landing
+		 * during the wait simply re-runs us afterwards -- the step is requested
+		 * cleanly on the next pass.  Times out at tPSTransition (rare: a HRST
+		 * during the wait leaves PS_RDY unset; proceed, the next tick tears
+		 * down on pd_contract_lost).
+		 */
+		evt = sm5714_pd_wait(t, SM5714_PD_EVT_PS_RDY, SM5714_PD_T_PSRDY_MS);
+		if (!(evt & SM5714_PD_EVT_PS_RDY))
+			dev_warn(dev,
+				 "PD keepalive: no PS_RDY within %d ms (evt=0x%x) -- proceeding\n",
+				 SM5714_PD_T_PSRDY_MS, evt);
+	}
 
 	schedule_delayed_work(&t->pd_keepalive,
 			      msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
