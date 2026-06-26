@@ -203,6 +203,21 @@
 #define SM5440_VBAT_MIN		3300	/* device-own SM5440_VBAT_MIN / dc_min_vbat */
 
 /*
+ * Increment-3b-3 auto-engage supervisor gates.  The device-own direct-charge
+ * step table (gts9u DT, battery,dc_step_chg_cond_soc = <0x3e 0x4f 0x64> =
+ * 62/79/100 %) defines step-0 as SoC < 62 % at a 4250 mV cell-V target -- and
+ * this port ports ONLY step-0 (dc_start always sets SM5440_DC_STEP0_VBAT_MV).
+ * So 62 % is the correct engage ceiling, not merely a test precondition: above
+ * it the cell is already past 4250 mV and a step-0 engine would sit in CV doing
+ * nothing.  The buck owns 62 -> 100 %.  Disengage one point above with hysteresis
+ * so a CC-creep across the boundary cannot chatter the pump on/off.
+ */
+#define SM5440_AUTO_ENGAGE_SOC		62	/* engage only when SoC < this (device-own step-0) */
+#define SM5440_AUTO_DISENGAGE_SOC	64	/* disengage a supervisor run at/above this */
+#define SM5440_AUTO_ENGAGE_CI_GL	4500	/* fixed input-current target (sess-211 reliable; voltage-caps to ~4200) */
+#define SM5440_AUTO_RETRY_MAX		3	/* consecutive engage failures before latching off until replug */
+
+/*
  * Increment-3a graceful-stop ramp-down (the buck handoff).  sess-206 run-1 showed
  * that restoring the sustained-PPS voltage in ONE step (the engine's ~10500 mV
  * ceiling -> 10000) while the buck simultaneously re-loaded the source Hard-Reset
@@ -308,6 +323,22 @@ struct sm5440 {
 	u32 probe_floor_off;	/* ta.v_max never retreats below 2*Vcell + this (the engage point) */
 	int probe_prev_ibus;	/* IBUS (mA) at the last bump, for the flat-detector */
 	int probe_settle;	/* probe ticks remaining before judging the last bump */
+
+	/*
+	 * Increment-3b-3: the auto-engage supervisor (executor half).  The SM5714 buck
+	 * worker (the arbiter) publishes dc_intent via its registered notify; the
+	 * executor (auto_engage_work) ANDs that with the pump-side gates (a PPS contract
+	 * is held, SoC < the step-0 ceiling, no fault latch) and engages/disengages.
+	 * Push-triggered by the notify (no independent poll).  auto_engaged marks a run
+	 * the supervisor started, so it never disturbs a manual dc_test/pump_test run.
+	 * All accessed under engage_lock except dc_intent (WRITE_ONCE in the cb / READ_ONCE
+	 * in the executor -- the cb must not take engage_lock; see sm5440_dc_intent_cb).
+	 */
+	struct delayed_work auto_engage_work;
+	bool dc_intent;		/* last buck-worker notify: charger present + cell temp OK */
+	bool auto_engaged;	/* this dc run was started by the supervisor (gates auto-disengage) */
+	bool dc_err_latched;	/* engage failed SM5440_AUTO_RETRY_MAX times -- stop until charger replug */
+	int dc_retry_cnt;	/* consecutive auto-engage failures (device-own dc_retry_cnt analog) */
 };
 
 /*
@@ -528,6 +559,32 @@ static bool sm5440_fault_present(struct sm5440 *chip, u8 st[4])
 }
 
 /*
+ * Lazy-cached fuelgauge handle.  The fuelgauge may probe AFTER this driver, so
+ * acquire on first use (under engage_lock) rather than at probe; held for the
+ * driver's lifetime and put once in remove().  A persistent handle (not the old
+ * per-engage get/put) is required because the auto-engage supervisor reads SoC
+ * while IDLE -- between runs there would otherwise be no handle to read.
+ */
+static struct power_supply *sm5440_fg(struct sm5440 *chip)
+{
+	if (!chip->fg)
+		chip->fg = power_supply_get_by_name("sm5714-fuelgauge");
+	return chip->fg;
+}
+
+/* Cell SoC percent via the fuelgauge, or -1 if unavailable.  Caller holds engage_lock. */
+static int sm5440_read_soc(struct sm5440 *chip)
+{
+	union power_supply_propval v = { };
+
+	if (!sm5440_fg(chip))
+		return -1;
+	if (power_supply_get_property(chip->fg, POWER_SUPPLY_PROP_CAPACITY, &v))
+		return -1;
+	return v.intval;
+}
+
+/*
  * Chip-side pump engage (device-faithful order: sw_reset -> init -> ADC on ->
  * IBUSLIM/VBATREG -> op-mode CHG_ON -> WDT).  The PPS input must already be
  * commanded to ~2x Vcell and the buck disarmed by the caller.  sw_reset wipes
@@ -590,10 +647,7 @@ static void sm5440_pump_disengage_locked(struct sm5440 *chip)
 	chip->pump_engaged = false;
 	sm5714_pd_request_voltage(10000, 3000);		/* restore the 10 V sustain baseline */
 	sm5714_charger_inhibit_buck(false);		/* re-allow the buck to charge */
-	if (chip->fg) {
-		power_supply_put(chip->fg);
-		chip->fg = NULL;
-	}
+	/* chip->fg is persistent (put once in remove); not released here */
 	dev_info(chip->dev, "pump DISENGAGED (buck re-allowed, PPS restored to 10 V)\n");
 }
 
@@ -737,7 +791,7 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 		goto err_uninhibit;
 	}
 
-	chip->fg = power_supply_get_by_name("sm5714-fuelgauge");
+	sm5440_fg(chip);			/* lazy-cache the persistent FG handle */
 	chip->pump_engaged = true;
 	chip->monitor_ticks = 0;
 	schedule_delayed_work(&chip->pump_monitor, msecs_to_jiffies(1000));
@@ -1032,9 +1086,10 @@ static const struct sm_dc_ops sm5440_dc_ops = {
 
 /*
  * Common teardown (idempotent): stop the engine, restore the 10 V sustain
- * baseline, re-allow the buck, release the FG handle.  Called from dc_test=0,
- * the done callback, and the monitor's auto-restore -- so a topoff/fault/WDT
- * stop can never leave the buck inhibited + pump off = cell not charging.
+ * baseline, re-allow the buck, clear dc_running + auto_engaged (the FG handle is
+ * persistent, put in remove).  Called from dc_test=0, the done callback, the
+ * monitor's auto-restore, and the supervisor's auto-disengage -- so a topoff/
+ * fault/WDT stop can never leave the buck inhibited + pump off = cell not charging.
  */
 /*
  * Graceful PPS ramp-down toward 9 V before the buck re-loads the source (Inc-3a,
@@ -1094,11 +1149,9 @@ static void sm5440_dc_teardown(struct sm5440 *chip)
 		sm_dc_stop_charging(chip->dc);	/* pump op-mode OFF first (reverse-current guard) */
 	sm5440_dc_ramp_ta_down(chip);		/* gentle PPS ramp to 9 V, settle UNLOADED */
 	sm5714_charger_inhibit_buck(false);	/* re-allow the buck (now on a settled 9 V PPS) */
-	if (chip->fg) {
-		power_supply_put(chip->fg);
-		chip->fg = NULL;
-	}
+	/* chip->fg is persistent (put once in remove); not released here */
 	chip->dc_running = false;
+	chip->auto_engaged = false;		/* a fresh run (manual or auto) re-decides ownership */
 }
 
 /*
@@ -1358,7 +1411,7 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	sm_dc_set_target_vbat(chip->dc, SM5440_DC_STEP0_VBAT_MV);
 	sm_dc_set_target_ibus(chip->dc, target_ibus_ma);
 
-	chip->fg = power_supply_get_by_name("sm5714-fuelgauge");
+	sm5440_fg(chip);			/* lazy-cache the persistent FG handle */
 	chip->dc_running = true;
 	chip->dc_ticks = 0;
 	chip->dc_adaptive = adaptive;
@@ -1407,6 +1460,106 @@ static void sm5440_dc_stop(struct sm5440 *chip)
 	mutex_lock(&chip->engage_lock);
 	if (chip->dc_running)
 		sm5440_dc_teardown(chip);
+	mutex_unlock(&chip->engage_lock);
+}
+
+/*
+ * Increment-3b-3 supervisor -- the buck worker's notify callback.  Runs in the buck
+ * worker's context and MUST be non-blocking (the buck worker holds the vbus
+ * instance_lock across this call): just publish the intent and kick the executor.
+ * No engage_lock here -- taking it under instance_lock could invert against the
+ * engage path's engage_lock -> instance_lock -> sv->lock ordering (inhibit_buck).
+ * WRITE_ONCE pairs with the executor's READ_ONCE.  system_long_wq because the
+ * executor may sleep for the full engage (msleep 300) / graceful-stop ramp (~3 s).
+ */
+static void sm5440_dc_intent_cb(void *ctx, bool dc_intent)
+{
+	struct sm5440 *chip = ctx;
+
+	WRITE_ONCE(chip->dc_intent, dc_intent);
+	mod_delayed_work(system_long_wq, &chip->auto_engage_work, 0);
+}
+
+/*
+ * The executor.  Engage when the arbiter signals intent AND the pump-side gates
+ * pass (a PPS contract is held, SoC below the step-0 ceiling, no fault latch);
+ * disengage a SUPERVISOR-OWNED run when intent drops, the contract is lost, or SoC
+ * reaches the disengage ceiling.  Step-0's 4250 mV != the 4440 mV float, so the
+ * engine never self-DONEs and this SoC ceiling is the SOLE terminator -- an
+ * unreadable SoC therefore fails SAFE to disengage (mirrors the buck's temp-read
+ * fail-to-cut).  engage_lock serializes against the manual triggers + the monitors,
+ * so a concurrent invocation can never double-engage.  dc_start/dc_stop run WITHOUT
+ * engage_lock held across their sync-cancels (dc_stop sync-cancels the monitors,
+ * which themselves take engage_lock).
+ */
+static void sm5440_auto_engage_work(struct work_struct *work)
+{
+	struct sm5440 *chip = container_of(work, struct sm5440,
+					   auto_engage_work.work);
+	bool intent = READ_ONCE(chip->dc_intent);
+	int soc, ret;
+
+	mutex_lock(&chip->engage_lock);
+	soc = sm5440_read_soc(chip);
+
+	if (chip->dc_running) {
+		/*
+		 * Only manage a run the supervisor itself started; leave a manual
+		 * dc_test/dc_probe run to the operator (dc_test=0).
+		 */
+		if (chip->auto_engaged &&
+		    (!intent || !sm5714_pd_contract_active() ||
+		     soc < 0 || soc >= SM5440_AUTO_DISENGAGE_SOC)) {
+			dev_info(chip->dev,
+				 "auto-disengage: intent=%d contract=%d soc=%d%%\n",
+				 intent, sm5714_pd_contract_active(), soc);
+			mutex_unlock(&chip->engage_lock);
+			sm5440_dc_stop(chip);
+			return;
+		}
+		mutex_unlock(&chip->engage_lock);
+		return;
+	}
+
+	/* Idle.  The charger going away (intent low) clears the fault latch. */
+	if (!intent) {
+		chip->dc_err_latched = false;
+		chip->dc_retry_cnt = 0;
+		mutex_unlock(&chip->engage_lock);
+		return;
+	}
+
+	/*
+	 * Engage gates: not already on the pump, not latched-off after repeated
+	 * failures, a PPS contract is held, and SoC is known and below the step-0
+	 * ceiling (above it a step-0-only engine has nothing to do; the buck owns it).
+	 */
+	if (chip->pump_engaged || chip->dc_err_latched ||
+	    !sm5714_pd_contract_active() ||
+	    soc < 0 || soc >= SM5440_AUTO_ENGAGE_SOC) {
+		mutex_unlock(&chip->engage_lock);
+		return;
+	}
+
+	ret = sm5440_dc_start(chip, SM5440_AUTO_ENGAGE_CI_GL, false);
+	if (ret) {
+		if (++chip->dc_retry_cnt >= SM5440_AUTO_RETRY_MAX) {
+			chip->dc_err_latched = true;
+			dev_warn(chip->dev,
+				 "auto-engage: %d consecutive failures -- latching off until charger replug\n",
+				 chip->dc_retry_cnt);
+		} else {
+			dev_warn(chip->dev,
+				 "auto-engage: dc_start failed (%d) -- retry %d/%d on next poll\n",
+				 ret, chip->dc_retry_cnt, SM5440_AUTO_RETRY_MAX);
+		}
+	} else {
+		chip->dc_retry_cnt = 0;
+		chip->auto_engaged = true;
+		dev_info(chip->dev,
+			 "auto-engage: pump engaged at SoC %d%% (ci_gl=%u mA) -- no sysfs trigger\n",
+			 soc, SM5440_AUTO_ENGAGE_CI_GL);
+	}
 	mutex_unlock(&chip->engage_lock);
 }
 
@@ -1569,6 +1722,7 @@ static int sm5440_probe(struct i2c_client *client)
 	INIT_DELAYED_WORK(&chip->ocp_check_work, sm5440_ocp_check_work);
 	INIT_DELAYED_WORK(&chip->dc_monitor, sm5440_dc_monitor_work);
 	INIT_DELAYED_WORK(&chip->probe_work, sm5440_dc_probe_work);
+	INIT_DELAYED_WORK(&chip->auto_engage_work, sm5440_auto_engage_work);
 
 	chip->regmap = devm_regmap_init_i2c(client, &sm5440_regmap_config);
 	if (IS_ERR(chip->regmap))
@@ -1653,6 +1807,14 @@ static int sm5440_probe(struct i2c_client *client)
 				dev_warn(dev, "could not create dc_test sysfs attribute\n");
 			if (device_create_file(dev, &dev_attr_dc_probe))
 				dev_warn(dev, "could not create dc_probe sysfs attribute\n");
+			/*
+			 * Auto-engage supervisor (Inc-3b-3): register with the SM5714
+			 * buck worker (the arbiter) so the pump engages on a PD-charger
+			 * attach with NO sysfs trigger.  Only with the engine up -- the
+			 * supervisor drives the closed-loop dc_start path.
+			 */
+			sm5714_charger_set_dc_notify(sm5440_dc_intent_cb, chip);
+			dev_info(dev, "auto-engage supervisor registered\n");
 		}
 	}
 
@@ -1664,6 +1826,14 @@ static int sm5440_probe(struct i2c_client *client)
 static void sm5440_remove(struct i2c_client *client)
 {
 	struct sm5440 *chip = i2c_get_clientdata(client);
+
+	/*
+	 * Unregister the auto-engage notify FIRST so the buck worker stops kicking the
+	 * executor, THEN sync-cancel it below -- otherwise a notify landing after the
+	 * cancel would re-queue work against a torn-down device.  Harmless if the cb
+	 * was never registered (engine absent).
+	 */
+	sm5714_charger_set_dc_notify(NULL, NULL);
 
 	device_remove_file(&client->dev, &dev_attr_pump_test);
 	if (chip->dc) {
@@ -1678,6 +1848,7 @@ static void sm5440_remove(struct i2c_client *client)
 	 * them is safe even when the engine never came up.  Then one locked region
 	 * tears down whichever path was live (mutually exclusive); the engine last.
 	 */
+	cancel_delayed_work_sync(&chip->auto_engage_work);
 	cancel_delayed_work_sync(&chip->probe_work);
 	cancel_delayed_work_sync(&chip->dc_monitor);
 	cancel_delayed_work_sync(&chip->ocp_check_work);
@@ -1694,6 +1865,9 @@ static void sm5440_remove(struct i2c_client *client)
 		sm_dc_destroy_instance(chip->dc);
 		chip->dc = NULL;
 	}
+
+	if (chip->fg)
+		power_supply_put(chip->fg);	/* the persistent FG handle */
 }
 
 static const struct i2c_device_id sm5440_i2c_id[] = {

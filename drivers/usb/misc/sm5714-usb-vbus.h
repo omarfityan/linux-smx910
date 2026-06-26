@@ -30,10 +30,26 @@ void sm5714_usb_vbus_inhibit_afc(bool inhibit);
  * handoff).  false on disengage re-allows the worker to resume buck charging.
  */
 int sm5714_charger_inhibit_buck(bool inhibit);
+/*
+ * Register (or clear, with NULL) the SM5440 charge-pump's direct-charge notify
+ * callback.  The charging worker invokes it once per poll with its dc_intent: a
+ * charger is present AND the cell temperature is in the safe window (the same
+ * gate that arms the buck FET).  The pump driver's executor then ANDs that with
+ * its own gates (a PPS contract is held, SoC below the step-0 ceiling, no fault
+ * latch) and engages/disengages.  Kept as a registered pointer so the symbol
+ * dependency stays one-directional (the SM5440 driver depends on this one, as it
+ * already does for inhibit_buck -- not the reverse), and so this driver builds
+ * without the pump.  The callback must be non-blocking (it runs in the worker's
+ * context); the pump's implementation only stores a flag and schedules work.
+ */
+void sm5714_charger_set_dc_notify(void (*notify)(void *ctx, bool dc_intent),
+				  void *ctx);
 #else
 static inline int sm5714_usb_vbus_set_host(bool on) { return -ENODEV; }
 static inline void sm5714_usb_vbus_inhibit_afc(bool inhibit) { }
 static inline int sm5714_charger_inhibit_buck(bool inhibit) { return -ENODEV; }
+static inline void sm5714_charger_set_dc_notify(
+		void (*notify)(void *ctx, bool dc_intent), void *ctx) { }
 #endif
 
 #endif /* __SM5714_USB_VBUS_H */

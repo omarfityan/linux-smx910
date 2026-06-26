@@ -343,6 +343,26 @@ static int sm5714_vbus_disable(struct sm5714_vbus *sv)
 static DEFINE_MUTEX(sm5714_vbus_instance_lock);
 static struct sm5714_vbus *sm5714_vbus_instance;
 
+/*
+ * SM5440 direct-charge notify (see sm5714-usb-vbus.h).  Stored module-static and
+ * guarded by instance_lock: the charging worker calls it at its common exit AFTER
+ * dropping sv->lock, so the only lock held across the callback is instance_lock --
+ * no inversion against inhibit_buck (instance_lock -> sv->lock), since the callback
+ * is non-blocking (stores a flag + schedules work) and never re-enters this driver.
+ */
+static void (*sm5714_dc_notify)(void *ctx, bool dc_intent);
+static void *sm5714_dc_notify_ctx;
+
+void sm5714_charger_set_dc_notify(void (*notify)(void *ctx, bool dc_intent),
+				  void *ctx)
+{
+	mutex_lock(&sm5714_vbus_instance_lock);
+	sm5714_dc_notify = notify;
+	sm5714_dc_notify_ctx = ctx;
+	mutex_unlock(&sm5714_vbus_instance_lock);
+}
+EXPORT_SYMBOL_GPL(sm5714_charger_set_dc_notify);
+
 static int sm5714_vbus_set(struct sm5714_vbus *sv, bool on)
 {
 	bool changed = false;
@@ -626,6 +646,8 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 	int charge_ma = SM5714_CHARGE_CURRENT_MIN;
 	bool charger = false;
 	bool vbus = false;
+	bool dc_intent = false;		/* publish to the SM5440 supervisor at the
+					 * common exit; false on every early-out */
 	u8 offset;
 
 	mutex_lock(&sv->lock);
@@ -770,8 +792,34 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 			 charge_ma);
 	}
 
+	/*
+	 * Direct-charge intent for the SM5440 supervisor: a source is present AND the
+	 * cell is in the safe temperature window -- the same gate (vbus && !charge_cut)
+	 * that arms the buck FET above.  Deliberately NOT gated on `charger` (the BC1.2
+	 * DCP classification): a pure USB-C PD charger need not assert a BC1.2 DCP
+	 * signature, and the executor's pd_contract_active() check is the authoritative
+	 * "is this a fast (PPS) charger" filter -- mirroring the device-own
+	 * is_pd_apdo_wire_type gate.  A non-PPS source (PC/DCP) leaves dc_intent true but
+	 * the executor declines (no contract) and the buck handles it.  Computed on the
+	 * normal path only; host-mode / factory-mode / status-read-fail early-outs leave
+	 * it false, so a running pump disengages in those states (fail-safe).
+	 */
+	dc_intent = vbus && !sv->charge_cut;
+
 out:
 	mutex_unlock(&sv->lock);
+
+	/*
+	 * Publish dc_intent to the SM5440 supervisor.  Done AFTER dropping sv->lock so
+	 * the only lock held is instance_lock; the callback is non-blocking (it stores
+	 * a flag + schedules the pump's executor work), so no inversion against
+	 * inhibit_buck's instance_lock -> sv->lock ordering.
+	 */
+	mutex_lock(&sm5714_vbus_instance_lock);
+	if (sm5714_dc_notify)
+		sm5714_dc_notify(sm5714_dc_notify_ctx, dc_intent);
+	mutex_unlock(&sm5714_vbus_instance_lock);
+
 	schedule_delayed_work(&sv->charger_work,
 			      msecs_to_jiffies(SM5714_CHG_POLL_MS));
 }
