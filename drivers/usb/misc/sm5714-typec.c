@@ -238,8 +238,22 @@ struct sm5714_typec {
 	struct delayed_work resync;
 	enum usb_role role;
 	bool pd_enabled;		/* PD protocol layer brought up (sink) */
-	bool pd_arm;			/* enable PD on the next sink-attach edge */
-	bool pd_do_request;		/* negotiate (not just capture) on this attach */
+	bool pd_arm;			/* enable PD on the next sink-attach edge (one-shot,
+					 * the pd_caps capture-only bring-up trigger) */
+	bool pd_negotiate_armed;	/* PERSISTENT intent: negotiate + sustain a PPS
+					 * contract on EVERY sink attach (the pd_request
+					 * trigger).  Unlike pd_arm it survives a detach/
+					 * pd_disable, so an unplug between arming and the
+					 * real attach no longer drops the intent (the
+					 * sess-211 run-2 split-arm abort).  Auto-engage
+					 * depends on it; default-on at probe = cold
+					 * plug-and-go (a one-line follow-up). */
+	bool pd_attach_done;		/* PD already brought up on THIS attach; blocks the
+					 * blind periodic resync from re-enabling PD (and
+					 * re-hitting the no-APDO teardown) until a real
+					 * detach clears it */
+	bool pd_do_request;		/* negotiate (not just capture) on this attach;
+					 * re-derived from pd_negotiate_armed each attach */
 	bool pd_negotiating;		/* a Request flow is in flight (work scheduled) */
 	bool pd_contract_lost;		/* IRQ saw HRST/TX_SOP_ERR: contract genuinely gone */
 	struct work_struct pd_req_work;	/* initial PD negotiation; runs off-IRQ (it blocks) */
@@ -354,20 +368,35 @@ static void sm5714_typec_apply(struct sm5714_typec *t, enum usb_role role,
 
 	/*
 	 * Bring the PD protocol layer up at the sink-attach edge (when armed via
-	 * the pd_caps trigger) so it is live the moment the source sends its
-	 * initial Source_Capabilities -- a PD source only advertises caps early
-	 * in attach, so enabling here (not seconds later) is what lets us catch
-	 * them.  Tear PD down on any move away from sink.  One-shot: the arm is
-	 * consumed so a later Hard-Reset re-attach does not re-loop.
+	 * pd_caps one-shot or the persistent pd_request intent) so it is live the
+	 * moment the source sends its initial Source_Capabilities -- a PD source
+	 * only advertises caps early in attach, so enabling here (not seconds
+	 * later) is what lets us catch them.  Tear PD down on any move away from
+	 * sink.  pd_attach_done (not consuming the arm) is what stops a re-loop:
+	 * the blind periodic resync also lands here with role==DEVICE, and with a
+	 * PERSISTENT pd_negotiate_armed a no-APDO/Hard-Reset teardown (pd_enabled
+	 * back to false, still attached) would otherwise re-enable+re-negotiate
+	 * every resync.  The latch holds until a genuine detach clears it.
 	 */
 	if (role == USB_ROLE_DEVICE) {
-		if (t->pd_arm && !t->pd_enabled) {
+		if ((t->pd_arm || t->pd_negotiate_armed) && !t->pd_enabled &&
+		    !t->pd_attach_done) {
+			/*
+			 * Re-derive pd_do_request from the persistent intent each
+			 * attach, so pd_disable clearing it (per-attach hygiene)
+			 * never strands a later attach in capture-only mode -- the
+			 * sess-211 run-2 split-arm abort.
+			 */
+			t->pd_do_request = t->pd_negotiate_armed;
 			t->pd_arm = false;
+			t->pd_attach_done = true;
 			if (sm5714_pd_enable(t))
 				dev_warn(&t->client->dev, "PD enable failed\n");
 		}
-	} else if (t->pd_enabled) {
-		sm5714_pd_disable(t);
+	} else {
+		t->pd_attach_done = false;	/* a fresh attach may re-arm */
+		if (t->pd_enabled)
+			sm5714_pd_disable(t);
 	}
 }
 
@@ -685,7 +714,12 @@ static void sm5714_pd_disable(struct sm5714_typec *t)
 	i2c_smbus_write_byte_data(t->client, SM5714_TYPEC_REG_PD_CNTL1,
 				  SM5714_TYPEC_PD_CNTL1_DISABLE);
 	t->pd_enabled = false;
-	t->pd_do_request = false;	/* one-shot: a fresh attach must re-arm */
+	t->pd_do_request = false;	/* per-attach hygiene; re-derived from the
+					 * persistent pd_negotiate_armed at the next
+					 * attach edge -- NOT a dropped intent.  Leaves
+					 * pd_negotiate_armed and pd_attach_done intact
+					 * (this may run mid-attach: no-APDO teardown or
+					 * contract-loss -- the latch must hold). */
 	t->pd_negotiating = false;
 	t->pd_contract_lost = false;
 	/* PD gone: re-allow AFC as the high-voltage fallback (the worker re-AFCs). */
@@ -833,10 +867,19 @@ static void sm5714_pd_req_work(struct work_struct *work)
 
 	pos = sm5714_pd_build_request(t, &h, &rdo);
 	if (!pos) {
-		dev_warn(dev, "PD: no PPS APDO covers %u mV; not requesting\n",
+		/*
+		 * No PPS APDO covers the target -- a non-PPS source (plain charger,
+		 * a PC for adb).  Tear PD down rather than leaving it enabled with
+		 * no Request: a spec-correct source Hard-Resets ~tSenderResponse
+		 * later and would cycle VBUS each time.  Teardown re-allows AFC as
+		 * the fallback; pd_attach_done stays set so we do not re-try PD on
+		 * this same attach.  (Dormant under the old one-shot arm; the
+		 * persistent pd_negotiate_armed makes every non-PPS attach hit this.)
+		 */
+		dev_warn(dev, "PD: no PPS APDO covers %u mV -- tearing down (non-PPS source; AFC fallback)\n",
 			 t->pd_target_mv);
 		mutex_unlock(&t->lock);
-		return;
+		goto teardown;
 	}
 
 	/* Arm the reply path BEFORE sending: clear stale events, reinit the
@@ -1150,7 +1193,8 @@ static ssize_t pd_caps_store(struct device *dev, struct device_attribute *attr,
 	struct sm5714_typec *t = i2c_get_clientdata(to_i2c_client(dev));
 
 	mutex_lock(&t->lock);
-	t->pd_arm = true;
+	t->pd_arm = true;		/* one-shot capture (not the persistent negotiate intent) */
+	t->pd_attach_done = false;	/* allow the next attach edge to bring PD up */
 	mutex_unlock(&t->lock);
 	dev_info(dev,
 		 "PD armed: will enable PD + capture Source_Capabilities on the next sink attach -- replug the charger\n");
@@ -1173,11 +1217,14 @@ static ssize_t pd_request_store(struct device *dev,
 	struct sm5714_typec *t = i2c_get_clientdata(to_i2c_client(dev));
 
 	mutex_lock(&t->lock);
-	t->pd_arm = true;
-	t->pd_do_request = true;
+	t->pd_negotiate_armed = true;	/* PERSISTENT: survives detach/pd_disable, so the
+					 * intent is not lost by an unplug between arming
+					 * and attach (the split-arm fix); auto-engage
+					 * relies on this holding across replugs */
+	t->pd_attach_done = false;	/* allow the next attach edge to bring PD up */
 	mutex_unlock(&t->lock);
 	dev_info(dev,
-		 "PD armed: will negotiate + sustain a %u mV PPS contract on the next sink attach -- replug the charger\n",
+		 "PD armed (persistent): will negotiate + sustain a %u mV PPS contract on every sink attach -- replug the charger\n",
 		 SM5714_PD_REQ_MV);
 	return len;
 }
