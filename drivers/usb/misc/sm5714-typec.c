@@ -244,6 +244,9 @@ struct sm5714_typec {
 	bool pd_contract_lost;		/* IRQ saw HRST/TX_SOP_ERR: contract genuinely gone */
 	struct work_struct pd_req_work;	/* initial PD negotiation; runs off-IRQ (it blocks) */
 	struct delayed_work pd_keepalive; /* re-Request loop that sustains the contract */
+	struct workqueue_struct *pd_wq;	/* dedicated ordered (one-at-a-time) wq for the
+					 * keepalive; serializes every re-Request AMS so
+					 * two Requests can never overlap in one contract */
 	struct completion pd_reply;	/* IRQ wakes the work on a control message */
 	u32 pd_evt;			/* sticky SM5714_PD_EVT_* control-msg events */
 	union sm5714_pd_obj pd_pdo[SM5714_PD_MAX_OBJ];	/* last captured source caps */
@@ -883,8 +886,8 @@ static void sm5714_pd_req_work(struct work_struct *work)
 	mutex_lock(&t->lock);
 	if (t->pd_enabled) {
 		t->pd_contract_lost = false;
-		schedule_delayed_work(&t->pd_keepalive,
-				      msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
+		queue_delayed_work(t->pd_wq, &t->pd_keepalive,
+				   msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
 		dev_info(dev, "PD keepalive armed (%u ms) -- sustaining contract\n",
 			 SM5714_PD_KEEPALIVE_MS);
 	}
@@ -903,7 +906,8 @@ teardown:
  * PPS voltage so the source does not Hard-Reset it on tPPSTimeout.  Self-
  * rescheduling delayed work (the device's own sm_dc loop uses the same shape).
  * Each keepalive completes a full AMS: send the re-Request, then WAIT for the
- * source's PS_RDY before returning.  This serializes the contract's Requests.
+ * source's PS_RDY before returning.  Running on a dedicated ordered workqueue
+ * (t->pd_wq, one work item at a time) this serializes the contract's Requests.
  * The engine steps the PPS voltage via sm5714_pd_request_voltage(), which kicks
  * this same work item immediately (mod_delayed_work .. 0); without waiting for
  * PS_RDY that stepped re-Request can fire mid-AMS -- a fresh Request arriving
@@ -952,16 +956,16 @@ static void sm5714_pd_keepalive_work(struct work_struct *work)
 		dev_info(dev, "PD keepalive: SinkTxNG (CC_STATUS=0x%02x) -- deferring\n",
 			 cc);
 		mutex_unlock(&t->lock);
-		schedule_delayed_work(&t->pd_keepalive,
-				      msecs_to_jiffies(SM5714_PD_SINKTX_RETRY_MS));
+		queue_delayed_work(t->pd_wq, &t->pd_keepalive,
+				   msecs_to_jiffies(SM5714_PD_SINKTX_RETRY_MS));
 		return;
 	}
 
 	pos = sm5714_pd_build_request(t, &h, &rdo);
 	if (!pos) {			/* caps should still be valid; reschedule */
 		mutex_unlock(&t->lock);
-		schedule_delayed_work(&t->pd_keepalive,
-				      msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
+		queue_delayed_work(t->pd_wq, &t->pd_keepalive,
+				   msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
 		return;
 	}
 	/*
@@ -981,12 +985,16 @@ static void sm5714_pd_keepalive_work(struct work_struct *work)
 		/*
 		 * Serialize the AMS: block until this Request's PS_RDY arrives so the
 		 * next Request (this work re-queued by the engine's voltage step, or
-		 * the next periodic tick) cannot collide with an in-flight AMS.  This
-		 * work item is single-threaded, so a mod_delayed_work(.., 0) landing
-		 * during the wait simply re-runs us afterwards -- the step is requested
-		 * cleanly on the next pass.  Times out at tPSTransition (rare: a HRST
-		 * during the wait leaves PS_RDY unset; proceed, the next tick tears
-		 * down on pd_contract_lost).
+		 * the next periodic tick) cannot collide with an in-flight AMS.  The
+		 * keepalive runs on a dedicated ORDERED workqueue (t->pd_wq) that runs
+		 * one work item at a time, so a queue/mod_delayed_work(.., 0) landing
+		 * during this wait queues behind us and re-runs only after we return --
+		 * the step is requested cleanly on the next pass.  (On the per-CPU
+		 * system_wq this did NOT hold: two keepalive instances ran on different
+		 * pools concurrently and put two Requests in one contract -> Hard
+		 * Reset.)  Times out at tPSTransition (rare: a HRST during the wait
+		 * leaves PS_RDY unset; proceed, the next tick tears down on
+		 * pd_contract_lost).
 		 */
 		evt = sm5714_pd_wait(t, SM5714_PD_EVT_PS_RDY, SM5714_PD_T_PSRDY_MS);
 		if (!(evt & SM5714_PD_EVT_PS_RDY))
@@ -995,8 +1003,8 @@ static void sm5714_pd_keepalive_work(struct work_struct *work)
 				 SM5714_PD_T_PSRDY_MS, evt);
 	}
 
-	schedule_delayed_work(&t->pd_keepalive,
-			      msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
+	queue_delayed_work(t->pd_wq, &t->pd_keepalive,
+			   msecs_to_jiffies(SM5714_PD_KEEPALIVE_MS));
 }
 
 /*
@@ -1006,8 +1014,9 @@ static void sm5714_pd_keepalive_work(struct work_struct *work)
  * sm5714_pd_request_voltage(): command the sustained PPS contract to a new
  * voltage / current ceiling.  The pump's CC/CV loop calls this to step the PPS
  * input as it regulates; the keepalive then re-Requests the new target.  We kick
- * the keepalive to fire immediately (mod_delayed_work .. 0) so the stepped
- * voltage is requested promptly rather than up to one keepalive period later.
+ * the keepalive to run as soon as its ordered workqueue is free (delay 0) so the
+ * stepped voltage is requested promptly -- behind any in-flight AMS on that wq,
+ * never concurrently with it.
  * Returns -ENODEV (no bound instance) or -ENOTCONN (no PPS contract held).
  */
 int sm5714_pd_request_voltage(unsigned int mv, unsigned int ma)
@@ -1029,7 +1038,7 @@ int sm5714_pd_request_voltage(unsigned int mv, unsigned int ma)
 	if (!active)
 		return -ENOTCONN;
 
-	mod_delayed_work(system_wq, &t->pd_keepalive, 0);
+	mod_delayed_work(t->pd_wq, &t->pd_keepalive, 0);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(sm5714_pd_request_voltage);
@@ -1237,6 +1246,20 @@ static int sm5714_typec_probe(struct i2c_client *client)
 	INIT_WORK(&t->pd_req_work, sm5714_pd_req_work);
 	INIT_DELAYED_WORK(&t->pd_keepalive, sm5714_pd_keepalive_work);
 	init_completion(&t->pd_reply);
+
+	/*
+	 * Run the keepalive on its OWN ordered (single-worker) workqueue, not the
+	 * per-CPU system_wq.  An ordered wq runs at most one work item at a time,
+	 * so a re-Request kicked by the SM5440 voltage step (mod_delayed_work .. 0)
+	 * can never start before the in-flight keepalive has finished waiting for
+	 * its PS_RDY.  On system_wq the two could land on different per-CPU pools
+	 * and run concurrently -- two Requests in one PPS contract, which the
+	 * source answers with a Hard Reset.  The device's own sm_dc engine sustains
+	 * its PD loop on a dedicated single-threaded wq for the same reason.
+	 */
+	t->pd_wq = alloc_ordered_workqueue("sm5714-pd", 0);
+	if (!t->pd_wq)
+		return -ENOMEM;
 	i2c_set_clientdata(client, t);
 
 	/*
@@ -1316,6 +1339,7 @@ err_unregister_port:
 		typec_unregister_port(t->port);
 	usb_role_switch_put(t->role_sw);
 err_put_connector:
+	destroy_workqueue(t->pd_wq);
 	fwnode_handle_put(connector);
 	return ret;
 }
@@ -1331,6 +1355,7 @@ static void sm5714_typec_remove(struct i2c_client *client)
 	cancel_delayed_work_sync(&t->resync);
 	cancel_work_sync(&t->pd_req_work);
 	cancel_delayed_work_sync(&t->pd_keepalive);
+	destroy_workqueue(t->pd_wq);
 	/* Leave the port disconnected + VBUS off (also unregisters the partner). */
 	mutex_lock(&t->lock);
 	sm5714_typec_apply(t, USB_ROLE_NONE, TYPEC_ORIENTATION_NONE);
