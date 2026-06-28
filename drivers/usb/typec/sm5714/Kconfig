@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0
+config TYPEC_SM5714
+	tristate "Silicon Mitus SM5714 Type-C Port Controller"
+	depends on I2C
+	depends on TYPEC_TCPM
+	help
+	  A USB Type-C Port Controller (tcpc_dev) driver for the Silicon Mitus
+	  SM5714 PMIC's autonomous Type-C/PD controller (PDIC), binding it to the
+	  kernel's USB-PD policy engine (tcpm).  The SM5714 has a vendor register
+	  layout rather than a standard TCPCI block, so it is integrated the way
+	  Qualcomm's PMIC Type-C is: this driver provides the CC/role/PD-FIFO
+	  transport and feeds tcpm's state machine from the chip interrupt.
+
+	  Say Y or M here to use USB-PD on boards with the SM5714 (e.g. the
+	  Samsung Galaxy Tab S9 Ultra, SM-X910).
