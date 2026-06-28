@@ -1418,18 +1418,17 @@
 	 * (rung-3 Component 1) probes here, gates on the DEVICEID (low nibble
 	 * 0x1), enables the on-chip ADC, and exposes input voltage / input
 	 * current / die temperature as a power_supply.  It leaves op-mode at
-	 * its CHG_OFF default and never controls charging.  The freq / r_ttl /
-	 * freq_siop / en_vbatreg properties are the device's own values
-	 * (downstream qupv3_hub_i2c3: sm5440@63), carried for the later
-	 * fast-charge control components; the telemetry driver ignores them.
+	 * its CHG_OFF default, never controls charging, and consumes no
+	 * device-tree tuning.  The device's own pump-tuning values -- freq
+	 * 450, r_ttl 500000, freq_siop <250 250>, en_vbatreg 0 (downstream
+	 * qupv3_hub_i2c3: sm5440@63) -- are reintroduced under manufacturer-
+	 * prefixed property names, with a driver that consumes them, by the
+	 * later fast-charge control component; they are deliberately not
+	 * carried here so the node validates against the upstream binding.
 	 */
 	charger@63 {
 		compatible = "siliconmitus,sm5440";
 		reg = <0x63>;
-		sm5440,freq = <450>;
-		sm5440,r_ttl = <500000>;
-		sm5440,freq_siop = <250 250>;
-		sm5440,en_vbatreg = <0>;
 	};
 };
 
