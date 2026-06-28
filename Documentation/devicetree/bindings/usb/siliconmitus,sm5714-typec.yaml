@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/usb/siliconmitus,sm5714-typec.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Silicon Mitus SM5714 USB Type-C / PD controller (PDIC)
+
+maintainers:
+  - Omar Fityan <me@omarfityan.com>
+
+description:
+  The USB Type-C cable-orientation and role-detect block (PDIC) of the Silicon
+  Mitus SM5714, accessed as an independent I2C client at its own address. It
+  performs autonomous DRP role detection, drives the USB role switch and the
+  SM5714 OTG VBUS, and carries USB Power Delivery messaging through the chip's
+  hardware PD protocol layer.
+
+properties:
+  compatible:
+    const: siliconmitus,sm5714-typec
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  connector:
+    type: object
+    $ref: ../connector/usb-connector.yaml#
+    unevaluatedProperties: false
+    description:
+      Properties for the USB Type-C connector.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - connector
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        usbpd@33 {
+            compatible = "siliconmitus,sm5714-typec";
+            reg = <0x33>;
+            interrupt-parent = <&tlmm>;
+            interrupts = <133 IRQ_TYPE_LEVEL_LOW>;
+
+            connector {
+                compatible = "usb-c-connector";
+                label = "USB-C";
+                power-role = "dual";
+                data-role = "dual";
+                try-power-role = "sink";
+
+                port {
+                    endpoint {
+                        remote-endpoint = <&usb_dwc3_hs>;
+                    };
+                };
+            };
+        };
+    };
+...

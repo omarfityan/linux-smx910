@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/siliconmitus,sm5714-usb-vbus.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Silicon Mitus SM5714 USB VBUS / battery charger
+
+maintainers:
+  - Omar Fityan <me@omarfityan.com>
+
+description:
+  The charger / USB-VBUS sub-block of the Silicon Mitus SM5714 power-management
+  IC, accessed as an independent I2C client at its own address. It manages the
+  battery charge FET and the input voltage/current limits, sources VBUS for USB
+  host (OTG) mode, and gates charging on a cell-temperature NTC read from an
+  external ADC channel.
+
+properties:
+  compatible:
+    const: siliconmitus,sm5714-usb-vbus
+
+  reg:
+    maxItems: 1
+
+  io-channels:
+    maxItems: 1
+    description:
+      Cell-temperature NTC thermistor channel on an external ADC, used by the
+      charge thermal gate.
+
+  io-channel-names:
+    items:
+      - const: batt-therm
+
+  siliconmitus,vbus-always-on:
+    type: boolean
+    description:
+      Bring USB host VBUS sourcing up at boot instead of on demand. The SM5714
+      cannot source VBUS and charge the battery at the same time, so setting
+      this prevents battery charging while host VBUS is enabled.
+
+required:
+  - compatible
+  - reg
+  - io-channels
+  - io-channel-names
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        charger@49 {
+            compatible = "siliconmitus,sm5714-usb-vbus";
+            reg = <0x49>;
+            io-channels = <&pmic_adc 0>;
+            io-channel-names = "batt-therm";
+        };
+    };
+...

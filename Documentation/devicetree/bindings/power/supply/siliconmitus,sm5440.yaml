@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/siliconmitus,sm5440.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Silicon Mitus SM5440 switched-capacitor charge pump
+
+maintainers:
+  - Omar Fityan <me@omarfityan.com>
+
+description:
+  The Silicon Mitus SM5440 is an inductorless switched-capacitor (2:1) charge
+  pump used on the cell side of a USB Power Delivery / PPS direct-charge path.
+  It is controlled over I2C and reports input voltage, input current and die
+  temperature through an on-chip ADC.
+
+properties:
+  compatible:
+    const: siliconmitus,sm5440
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        charger@63 {
+            compatible = "siliconmitus,sm5440";
+            reg = <0x63>;
+        };
+    };
+...
