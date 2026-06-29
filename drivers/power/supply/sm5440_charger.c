@@ -32,17 +32,21 @@
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/usb/pd.h>		/* RDO_PROG_{VOLT_MV,CURR_MA}_STEP grids */
 #include <linux/workqueue.h>
 
 /*
- * Cross-driver hooks for the buck<->pump handoff and PPS voltage stepping.  The
- * SM5714 Type-C/PD role driver (PPS contract) and the SM5714 VBUS/charger driver
- * (the buck) live in drivers/usb/misc; both expose no-op fallbacks when not
- * built, so the telemetry-only path still builds without them.  Included by
- * relative path for this bring-up (a shared include/linux/ header is a planned
- * cleanup before upstreaming).
+ * Cross-driver hook for the buck<->pump handoff: the SM5714 VBUS/charger driver
+ * (the buck + MUIC AFC) lives in drivers/usb/misc and exposes no-op fallbacks
+ * when not built, so the telemetry-only path still builds without it.  Included
+ * by relative path for this bring-up (a shared include/linux/ header is a
+ * planned cleanup before upstreaming).
+ *
+ * PPS voltage/current stepping no longer uses a bespoke cross-driver hook: the
+ * pump drives mainline tcpm's "tcpm-source-psy" power-supply directly via the
+ * generic power_supply API (see the PPS bridge below), so the bespoke
+ * sm5714-typec.h is gone.
  */
-#include "../../usb/misc/sm5714-typec.h"
 #include "../../usb/misc/sm5714-usb-vbus.h"
 
 /* The ported sm_dc CC/CV direct-charging engine (sm5440_direct_charger.c). */
@@ -299,6 +303,21 @@ static const u32 sm5440_dc_step_cond_iin[SM5440_DC_STEP_MAX]     = { 4100, 2000 
  */
 #define SM5440_PROBE_COLLAPSE_MV 200
 
+/*
+ * Mainline-tcpm PPS bridge (Increment-3c, upstream-readiness).  The pump steps
+ * the PPS contract through tcpm's source power-supply.  ONLINE-write states are
+ * private to tcpm.c (no exported header) so they are hand-replicated here.  The
+ * psy name is "tcpm-source-psy-" + dev_name(PDIC) = i2c bus 1 addr 0x33.  The
+ * by-name binding is the string-coupled v1; the by-phandle
+ * devm_power_supply_get_by_reference() form is the upstream-final shape.
+ */
+#define SM5440_TCPM_PSY_OFFLINE		0
+#define SM5440_TCPM_PSY_FIXED_ONLINE	1
+#define SM5440_TCPM_PSY_PROG_ONLINE	2
+#define SM5440_TCPM_SOURCE_PSY		"tcpm-source-psy-1-0033"
+#define SM5440_PPS_KEEPALIVE_MS		5000	/* re-ping < source tPPSTimeout (~12 s) */
+#define SM5440_PPS_KEEPALIVE_SKIP_MS	3000	/* skip the ping if the engine stepped recently */
+
 struct sm5440 {
 	struct device *dev;
 	struct regmap *regmap;
@@ -369,6 +388,22 @@ struct sm5440 {
 	 */
 	int dc_step;		/* current ladder step */
 	int dc_step_iin_cnt;	/* consecutive ticks the advance predicate held (debounce -> SM5440_DC_STEP_IIN_CNT) */
+
+	/*
+	 * Increment-3c: the mainline-tcpm PPS bridge.  tcpm_psy is tcpm's
+	 * "tcpm-source-psy-1-0033" power-supply (acquired by name in probe, ref held
+	 * for our lifetime, put in remove); the PPS contract is stepped through it.
+	 * pps_lock guards the {target,sent} stash that the engine's op-8 and the
+	 * keepalive both touch -- held ONLY for the u32 copy, NEVER across the
+	 * blocking set_property.  pps_active = PROG_ONLINE written + keepalive armed.
+	 */
+	struct power_supply *tcpm_psy;
+	struct delayed_work pps_keepalive;
+	spinlock_t pps_lock;
+	bool pps_active;
+	u32 pps_target_mv, pps_target_ma;	/* desired (the keepalive re-issues this) */
+	u32 pps_sent_mv, pps_sent_ma;		/* last actually sent (skip-unchanged) */
+	unsigned long pps_last_step;		/* jiffies of the last step (keepalive backoff) */
 };
 
 /*
@@ -654,6 +689,211 @@ static void sm5440_pump_disengage_chip(struct sm5440 *chip)
 	regmap_write(chip->regmap, SM5440_REG_ADCCNTL1, SM5440_ADCCNTL1_ENABLE);
 }
 
+/* ===================================================================== *
+ * Increment-3c: the mainline-tcpm PPS bridge.
+ *
+ * The pump steps the PPS contract by writing tcpm's "tcpm-source-psy" through
+ * the generic power_supply API -- no EXPORT_SYMBOL cross-driver coupling (the
+ * upstream-shaped form validated in isolation at sess-219: a userspace echo in
+ * Step 0 + a standalone in-kernel consumer in Step 1).  These helpers replace
+ * the bespoke sm5714_pd_request_voltage() / sm5714_pd_contract_active() hooks.
+ * ===================================================================== */
+
+/*
+ * True iff a PPS-capable PD contract is up.  usb_type == PD_PPS is derived from
+ * the SOURCE's advertised caps (an APDO present), NOT from our contract being on
+ * the PPS APDO right now -- so it reads true with a PPS-capable adapter even at
+ * the 9 V FIXED pre-activation state.  That is exactly the non-circular gate the
+ * supervisor needs: it must pass BEFORE the engine activates PPS.  A non-PPS PD
+ * charger reads plain PD here, so the pump cleanly declines to engage on a
+ * source it could not step.
+ */
+static bool sm5440_pps_contract_active(struct sm5440 *chip)
+{
+	union power_supply_propval pv;
+
+	if (!chip->tcpm_psy)
+		return false;
+	if (power_supply_get_property(chip->tcpm_psy,
+				      POWER_SUPPLY_PROP_USB_TYPE, &pv))
+		return false;
+	if (pv.intval != POWER_SUPPLY_USB_TYPE_PD_PPS)
+		return false;
+	if (power_supply_get_property(chip->tcpm_psy,
+				      POWER_SUPPLY_PROP_ONLINE, &pv))
+		return false;
+	return pv.intval != SM5440_TCPM_PSY_OFFLINE;
+}
+
+/*
+ * Step the PPS contract to {mv, ma}; activate PPS lazily on first use.
+ *
+ * RETURNS 0 for every contract-state outcome -- transient -EAGAIN (AMS in
+ * flight), -EINVAL (momentary out-of-window) and -ETIMEDOUT (a slow PS_RDY on a
+ * still-live contract) from a step are ABSORBED.  The engine treats any < 0 from
+ * op-8 as a FATAL SM_DC_ERR_SEND_PD_MSG and stops the pump, but a transient AMS
+ * hiccup must NOT do that: genuine contract loss is detected out-of-band by the
+ * supervisor's contract-active gate + the dc_monitor, exactly as the bespoke
+ * async hook behaved (it returned < 0 only on genuine loss).  Only -ENODEV (no
+ * psy handle -- a structural condition) is surfaced.
+ *
+ * tcpm exposes V and I as two separate set-properties => two separate PPS AMS
+ * (the bespoke packed both into one RDO).  The CC loop steps voltage and holds
+ * current constant, so CURRENT_NOW is emitted only when ma changes (and at
+ * activation); a steady CC step is then one AMS, matching the bespoke cadence
+ * and halving the Hard-Reset collision surface.  force re-sends VOLTAGE_NOW even
+ * when unchanged (the keepalive path -- a redundant Request is how the source's
+ * tPPSTimeout is refreshed; tcpm has neither an internal keepalive nor an
+ * unchanged-value short-circuit).
+ *
+ * Process / workqueue context only (set_property blocks up to ~10 s).  Never
+ * holds pps_lock across a set_property (tcpm serialises concurrent steppers
+ * internally on its own port lock).
+ */
+static int sm5440_pps_request(struct sm5440 *chip, u32 mv, u32 ma, bool force)
+{
+	union power_supply_propval pv;
+	unsigned long flags;
+	bool need_c, need_v;
+	int ret;
+
+	if (!chip->tcpm_psy)
+		return -ENODEV;
+
+	/*
+	 * Activate PPS once.  -EAGAIN (state != SNK_READY mid-AMS): leave inactive
+	 * and return 0 so the engine is not faulted; the next step (or dc_start's
+	 * VBUS-verify abort + the supervisor's retry) re-attempts.  On success arm
+	 * the keepalive and reset the sent-cache so the first step emits both V + I.
+	 */
+	if (!READ_ONCE(chip->pps_active)) {
+		pv.intval = SM5440_TCPM_PSY_PROG_ONLINE;
+		ret = power_supply_set_property(chip->tcpm_psy,
+						POWER_SUPPLY_PROP_ONLINE, &pv);
+		if (ret) {
+			dev_dbg(chip->dev, "pps: activate deferred (%d)\n", ret);
+			return 0;
+		}
+		spin_lock_irqsave(&chip->pps_lock, flags);
+		chip->pps_active = true;
+		chip->pps_sent_mv = 0;
+		chip->pps_sent_ma = 0;
+		spin_unlock_irqrestore(&chip->pps_lock, flags);
+		schedule_delayed_work(&chip->pps_keepalive,
+				      msecs_to_jiffies(SM5440_PPS_KEEPALIVE_MS));
+		dev_info(chip->dev, "pps: activated (PROG_ONLINE)\n");
+	}
+
+	/*
+	 * Clamp to the live APDO window -- the SOURCE max exposed by tcpm (the sink
+	 * APDO does not throttle a request).  Guards against a current-limited
+	 * adapter, which tcpm would otherwise -EINVAL.
+	 */
+	if (!power_supply_get_property(chip->tcpm_psy,
+				       POWER_SUPPLY_PROP_VOLTAGE_MAX, &pv) &&
+	    pv.intval > 0)
+		mv = min(mv, (u32)pv.intval / 1000);
+	if (!power_supply_get_property(chip->tcpm_psy,
+				       POWER_SUPPLY_PROP_CURRENT_MAX, &pv) &&
+	    pv.intval > 0)
+		ma = min(ma, (u32)pv.intval / 1000);
+
+	/* Align to the PD programmable grids or tcpm silently floors the request. */
+	mv -= mv % RDO_PROG_VOLT_MV_STEP;
+	ma -= ma % RDO_PROG_CURR_MA_STEP;
+
+	/* Decide what to emit + stash the target (the keepalive re-issues it). */
+	spin_lock_irqsave(&chip->pps_lock, flags);
+	chip->pps_target_mv = mv;
+	chip->pps_target_ma = ma;
+	need_c = (ma != chip->pps_sent_ma);
+	need_v = force || (mv != chip->pps_sent_mv);
+	spin_unlock_irqrestore(&chip->pps_lock, flags);
+
+	/*
+	 * Current first (raise the ceiling before a voltage that may need it), then
+	 * voltage.  Every step errno is logged + absorbed -> 0 (see the kerneldoc).
+	 */
+	if (need_c) {
+		pv.intval = ma * 1000;
+		ret = power_supply_set_property(chip->tcpm_psy,
+						POWER_SUPPLY_PROP_CURRENT_NOW, &pv);
+		if (ret) {
+			dev_dbg(chip->dev, "pps: set I=%u mA (%d, absorbed)\n", ma, ret);
+		} else {
+			WRITE_ONCE(chip->pps_sent_ma, ma);
+			/*
+			 * Bump pps_last_step ONLY on a real wire send -- the source's
+			 * tPPSTimeout is refreshed by the Request that just landed.  It
+			 * must NOT be bumped on a C2-suppressed no-op: the engine's
+			 * support_pd_remain re-calls op-8 every CC/CV loop (<3 s) with an
+			 * unchanged target, which C2 swallows; if those bumped the step
+			 * stamp they would keep it younger than KEEPALIVE_SKIP_MS forever,
+			 * starving the keepalive of its only job -> no Request reaches the
+			 * source -> tPPSTimeout -> Hard Reset.  Keyed to wire activity, the
+			 * stamp goes stale during a suppressed hold and the keepalive fires.
+			 */
+			WRITE_ONCE(chip->pps_last_step, jiffies);
+		}
+	}
+	if (need_v) {
+		pv.intval = mv * 1000;
+		ret = power_supply_set_property(chip->tcpm_psy,
+						POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv);
+		if (ret) {
+			dev_dbg(chip->dev, "pps: set V=%u mV (%d, absorbed)\n", mv, ret);
+		} else {
+			WRITE_ONCE(chip->pps_sent_mv, mv);
+			WRITE_ONCE(chip->pps_last_step, jiffies);	/* real send -> refresh the skip window */
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * PPS keepalive: periodically re-Request the held voltage so the source does not
+ * drop the contract on tPPSTimeout (tcpm has no internal keepalive; sess-219
+ * Step 1 proved a 5 s re-ping holds it 80 s+ with zero Hard-Reset).  Skips the
+ * ping when the engine stepped within the last few seconds (an active CC/CV loop
+ * already refreshes the timer) and self-terminates when the contract is gone
+ * (charger unplug).  Self-reschedules while pps_active.  Never holds pps_lock
+ * across the blocking set_property.
+ */
+static void sm5440_pps_keepalive_work(struct work_struct *work)
+{
+	struct sm5440 *chip = container_of(work, struct sm5440, pps_keepalive.work);
+	unsigned long flags;
+	u32 mv, ma;
+
+	if (!READ_ONCE(chip->pps_active))
+		return;
+
+	if (!sm5440_pps_contract_active(chip)) {
+		dev_info(chip->dev, "pps keepalive: contract gone -- stopping\n");
+		WRITE_ONCE(chip->pps_active, false);
+		return;			/* do not reschedule */
+	}
+
+	/* The engine pinged recently: it owns the cadence this window; just rearm. */
+	if (time_before(jiffies, READ_ONCE(chip->pps_last_step) +
+				 msecs_to_jiffies(SM5440_PPS_KEEPALIVE_SKIP_MS)))
+		goto rearm;
+
+	spin_lock_irqsave(&chip->pps_lock, flags);
+	mv = chip->pps_target_mv;
+	ma = chip->pps_target_ma;
+	spin_unlock_irqrestore(&chip->pps_lock, flags);
+
+	sm5440_pps_request(chip, mv, ma, true);		/* force the re-Request */
+	dev_dbg(chip->dev, "pps keepalive: re-Request %u mV\n", mv);
+
+rearm:
+	if (READ_ONCE(chip->pps_active))
+		schedule_delayed_work(&chip->pps_keepalive,
+				      msecs_to_jiffies(SM5440_PPS_KEEPALIVE_MS));
+}
+
 /*
  * Increment-1 guarded manual pump-engage orchestration.  This is NOT the
  * production CC/CV loop (that is the ported sm_dc engine) -- it is a one-shot,
@@ -675,8 +915,9 @@ static void sm5440_pump_disengage_locked(struct sm5440 *chip)
 {
 	sm5440_pump_disengage_chip(chip);		/* op-mode -> CHG_OFF first */
 	chip->pump_engaged = false;
-	sm5714_pd_request_voltage(10000, 3000);		/* restore the 10 V sustain baseline */
+	sm5440_pps_request(chip, 10000, 3000, false);	/* restore the 10 V sustain baseline */
 	sm5714_charger_inhibit_buck(false);		/* re-allow the buck to charge */
+	sm5714_usb_vbus_inhibit_afc_pump(false);	/* pump no longer owns the contract */
 	/* chip->fg is persistent (put once in remove); not released here */
 	dev_info(chip->dev, "pump DISENGAGED (buck re-allowed, PPS restored to 10 V)\n");
 }
@@ -745,7 +986,7 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 {
 	int vbat_mv = 0, target_mv, off_mv, ret;
 
-	if (!sm5714_pd_contract_active()) {
+	if (!sm5440_pps_contract_active(chip)) {
 		dev_warn(chip->dev,
 			 "engage: no PPS contract active -- arm pd_request + plug first\n");
 		return -ENOTCONN;
@@ -757,6 +998,7 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 		dev_warn(chip->dev, "engage: buck inhibit failed (%d)\n", ret);
 		return ret;
 	}
+	sm5714_usb_vbus_inhibit_afc_pump(true);		/* pump owns the contract: stand AFC down */
 
 	/*
 	 * Command the PPS input to ~2*Vcell + IR offset (device-own
@@ -777,7 +1019,7 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 	target_mv = min(target_mv, SM5440_DC_VBUS_OVP_TH - 500);
 	target_mv = max(target_mv, SM5440_TA_MIN_VOLTAGE);
 
-	ret = sm5714_pd_request_voltage(target_mv, 5000);
+	ret = sm5440_pps_request(chip, target_mv, 5000, false);
 	if (ret) {
 		dev_warn(chip->dev, "engage: PPS request %d mV failed (%d)\n",
 			 target_mv, ret);
@@ -832,6 +1074,7 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 
 err_uninhibit:
 	sm5714_charger_inhibit_buck(false);
+	sm5714_usb_vbus_inhibit_afc_pump(false);	/* engage aborted: release the AFC stand-down */
 	return ret;
 }
 
@@ -877,8 +1120,8 @@ static DEVICE_ATTR_WO(pump_test);
  * The 9 sm_dc_ops are thin wrappers over the Inc-1 register helpers above.
  * The engine (sm5440_direct_charger.c) is hardware-agnostic and drives the
  * SM5440 only through this vtable + the single send_power_source_msg seam,
- * which routes the engine's stepped PPS target to the SM5714 sustained PD
- * contract via sm5714_pd_request_voltage().
+ * which routes the engine's stepped PPS target to the tcpm PPS contract via
+ * sm5440_pps_request().
  * ===================================================================== */
 
 /* op 1: ADC read.  Engine units are mV (voltages) / mA (currents). */
@@ -1044,11 +1287,13 @@ static int sm5440_dc_get_dc_loop_status(struct i2c_client *i2c)
 }
 
 /*
- * op 8: THE SEAM.  Route the engine's stepped PPS target to the SM5714
- * sustained contract.  sm5714_pd_request_voltage() sets the commandable target
- * and kicks the keepalive (the sole PD requester); it returns <0 only on
- * genuine contract loss, so a SinkTxOk deferral never surfaces here as a fatal
- * SM_DC_ERR_SEND_PD_MSG -- exactly the behaviour the engine needs.
+ * op 8: THE SEAM.  Route the engine's stepped PPS target to the tcpm contract
+ * via sm5440_pps_request().  ALWAYS returns 0: the engine treats any < 0 here as
+ * a fatal SM_DC_ERR_SEND_PD_MSG and stops the pump, but under tcpm a step can
+ * transiently fail (-EAGAIN mid-AMS, a slow PS_RDY -ETIMEDOUT) on an otherwise
+ * live contract -- those must NOT fault the engine.  Genuine contract loss is
+ * detected out-of-band by the supervisor's contract-active gate + the dc_monitor
+ * (which restore the buck), exactly as the bespoke async hook behaved.
  */
 static int sm5440_dc_send_power_source_msg(struct i2c_client *i2c,
 					   struct sm_dc_power_source_info *ta)
@@ -1056,11 +1301,12 @@ static int sm5440_dc_send_power_source_msg(struct i2c_client *i2c,
 	struct sm5440 *chip = i2c_get_clientdata(i2c);
 	int ret;
 
-	ret = sm5714_pd_request_voltage(ta->v, ta->c);
+	ret = sm5440_pps_request(chip, ta->v, ta->c, false);
 	if (ret)
-		dev_warn(chip->dev, "dc send: PPS %umV/%umA failed (%d)\n",
+		dev_warn(chip->dev,
+			 "dc send: PPS %umV/%umA -> %d (absorbed; not faulting engine)\n",
 			 ta->v, ta->c, ret);
-	return ret;
+	return 0;
 }
 
 /* op 9: SW-OCP trigger (async, device-faithful -- must return 0, see below). */
@@ -1145,13 +1391,13 @@ static void sm5440_dc_ramp_ta_down(struct sm5440 *chip)
 		mv -= SM5440_DC_STOP_STEP_MV;
 		if (mv < SM5440_DC_STOP_TA_MV)
 			mv = SM5440_DC_STOP_TA_MV;
-		if (sm5714_pd_request_voltage(mv, SM5440_DC_STOP_TA_MA))
-			return;			/* contract already gone */
+		if (sm5440_pps_request(chip, mv, SM5440_DC_STOP_TA_MA, false))
+			return;			/* no psy handle */
 		msleep(SM5440_DC_STOP_SETTLE_MS);
 	}
 	/* commit the 9 V target even if we started at/below it (e.g. post-UVLO collapse),
 	 * so the buck never re-enables against a stale/high PPS request. */
-	if (sm5714_pd_request_voltage(SM5440_DC_STOP_TA_MV, SM5440_DC_STOP_TA_MA))
+	if (sm5440_pps_request(chip, SM5440_DC_STOP_TA_MV, SM5440_DC_STOP_TA_MA, false))
 		return;
 
 	/*
@@ -1179,6 +1425,7 @@ static void sm5440_dc_teardown(struct sm5440 *chip)
 		sm_dc_stop_charging(chip->dc);	/* pump op-mode OFF first (reverse-current guard) */
 	sm5440_dc_ramp_ta_down(chip);		/* gentle PPS ramp to 9 V, settle UNLOADED */
 	sm5714_charger_inhibit_buck(false);	/* re-allow the buck (now on a settled 9 V PPS) */
+	sm5714_usb_vbus_inhibit_afc_pump(false);	/* pump no longer owns the contract */
 	/* chip->fg is persistent (put once in remove); not released here */
 	chip->dc_running = false;
 	chip->auto_engaged = false;		/* a fresh run (manual or auto) re-decides ownership */
@@ -1399,9 +1646,9 @@ static void sm5440_dc_done_cb(void *ctx)
 static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptive)
 {
 	struct sm_dc_power_source_info ta = { };
-	int vbat_mv = 0, target_mv, off_mv, vbus_mv, diff, ret, engage_off;
+	int vbat_mv = 0, target_mv, off_mv, vbus_mv, diff, ret, engage_off, i;
 
-	if (!sm5714_pd_contract_active()) {
+	if (!sm5440_pps_contract_active(chip)) {
 		dev_warn(chip->dev, "dc start: no PPS contract -- arm pd_request + plug first\n");
 		return -ENOTCONN;
 	}
@@ -1411,6 +1658,7 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 		dev_warn(chip->dev, "dc start: buck inhibit failed (%d)\n", ret);
 		return ret;
 	}
+	sm5714_usb_vbus_inhibit_afc_pump(true);		/* pump owns the contract: stand AFC down */
 
 	/* chip prep: sw_reset + device-faithful init + continuous ADC, NO op-mode
 	 * (the engine flips op-mode itself in preset's set_charging_enable). */
@@ -1433,28 +1681,42 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	target_mv = min(target_mv, SM5440_DC_VBUS_OVP_TH - 500);
 	target_mv = max(target_mv, SM5440_TA_MIN_VOLTAGE);
 
-	ret = sm5714_pd_request_voltage(target_mv, target_ibus_ma);
+	ret = sm5440_pps_request(chip, target_mv, target_ibus_ma, false);
 	if (ret) {
 		dev_warn(chip->dev, "dc start: PPS request %dmV failed (%d)\n", target_mv, ret);
 		goto err_restore;
 	}
-	dev_info(chip->dev, "dc start: VBAT=%dmV -> PPS target=%dmV; settling 300 ms\n",
+	dev_info(chip->dev, "dc start: VBAT=%dmV -> PPS target=%dmV; settling\n",
 		 vbat_mv, target_mv);
-	msleep(300);
 
+	/*
+	 * Settle + verify VBUS reached the PPS target.  sm5440_get_vbus_uv reads
+	 * the SM5440 ADC, which was sw_reset just above -- its first conversions
+	 * lag the freshly-stepped rail, so a single 300 ms read caught a stale
+	 * pre-step sample (~9 V) and aborted a healthy 10 V engage.  Re-read until
+	 * the ADC tracks the rail (within 10 %) or a generous timeout; the rail
+	 * itself steps fine (confirmed by a userspace PPS sweep).
+	 */
 	vbus_mv = 0;
-	sm5440_get_vbus_uv(chip, &vbus_mv);
-	vbus_mv /= 1000;
-	diff = vbus_mv - target_mv;
-	if (diff < 0)
-		diff = -diff;
+	diff = target_mv;
+	for (i = 0; i < 12; i++) {
+		msleep(150);
+		sm5440_get_vbus_uv(chip, &vbus_mv);
+		vbus_mv /= 1000;
+		diff = vbus_mv - target_mv;
+		if (diff < 0)
+			diff = -diff;
+		if (diff <= target_mv / 10)
+			break;
+	}
 	if (diff > target_mv / 10) {
-		dev_warn(chip->dev, "dc start: VBUS=%dmV not within 10%% of %dmV (PPS not transitioned) -- abort\n",
+		dev_warn(chip->dev, "dc start: VBUS=%dmV not within 10%% of %dmV after settle (PPS not transitioned) -- abort\n",
 			 vbus_mv, target_mv);
 		ret = -EIO;
 		goto err_restore;
 	}
-	dev_info(chip->dev, "dc start: VBUS settled to %dmV -- handing to the engine\n", vbus_mv);
+	dev_info(chip->dev, "dc start: VBUS settled to %dmV (%d reads) -- handing to the engine\n",
+		 vbus_mv, i + 1);
 
 	/*
 	 * TA descriptor: our 10 V APDO (pos 5); the engine ramps within it.  c_max =
@@ -1516,6 +1778,7 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 err_restore:
 	sm5440_dc_ramp_ta_down(chip);		/* gentle PPS restore (same buck handoff as teardown) */
 	sm5714_charger_inhibit_buck(false);
+	sm5714_usb_vbus_inhibit_afc_pump(false);	/* dc start aborted: release the AFC stand-down */
 	return ret;
 }
 
@@ -1579,11 +1842,11 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 		 * dc_test/dc_probe run to the operator (dc_test=0).
 		 */
 		if (chip->auto_engaged &&
-		    (!intent || !sm5714_pd_contract_active() ||
+		    (!intent || !sm5440_pps_contract_active(chip) ||
 		     soc < 0 || soc >= SM5440_AUTO_DISENGAGE_SOC)) {
 			dev_info(chip->dev,
 				 "auto-disengage: intent=%d contract=%d soc=%d%%\n",
-				 intent, sm5714_pd_contract_active(), soc);
+				 intent, sm5440_pps_contract_active(chip), soc);
 			mutex_unlock(&chip->engage_lock);
 			sm5440_dc_stop(chip);
 			return;
@@ -1606,7 +1869,7 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 	 * ceiling (above it a step-0-only engine has nothing to do; the buck owns it).
 	 */
 	if (chip->pump_engaged || chip->dc_err_latched ||
-	    !sm5714_pd_contract_active() ||
+	    !sm5440_pps_contract_active(chip) ||
 	    soc < 0 || soc >= SM5440_AUTO_ENGAGE_SOC) {
 		mutex_unlock(&chip->engage_lock);
 		return;
@@ -1789,11 +2052,13 @@ static int sm5440_probe(struct i2c_client *client)
 	chip->dev = dev;
 	i2c_set_clientdata(client, chip);
 	mutex_init(&chip->engage_lock);
+	spin_lock_init(&chip->pps_lock);
 	INIT_DELAYED_WORK(&chip->pump_monitor, sm5440_pump_monitor_work);
 	INIT_DELAYED_WORK(&chip->ocp_check_work, sm5440_ocp_check_work);
 	INIT_DELAYED_WORK(&chip->dc_monitor, sm5440_dc_monitor_work);
 	INIT_DELAYED_WORK(&chip->probe_work, sm5440_dc_probe_work);
 	INIT_DELAYED_WORK(&chip->auto_engage_work, sm5440_auto_engage_work);
+	INIT_DELAYED_WORK(&chip->pps_keepalive, sm5440_pps_keepalive_work);
 
 	chip->regmap = devm_regmap_init_i2c(client, &sm5440_regmap_config);
 	if (IS_ERR(chip->regmap))
@@ -1815,6 +2080,21 @@ static int sm5440_probe(struct i2c_client *client)
 				     "SM5440 not found (DEVICEID=0x%02x)\n", devid);
 
 	chip->rev_id = SM5440_DEVICEID_REV(devid);
+
+	/*
+	 * Acquire tcpm's source power-supply -- the PPS contract this pump steps.
+	 * Defer until the SM5714 tcpm shim has registered it (the pump's role is to
+	 * drive this contract; without it there is nothing to do).  The ref is held
+	 * for our lifetime and put in remove; EPROBE_DEFER re-probes when the shim
+	 * binds.  DEV-LOOP: unload the pump BEFORE the shim, or a step races a freed
+	 * tcpm_port -- get_by_name pins use_cnt, so the shim's unregister WARN_ON's
+	 * but the psy stays half-alive; the WARN in dmesg is the canary.
+	 */
+	chip->tcpm_psy = power_supply_get_by_name(SM5440_TCPM_SOURCE_PSY);
+	if (!chip->tcpm_psy)
+		return dev_err_probe(dev, -EPROBE_DEFER,
+				     "tcpm source-psy '%s' not ready\n",
+				     SM5440_TCPM_SOURCE_PSY);
 
 	/*
 	 * Enable the on-chip ADC for telemetry only.  We intentionally skip
@@ -1939,6 +2219,19 @@ static void sm5440_remove(struct i2c_client *client)
 
 	if (chip->fg)
 		power_supply_put(chip->fg);	/* the persistent FG handle */
+
+	/*
+	 * PPS bridge teardown: stop the keepalive (it may be mid-step, blocking up to
+	 * ~10 s) then drop our tcpm source-psy ref.  pps_active is cleared FIRST so a
+	 * self-requeue cannot survive the sync-cancel.  The locked teardown above ran
+	 * with pps_active still set, so its ramp steps did not re-activate PPS.  (Per
+	 * the get_by_name lifetime: this runs only when the pump is unloaded before
+	 * the shim, so tcpm_psy is still backed by a live port here.)
+	 */
+	WRITE_ONCE(chip->pps_active, false);
+	cancel_delayed_work_sync(&chip->pps_keepalive);
+	if (chip->tcpm_psy)
+		power_supply_put(chip->tcpm_psy);
 }
 
 static const struct i2c_device_id sm5440_i2c_id[] = {

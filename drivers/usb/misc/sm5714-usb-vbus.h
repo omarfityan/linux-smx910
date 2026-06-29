@@ -23,6 +23,15 @@ int sm5714_usb_vbus_set_host(bool on);
  */
 void sm5714_usb_vbus_inhibit_afc(bool inhibit);
 /*
+ * Independent AFC inhibit for the SM5440 charge-pump.  A SEPARATE bit from
+ * sm5714_usb_vbus_inhibit_afc() (which the tcpm/role driver toggles edge-driven
+ * on PD-RX up/down): the worker skips AFC if EITHER is set.  The pump asserts
+ * this true for its entire engaged window (alongside inhibit_buck(true)) and
+ * clears it on disengage, so a tcpm PD-RX drop on a mid-charge Hard-Reset cannot
+ * re-arm the MUIC's AFC onto the rail the pump is mid-step.
+ */
+void sm5714_usb_vbus_inhibit_afc_pump(bool inhibit);
+/*
  * Inhibit (or re-allow) the SM5714 buck charge path.  The SM5440 charge-pump
  * driver calls this with true before engaging the pump: it disarms the cell
  * charge FET immediately and stops the charging worker re-arming it, so the
@@ -47,6 +56,7 @@ void sm5714_charger_set_dc_notify(void (*notify)(void *ctx, bool dc_intent),
 #else
 static inline int sm5714_usb_vbus_set_host(bool on) { return -ENODEV; }
 static inline void sm5714_usb_vbus_inhibit_afc(bool inhibit) { }
+static inline void sm5714_usb_vbus_inhibit_afc_pump(bool inhibit) { }
 static inline int sm5714_charger_inhibit_buck(bool inhibit) { return -ENODEV; }
 static inline void sm5714_charger_set_dc_notify(
 		void (*notify)(void *ctx, bool dc_intent), void *ctx) { }

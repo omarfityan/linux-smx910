@@ -197,7 +197,8 @@ struct sm5714_vbus {
 	bool charge_cut;		/* hot/cold FET-cut hysteresis */
 	enum sm5714_afc_state afc_state;	/* AFC 9V negotiation (per attach) */
 	int afc_tries;			/* negotiation attempts this attach */
-	bool afc_inhibited;		/* PD contract active: skip AFC (set by the role driver) */
+	bool afc_inhibited;		/* PD-RX up: skip AFC (set by the role/tcpm driver) */
+	bool afc_inhibited_pump;	/* pump owns the contract: skip AFC (set by the SM5440 driver) */
 	bool buck_inhibited;		/* pump engaged: keep the cell FET open (set by the SM5440 driver) */
 	struct power_supply *psy;	/* charger online indicator */
 	struct delayed_work charger_work;	/* input-current management */
@@ -437,6 +438,25 @@ void sm5714_usb_vbus_inhibit_afc(bool inhibit)
 	mutex_unlock(&sm5714_vbus_instance_lock);
 }
 EXPORT_SYMBOL_GPL(sm5714_usb_vbus_inhibit_afc);
+
+/*
+ * Independent AFC inhibit asserted by the SM5440 charge-pump for the whole
+ * engaged window (see the header).  This is a SECOND, separate bit from
+ * afc_inhibited (which the tcpm/role driver toggles edge-driven on PD-RX
+ * up/down): the worker skips AFC if EITHER bit is set.  Keeping them disjoint
+ * means a tcpm PD-RX drop on a mid-charge Hard-Reset -- which clears
+ * afc_inhibited -- cannot re-arm AFC while the pump still owns the contract and
+ * is mid-step.  Idempotent WRITE_ONCE; no refcount (the role driver's calls are
+ * edge-driven and unbalanced, so a shared count would corrupt).
+ */
+void sm5714_usb_vbus_inhibit_afc_pump(bool inhibit)
+{
+	mutex_lock(&sm5714_vbus_instance_lock);
+	if (sm5714_vbus_instance)
+		WRITE_ONCE(sm5714_vbus_instance->afc_inhibited_pump, inhibit);
+	mutex_unlock(&sm5714_vbus_instance_lock);
+}
+EXPORT_SYMBOL_GPL(sm5714_usb_vbus_inhibit_afc_pump);
 
 /*
  * Inhibit / re-allow the buck charge path (see the header).  Unlike AFC-inhibit
@@ -726,6 +746,7 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 	 * safe with 9 V on VBUS).
 	 */
 	if (vbus && !sv->charge_cut && !READ_ONCE(sv->afc_inhibited) &&
+	    !READ_ONCE(sv->afc_inhibited_pump) &&
 	    sv->afc_state == SM5714_AFC_IDLE) {
 		int dev_type2 = i2c_smbus_read_byte_data(sv->muic,
 							 SM5714_MUIC_REG_DEVTYPE2);

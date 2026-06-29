@@ -561,15 +561,21 @@ static irqreturn_t sm5714_tcpc_irq(int irq, void *data)
  * v1 (power-role = sink) so tcpm runs the sink state machine rather than DRP.
  * The sink advertises 5 V and 9 V fixed (PDO1 must be vSafe5V per spec) so tcpm
  * climbs to a 9 V fixed contract -- the charge-pump's input rail -- plus a PPS
- * APDO covering the fast-charge window (PPS stepping for the pump is a later
- * increment).  A software_node lets tcpm register without the dual-role DT
+ * APDO covering the fast-charge window (the SM5440 pump steps it via the tcpm
+ * source-psy).  A software_node lets tcpm register without the dual-role DT
  * connector graph -- tcpm tolerates a missing usb_role_switch (data-role muxing
  * to dwc3 is phase-2).
+ *
+ * The PPS APDO advertises 5 A: the 2:1 charge-pump draws >3 A on the input at
+ * the ~37 W rate, so a 3 A sink APDO would be spec-noncompliant for the real
+ * draw.  This does not itself cap the request -- tcpm bounds a PPS step by the
+ * SOURCE APDO max, never the sink APDO -- but it keeps the sink advertisement
+ * honest for upstream.
  */
 static const u32 sm5714_snk_pdos[] = {
 	PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM | PDO_FIXED_DATA_SWAP),
 	PDO_FIXED(9000, 3000, 0),
-	PDO_PPS_APDO(3300, 11000, 3000),
+	PDO_PPS_APDO(3300, 11000, 5000),
 };
 
 static const struct property_entry sm5714_connector_props[] = {
