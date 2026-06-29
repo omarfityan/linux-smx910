@@ -474,6 +474,15 @@ struct tcpm_port {
 	unsigned int operating_snk_mw;
 	bool update_sink_caps;
 
+	/*
+	 * Set when re-asserting PPS in response to a received, unsolicited
+	 * Source_Capabilities; routes the SNK_NEGOTIATE_PPS_CAPABILITIES
+	 * failure path to a fixed-PDO renegotiation (which answers the
+	 * Source_Capabilities with a Request) instead of going idle in
+	 * SNK_READY.
+	 */
+	bool pps_reassert;
+
 	/* Requested current / voltage to the port partner */
 	u32 req_current_limit;
 	u32 req_supply_voltage;
@@ -3254,8 +3263,32 @@ static void tcpm_pd_data_request(struct tcpm_port *port,
 		} else {
 			if (port->ams == GET_SOURCE_CAPABILITIES)
 				tcpm_ams_finish(port);
-			tcpm_pd_handle_state(port, SNK_NEGOTIATE_CAPABILITIES,
-					     POWER_NEGOTIATION, 0);
+			/*
+			 * If we already hold an explicit PPS contract, an
+			 * unsolicited Source_Capabilities refresh must not
+			 * silently drop us to a fixed PDO.  A default
+			 * renegotiation runs tcpm_pd_select_pdo(), which clears
+			 * pps_data.supported and only ever selects a fixed PDO,
+			 * so it tears down an active PPS contract even when the
+			 * source still advertises the same APDO.  Re-assert the
+			 * held PPS APDO at the current setpoint instead.  If
+			 * re-asserting fails (the refreshed caps no longer
+			 * support the held request), pps_reassert routes the
+			 * failure to a fixed-PDO renegotiation, which still
+			 * answers this Source_Capabilities with a Request --
+			 * rather than going idle in SNK_READY, which the source
+			 * answers with a hard reset.
+			 */
+			if (port->pps_data.active) {
+				port->pps_reassert = true;
+				tcpm_pd_handle_state(port,
+						     SNK_NEGOTIATE_PPS_CAPABILITIES,
+						     POWER_NEGOTIATION, 0);
+			} else {
+				tcpm_pd_handle_state(port,
+						     SNK_NEGOTIATE_CAPABILITIES,
+						     POWER_NEGOTIATION, 0);
+			}
 		}
 		break;
 	case PD_DATA_REQUEST:
@@ -5298,7 +5331,7 @@ static void run_state_machine(struct tcpm_port *port)
 			 * capabilities, and pps is no longer valid, we should
 			 * safely fall back to a standard PDO.
 			 */
-			if (port->update_sink_caps)
+			if (port->update_sink_caps || port->pps_reassert)
 				tcpm_set_state(port, SNK_NEGOTIATE_CAPABILITIES, 0);
 			else
 				tcpm_set_state(port, SNK_READY, 0);
@@ -5306,6 +5339,7 @@ static void run_state_machine(struct tcpm_port *port)
 			tcpm_set_state_cond(port, hard_reset_state(port),
 					    PD_T_SENDER_RESPONSE);
 		}
+		port->pps_reassert = false;
 		break;
 	case SNK_TRANSITION_SINK:
 		/* From the USB PD spec:
