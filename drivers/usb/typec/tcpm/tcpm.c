@@ -4567,6 +4567,7 @@ static void tcpm_reset_port(struct tcpm_port *port)
 	port->attached = false;
 	port->pd_capable = false;
 	port->pps_data.supported = false;
+	port->pps_reassert = false;
 	tcpm_set_partner_usb_comm_capable(port, false);
 
 	/*
@@ -5458,6 +5459,7 @@ static void run_state_machine(struct tcpm_port *port)
 		break;
 	case HARD_RESET_START:
 		port->sink_cap_done = false;
+		port->pps_reassert = false;
 		if (port->tcpc->enable_frs)
 			port->tcpc->enable_frs(port->tcpc, false);
 		port->hard_reset_count++;
