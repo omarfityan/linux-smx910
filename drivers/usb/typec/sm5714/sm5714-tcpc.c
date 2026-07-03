@@ -290,15 +290,37 @@ static int sm5714_tcpc_set_cc(struct tcpc_dev *tcpc, enum typec_cc_status cc)
  * Sink-only v1: present Rd and let the chip self-detect the attach -- it holds
  * the commanded CC mode across the whole plug cycle (no per-detach re-assert), as
  * proven on-device.  A dual-role / source port is phase-2.
+ *
+ * The autonomous chip latches an attach only on a physical CC edge (INT1_ATTACH)
+ * and then HOLDS that state for the whole plug cycle -- it does NOT re-emit the
+ * edge when tcpm merely restarts toggling.  So whenever tcpm (re)enters TOGGLING
+ * while a partner is already physically attached -- at boot with a charger already
+ * inserted, or on the SNK_UNATTACHED->TOGGLING leg of a hard-reset / port-reset /
+ * error-recovery -- no fresh edge ever arrives and tcpm would starve in TOGGLING
+ * at online=0 until a physical replug (charging silently degrades to the AFC/buck
+ * fallback).  Synthesize the missing edge from the chip's held attach status so
+ * tcpm re-reads CC (get_cc) and proceeds to attach.  tcpm_cc_change() only queues
+ * an event (leaf spinlock, no port lock), so it is safe to call here.
  */
 static int sm5714_tcpc_start_toggling(struct tcpc_dev *tcpc,
 				      enum typec_port_type port_type,
 				      enum typec_cc_status cc)
 {
-	if (port_type == TYPEC_PORT_SRC)
-		return sm5714_tcpc_set_cc(tcpc, TYPEC_CC_RP_DEF);
+	struct sm5714_tcpc *st = tcpc_to_sm5714(tcpc);
+	int ret, status1;
 
-	return sm5714_tcpc_set_cc(tcpc, TYPEC_CC_RD);
+	ret = sm5714_tcpc_set_cc(tcpc, port_type == TYPEC_PORT_SRC ?
+					TYPEC_CC_RP_DEF : TYPEC_CC_RD);
+	if (ret)
+		return ret;
+
+	mutex_lock(&st->lock);
+	status1 = sm5714_read(st, SM5714_REG_STATUS1);
+	mutex_unlock(&st->lock);
+	if (st->port && status1 >= 0 && (status1 & SM5714_STATUS1_ATTACH))
+		tcpm_cc_change(st->port);
+
+	return 0;
 }
 
 /* Orientation is resolved in hardware (CC_STATUS flip bit); nothing to set. */
