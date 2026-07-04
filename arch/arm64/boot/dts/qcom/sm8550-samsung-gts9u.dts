@@ -17,6 +17,7 @@
 
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include <dt-bindings/usb/pd.h>
 #include "sm8550.dtsi"
 #include "pm8550.dtsi"
 #include "pm8550vs.dtsi"
@@ -1509,6 +1510,27 @@
 			power-role = "dual";
 			data-role = "dual";
 			try-power-role = "sink";
+
+			/*
+			 * PD capabilities the tcpm policy engine
+			 * (drivers/usb/typec/tcpm) reads from this connector
+			 * node.  A DRP port must advertise BOTH source and sink.
+			 * source-pdos: 5 V only, 900 mA -- the SM5714 OTG boost's
+			 * hardware current limit (sm5714-usb-vbus.c BSTCNTL1); a
+			 * higher advertisement would be electrically dishonest.
+			 * sink-pdos: 5 V + 9 V fixed (the charge-pump input rail)
+			 * plus a PPS APDO spanning the fast-charge window.
+			 */
+			source-pdos = <PDO_FIXED(5000, 900,
+						 PDO_FIXED_DUAL_ROLE |
+						 PDO_FIXED_USB_COMM |
+						 PDO_FIXED_DATA_SWAP)>;
+			sink-pdos = <PDO_FIXED(5000, 3000,
+					       PDO_FIXED_USB_COMM |
+					       PDO_FIXED_DATA_SWAP)
+				     PDO_FIXED(9000, 3000, 0)
+				     PDO_PPS_APDO(3300, 11000, 5000)>;
+			op-sink-microwatt = <2500000>;
 
 			port {
 				sm5714_hs_ep: endpoint {

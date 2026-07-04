@@ -9,16 +9,15 @@
  * struct tcpc_dev with callbacks tcpm calls "down", and feeds tcpm's state
  * machine by calling the tcpm_*() event functions "up" from the chip interrupt.
  *
- * This is the SINK-ONLY first slice of the tcpm port (the bespoke role driver in
+ * This is the DUAL-ROLE (DRP) tcpm port (the bespoke role driver in
  * drivers/usb/misc/sm5714-typec.c carried the whole USB-PD policy in software;
  * tcpm replaces that policy, and the shim keeps only the chip transport and CC/
- * role control).  A live on-device experiment confirmed the autonomous chip can
- * be held as a full-time passive sink under external control: forcing manual
- * sink (CC_CNTL1=0x45) detected attach/detach, resolved orientation, and ran the
- * full PD message FIFO -- the primitives tcpm needs.  Dual-role toggling, source/
- * Rp and OTG-VBUS sourcing are a later staged increment; this slice deliberately
- * regresses them so tcpm can drive a sink contract end-to-end and what breaks
- * under tcpm policy can be catalogued.
+ * role control).  The autonomous chip is programmed for hardware DRP toggling
+ * (CC_CNTL1=0x40) so it resolves either role: a source on the cable -> we sink
+ * (charge), a sink on the cable -> we source 5 V and enumerate as a USB host.
+ * tcpm reads the port capability, the source/sink PDOs and the dwc3
+ * usb_role_switch from the device tree's "connector" node and drives the
+ * data-role mux + the power contract; the shim provides the chip transport.
  *
  * Every register value is transcribed from the device's own downstream driver
  * (drivers/usb/typec/sm/sm5714/{sm5714_typec.c,sm5714_pd.c}) -- the authority for
@@ -93,7 +92,7 @@
 #define SM5714_REG_CC_CNTL1		0x29
 #define SM5714_CC_CNTL1_DRP		0x40	/* autonomous dual-role toggling */
 #define SM5714_CC_CNTL1_SINK		0x45	/* present Rd (manual sink) */
-#define SM5714_CC_CNTL1_SOURCE		0x49	/* present Rp (manual source; phase-2) */
+#define SM5714_CC_CNTL1_SOURCE		0x49	/* present Rp (manual source) */
 #define SM5714_REG_CC_CNTL3		0x2b
 #define SM5714_CC_CNTL3_BASE		0x80	/* the base the manual modes pair with */
 
@@ -144,7 +143,7 @@ struct sm5714_tcpc {
 	struct i2c_client *client;
 	struct tcpm_port *port;
 	struct tcpc_dev tcpc;
-	struct fwnode_handle *fwnode;	/* the synthetic sink-caps connector node */
+	struct fwnode_handle *fwnode;	/* the DT "connector" child node (DRP caps + graph) */
 	struct mutex lock;		/* serializes the i2c register sequences */
 	bool pd_rx_enabled;		/* set_pd_rx state; gates INT4 handling */
 };
@@ -242,7 +241,7 @@ static int sm5714_tcpc_get_cc(struct tcpc_dev *tcpc,
 			break;
 		}
 		break;
-	case SM5714_CC_ATTACH_SNK:		/* a sink is on the cable (phase-2 source) */
+	case SM5714_CC_ATTACH_SNK:		/* a sink is on the cable -> we source */
 		active = TYPEC_CC_RD;
 		break;
 	default:				/* audio / unknown -> leave Open */
@@ -270,7 +269,7 @@ static int sm5714_tcpc_set_cc(struct tcpc_dev *tcpc, enum typec_cc_status cc)
 		break;
 	case TYPEC_CC_RP_DEF:
 	case TYPEC_CC_RP_1_5:
-	case TYPEC_CC_RP_3_0:			/* source: present Rp (phase-2) */
+	case TYPEC_CC_RP_3_0:			/* source: present Rp */
 		cntl1 = SM5714_CC_CNTL1_SOURCE;
 		break;
 	case TYPEC_CC_OPEN:
@@ -287,15 +286,19 @@ static int sm5714_tcpc_set_cc(struct tcpc_dev *tcpc, enum typec_cc_status cc)
 }
 
 /*
- * Sink-only v1: present Rd and let the chip self-detect the attach -- it holds
- * the commanded CC mode across the whole plug cycle (no per-detach re-assert), as
- * proven on-device.  A dual-role / source port is phase-2.
+ * Begin toggling for the requested port type.  A DRP port must be able to resolve
+ * EITHER role, so program the chip's autonomous hardware dual-role toggling (0x40)
+ * -- pinning a manual Rd (0x45) would only ever detect a source on the cable, and
+ * a peripheral (the host case) would never attach.  A sink- or source-only port
+ * pins the corresponding manual mode.  The chip resolves the role in hardware;
+ * get_cc reports it and tcpm drives the matching contract.  This mirrors the
+ * device's own bespoke driver, which runs the chip in 0x40 full-time.
  *
  * The autonomous chip latches an attach only on a physical CC edge (INT1_ATTACH)
  * and then HOLDS that state for the whole plug cycle -- it does NOT re-emit the
  * edge when tcpm merely restarts toggling.  So whenever tcpm (re)enters TOGGLING
  * while a partner is already physically attached -- at boot with a charger already
- * inserted, or on the SNK_UNATTACHED->TOGGLING leg of a hard-reset / port-reset /
+ * inserted, or on the UNATTACHED->TOGGLING leg of a hard-reset / port-reset /
  * error-recovery -- no fresh edge ever arrives and tcpm would starve in TOGGLING
  * at online=0 until a physical replug (charging silently degrades to the AFC/buck
  * fallback).  Synthesize the missing edge from the chip's held attach status so
@@ -308,15 +311,27 @@ static int sm5714_tcpc_start_toggling(struct tcpc_dev *tcpc,
 {
 	struct sm5714_tcpc *st = tcpc_to_sm5714(tcpc);
 	int ret, status1;
+	u8 cntl1;
 
-	ret = sm5714_tcpc_set_cc(tcpc, port_type == TYPEC_PORT_SRC ?
-					TYPEC_CC_RP_DEF : TYPEC_CC_RD);
+	switch (port_type) {
+	case TYPEC_PORT_SRC:
+		cntl1 = SM5714_CC_CNTL1_SOURCE;
+		break;
+	case TYPEC_PORT_SNK:
+		cntl1 = SM5714_CC_CNTL1_SINK;
+		break;
+	default:				/* TYPEC_PORT_DRP */
+		cntl1 = SM5714_CC_CNTL1_DRP;
+		break;
+	}
+
+	mutex_lock(&st->lock);
+	ret = sm5714_write(st, SM5714_REG_CC_CNTL1, cntl1);
+	status1 = ret ? ret : sm5714_read(st, SM5714_REG_STATUS1);
+	mutex_unlock(&st->lock);
 	if (ret)
 		return ret;
 
-	mutex_lock(&st->lock);
-	status1 = sm5714_read(st, SM5714_REG_STATUS1);
-	mutex_unlock(&st->lock);
 	if (st->port && status1 >= 0 && (status1 & SM5714_STATUS1_ATTACH))
 		tcpm_cc_change(st->port);
 
@@ -330,15 +345,24 @@ static int sm5714_tcpc_set_polarity(struct tcpc_dev *tcpc,
 	return 0;
 }
 
-/* VCONN sourcing is a source-role concern; no-op for the sink-only slice. */
+/*
+ * VCONN sourcing (powering an e-marked cable's Ra) is deliberately not driven
+ * here: the device's own bespoke DRP driver never sourced VCONN either -- the
+ * autonomous chip manages the cable in hardware -- and a basic USB2 host with a
+ * passive cable does not need it.  Report success so tcpm's source path proceeds;
+ * a discrete VCONN-enable is a later refinement.
+ */
 static int sm5714_tcpc_set_vconn(struct tcpc_dev *tcpc, bool on)
 {
 	return 0;
 }
 
 /*
- * OTG VBUS sourcing is owned by the SM5714 charger (host role).  The sink slice
- * only ever sees set_vbus(false); route to the proven OTG path defensively.
+ * Source (on) or cut (off) the 5 V OTG boost the SM5714 charger owns.  As a DRP
+ * source tcpm calls set_vbus(true) once a sink is on the cable; the boost sources
+ * 5 V at up to 900 mA (its hardware current limit -- the connector's source PDO
+ * advertises to match).  set_vbus(false) cuts it on any move away from source.
+ * -ENODEV (the VBUS driver has not probed) is benign for a sink contract.
  */
 static int sm5714_tcpc_set_vbus(struct tcpc_dev *tcpc, bool on, bool charge)
 {
@@ -579,35 +603,13 @@ static irqreturn_t sm5714_tcpc_irq(int irq, void *data)
 /* ---- probe / remove --------------------------------------------------------- */
 
 /*
- * The synthetic connector node tcpm reads its capabilities from.  Sink-only for
- * v1 (power-role = sink) so tcpm runs the sink state machine rather than DRP.
- * The sink advertises 5 V and 9 V fixed (PDO1 must be vSafe5V per spec) so tcpm
- * climbs to a 9 V fixed contract -- the charge-pump's input rail -- plus a PPS
- * APDO covering the fast-charge window (the SM5440 pump steps it via the tcpm
- * source-psy).  A software_node lets tcpm register without the dual-role DT
- * connector graph -- tcpm tolerates a missing usb_role_switch (data-role muxing
- * to dwc3 is phase-2).
- *
- * The PPS APDO advertises 5 A: the 2:1 charge-pump draws >3 A on the input at
- * the ~37 W rate, so a 3 A sink APDO would be spec-noncompliant for the real
- * draw.  This does not itself cap the request -- tcpm bounds a PPS step by the
- * SOURCE APDO max, never the sink APDO -- but it keeps the sink advertisement
- * honest for upstream.
+ * tcpm reads the port capability (DRP), the source/sink PDOs and the dwc3
+ * usb_role_switch from the "connector" child node of the PDIC in the device tree
+ * (arch/arm64/boot/dts/qcom/sm8550-samsung-gts9u.dts) -- the single source of
+ * truth.  The OF-graph endpoint in that node links to the dwc3 HS port, which is
+ * how tcpm finds the role switch (fwnode_usb_role_switch_get) and drives the
+ * host<->gadget data mux itself; the source/sink-pdos give it the power contract.
  */
-static const u32 sm5714_snk_pdos[] = {
-	PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM | PDO_FIXED_DATA_SWAP),
-	PDO_FIXED(9000, 3000, 0),
-	PDO_PPS_APDO(3300, 11000, 5000),
-};
-
-static const struct property_entry sm5714_connector_props[] = {
-	PROPERTY_ENTRY_STRING("data-role", "device"),
-	PROPERTY_ENTRY_STRING("power-role", "sink"),
-	PROPERTY_ENTRY_U32_ARRAY("sink-pdos", sm5714_snk_pdos),
-	PROPERTY_ENTRY_U32("op-sink-microwatt", 2500000),
-	{ }
-};
-
 static int sm5714_tcpc_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -625,10 +627,10 @@ static int sm5714_tcpc_probe(struct i2c_client *client)
 	mutex_init(&st->lock);
 	i2c_set_clientdata(client, st);
 
-	st->fwnode = fwnode_create_software_node(sm5714_connector_props, NULL);
-	if (IS_ERR(st->fwnode))
-		return dev_err_probe(dev, PTR_ERR(st->fwnode),
-				     "failed to create connector node\n");
+	st->fwnode = device_get_named_child_node(dev, "connector");
+	if (!st->fwnode)
+		return dev_err_probe(dev, -ENODEV,
+				     "no \"connector\" child node in the device tree\n");
 
 	st->tcpc.fwnode = st->fwnode;
 	st->tcpc.init = sm5714_tcpc_init;
@@ -675,11 +677,11 @@ static int sm5714_tcpc_probe(struct i2c_client *client)
 
 	enable_irq(client->irq);
 
-	dev_info(dev, "SM5714 tcpm shim ready (sink-only first slice)\n");
+	dev_info(dev, "SM5714 tcpm shim ready (dual-role)\n");
 	return 0;
 
 err_fwnode:
-	fwnode_remove_software_node(st->fwnode);
+	fwnode_handle_put(st->fwnode);
 	return ret;
 }
 
@@ -698,7 +700,7 @@ static void sm5714_tcpc_remove(struct i2c_client *client)
 	mutex_unlock(&st->lock);
 	sm5714_usb_vbus_inhibit_afc(false);
 
-	fwnode_remove_software_node(st->fwnode);
+	fwnode_handle_put(st->fwnode);
 }
 
 /*
@@ -724,6 +726,6 @@ static struct i2c_driver sm5714_tcpc_driver = {
 };
 module_i2c_driver(sm5714_tcpc_driver);
 
-MODULE_DESCRIPTION("SM5714 USB Type-C Port Controller shim for tcpm (sink-only)");
+MODULE_DESCRIPTION("SM5714 USB Type-C Port Controller shim for tcpm (dual-role)");
 MODULE_AUTHOR("ubuntu-tab project");
 MODULE_LICENSE("GPL");
