@@ -28,12 +28,14 @@
 #include <linux/bitops.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/usb/pd.h>
 #include <linux/usb/tcpm.h>
 #include <linux/usb/typec.h>
+#include <linux/workqueue.h>
 
 /* The SM5714 VBUS host/OTG + Samsung-AFC inhibit interface lives with the bespoke
  * cluster for now; the in-tree landing relocates this header (a mechanical move). */
@@ -95,6 +97,8 @@
 #define SM5714_CC_CNTL1_SOURCE		0x49	/* present Rp (manual source) */
 #define SM5714_REG_CC_CNTL3		0x2b
 #define SM5714_CC_CNTL3_BASE		0x80	/* the base the manual modes pair with */
+#define SM5714_CC_CNTL3_ATTACH_UFP	0x82	/* base | manual-attach(UFP): force a sink re-attach */
+#define SM5714_CC_CNTL3_OPEN		0x88	/* base | detach-bit: float CC (real electrical open) */
 
 /*
  * USB-PD protocol-layer window.  The PHY does CRC32 / GoodCRC / retry / message-
@@ -146,6 +150,22 @@ struct sm5714_tcpc {
 	struct fwnode_handle *fwnode;	/* the DT "connector" child node (DRP caps + graph) */
 	struct mutex lock;		/* serializes the i2c register sequences */
 	bool pd_rx_enabled;		/* set_pd_rx state; gates INT4 handling */
+
+	/*
+	 * Post-hard-reset recovery.  When a mid-charge hard reset drops the PD
+	 * contract, tcpm re-enters TOGGLING while the chip still holds the (now
+	 * stale) attach; start_toggling synthesizes the missing edge so tcpm
+	 * re-attaches -- but the source, never having seen us physically detach,
+	 * can stay latched out of PD, VBUS-cycling us into a ~1.37 s attach/detach
+	 * limit cycle that never re-charges.  We detect that cycle (repeated held-
+	 * attach start_toggling in quick succession) and break it by presenting a
+	 * real electrical open (CC_CNTL3 detach bit), the way the device's own
+	 * driver forces a detach, so the source resyncs; reattach_work then restores
+	 * the sink termination for a clean fresh attach.
+	 */
+	unsigned long last_toggle;	/* jiffies of the last held-attach start_toggling */
+	int stale_toggle_count;		/* consecutive rapid held-attach re-toggles */
+	struct delayed_work reattach_work;	/* restores CC after a forced detach */
 };
 
 #define tcpc_to_sm5714(p) container_of(p, struct sm5714_tcpc, tcpc)
@@ -285,6 +305,42 @@ static int sm5714_tcpc_set_cc(struct tcpc_dev *tcpc, enum typec_cc_status cc)
 	return ret;
 }
 
+/* Recovery tunables for the post-hard-reset attach/detach limit cycle. */
+#define SM5714_STALE_TOGGLE_MS		2500	/* window that counts re-toggles as "rapid" */
+#define SM5714_STALE_TOGGLE_LIMIT	2	/* break the cycle on the 3rd rapid re-toggle */
+#define SM5714_REATTACH_MS		700	/* open-window before restoring the termination */
+
+/*
+ * Lift the forced detach that broke the limit cycle by forcing a sink re-attach
+ * the way the device's own driver does -- set_attach(UFP): CC_CNTL1 = Rd (0x45)
+ * then CC_CNTL3 = manual-attach (0x82).  The bare base (0x80) does NOT re-arm CC
+ * detection after a float (verified on-device: it stayed detached); the 0x82
+ * manual-attach bit actively re-presents Rd and latches the source, yielding a
+ * fresh attach edge that tcpm negotiates cleanly.  Runs SM5714_REATTACH_MS after
+ * the open -- long enough for the source to see the detach, drop VBUS and reset
+ * its PD state.  If the chip has already latched the attach, hand tcpm the edge.
+ */
+static void sm5714_tcpc_reattach_work(struct work_struct *work)
+{
+	struct sm5714_tcpc *st = container_of(to_delayed_work(work),
+					      struct sm5714_tcpc, reattach_work);
+	int status1;
+
+	mutex_lock(&st->lock);
+	sm5714_write(st, SM5714_REG_CC_CNTL1, SM5714_CC_CNTL1_SINK);
+	sm5714_write(st, SM5714_REG_CC_CNTL3, SM5714_CC_CNTL3_ATTACH_UFP);
+	status1 = sm5714_read(st, SM5714_REG_STATUS1);
+	mutex_unlock(&st->lock);
+
+	dev_info(&st->client->dev,
+		 "post-hard-reset recovery: CC termination restored%s\n",
+		 (status1 >= 0 && (status1 & SM5714_STATUS1_ATTACH)) ?
+		 " (re-attaching)" : "");
+
+	if (st->port && status1 >= 0 && (status1 & SM5714_STATUS1_ATTACH))
+		tcpm_cc_change(st->port);
+}
+
 /*
  * Begin toggling for the requested port type.  A DRP port must be able to resolve
  * EITHER role, so program the chip's autonomous hardware dual-role toggling (0x40)
@@ -310,6 +366,7 @@ static int sm5714_tcpc_start_toggling(struct tcpc_dev *tcpc,
 				      enum typec_cc_status cc)
 {
 	struct sm5714_tcpc *st = tcpc_to_sm5714(tcpc);
+	bool held, cycle = false;
 	int ret, status1;
 	u8 cntl1;
 
@@ -326,13 +383,46 @@ static int sm5714_tcpc_start_toggling(struct tcpc_dev *tcpc,
 	}
 
 	mutex_lock(&st->lock);
-	ret = sm5714_write(st, SM5714_REG_CC_CNTL1, cntl1);
-	status1 = ret ? ret : sm5714_read(st, SM5714_REG_STATUS1);
+	status1 = sm5714_read(st, SM5714_REG_STATUS1);
+	held = status1 >= 0 && (status1 & SM5714_STATUS1_ATTACH);
+
+	/*
+	 * A lone held-attach toggle is the normal missing edge (boot-with-charger,
+	 * or a single hard-reset recovery leg): synthesize it below.  A rapid burst
+	 * of them is the post-hard-reset limit cycle -- on the LIMIT-th, break it by
+	 * presenting a real electrical open (CC_CNTL3 detach bit) instead of
+	 * re-toggling, so the still-attached source sees us detach and resyncs;
+	 * reattach_work restores the termination shortly after for a clean attach.
+	 */
+	if (held) {
+		if (time_before(jiffies, st->last_toggle +
+				msecs_to_jiffies(SM5714_STALE_TOGGLE_MS)))
+			st->stale_toggle_count++;
+		else
+			st->stale_toggle_count = 0;
+		st->last_toggle = jiffies;
+		cycle = st->stale_toggle_count >= SM5714_STALE_TOGGLE_LIMIT;
+	}
+
+	if (cycle) {
+		ret = sm5714_write(st, SM5714_REG_CC_CNTL3, SM5714_CC_CNTL3_OPEN);
+		st->stale_toggle_count = 0;
+	} else {
+		ret = sm5714_write(st, SM5714_REG_CC_CNTL1, cntl1);
+	}
 	mutex_unlock(&st->lock);
 	if (ret)
 		return ret;
 
-	if (st->port && status1 >= 0 && (status1 & SM5714_STATUS1_ATTACH))
+	if (cycle) {
+		dev_info(&st->client->dev,
+			 "post-hard-reset limit cycle detected -- forcing a CC detach to resync the source\n");
+		mod_delayed_work(system_wq, &st->reattach_work,
+				 msecs_to_jiffies(SM5714_REATTACH_MS));
+		return 0;
+	}
+
+	if (held && st->port)
 		tcpm_cc_change(st->port);
 
 	return 0;
@@ -625,6 +715,7 @@ static int sm5714_tcpc_probe(struct i2c_client *client)
 
 	st->client = client;
 	mutex_init(&st->lock);
+	INIT_DELAYED_WORK(&st->reattach_work, sm5714_tcpc_reattach_work);
 	i2c_set_clientdata(client, st);
 
 	st->fwnode = device_get_named_child_node(dev, "connector");
@@ -691,6 +782,7 @@ static void sm5714_tcpc_remove(struct i2c_client *client)
 
 	disable_irq(client->irq);
 	tcpm_unregister_port(st->port);
+	cancel_delayed_work_sync(&st->reattach_work);
 
 	/* Drop PD, return CC to autonomous DRP, and release the AFC inhibit so a
 	 * re-bind (or the bespoke driver) starts from the chip's neutral state. */
