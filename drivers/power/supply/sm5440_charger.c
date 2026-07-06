@@ -226,7 +226,16 @@
  */
 #define SM5440_AUTO_ENGAGE_SOC		62	/* engage only when SoC < this (device-own step-0 start) */
 #define SM5440_AUTO_DISENGAGE_SOC	95	/* disengage at/above = device-own dchg_end_soc; buck finishes 95->100 */
-#define SM5440_AUTO_ENGAGE_CI_GL	4500	/* step-0 IBUS target = val_iout[0]/2 (voltage-caps to ~3900 at path-R) */
+#define SM5440_AUTO_ENGAGE_CI_GL	4000	/* step-0 IBUS target.  The device-own step-0 is val_iout[0]/2 =
+						 * 4500, but mainline tcpm sends a Hard Reset when a PPS Request
+						 * cannot PS_RDY within tPSTransition (500 ms): the source
+						 * current-limits to ~3965 mA at the ~10.5 V ceiling, so a request
+						 * it cannot reach (4500) trips the timer (the bespoke PD stack
+						 * tolerates the missing PS_RDY; tcpm does not).  The engine walks
+						 * the request to ci_gl + 200, so cap ci_gl to keep the peak request
+						 * (4200) below the ~4450 last-good PS_RDY boundary; this still
+						 * DELIVERS ~3900 mA (the source's real ceiling), matching the
+						 * bespoke's delivered current without the reset. */
 #define SM5440_AUTO_RETRY_MAX		3	/* consecutive engage failures before latching off until replug */
 
 /*
