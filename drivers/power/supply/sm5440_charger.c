@@ -242,6 +242,34 @@
 #define SM5440_AUTO_RETRY_MAX		3	/* consecutive engage failures before latching off until replug */
 
 /*
+ * Build-2b: re-engage-on-HRST recovery.  A real Hard Reset drops the PPS contract
+ * to a FIXED PDO (online 2->1) and stops the engine; the keepalive gives up on the
+ * contract loss and nothing re-drives PROG_ONLINE, so the pump sticks on the buck
+ * (sess-233 §9).  dc_monitor arms the recovery worker on a mid-charge (non-topoff)
+ * engine stop; the worker re-activates PPS and re-engages, bounded by the SAME
+ * 3-strike dc_retry_cnt latch.  The poll window MUST exceed the SM5714 shim's
+ * worst-case CC-open->reattach recovery (sess-231: ~1.37 s/leg limit cycle,
+ * cycle-break ~2.5-4 s) so a still-reattaching source counts as a WAIT, not a
+ * strike -- else we latch off a source the shim would have brought back.
+ */
+#define SM5440_REENGAGE_DELAY_MS	1000	/* initial beat after the HRST teardown (let tcpm start its recovery) */
+#define SM5440_REENGAGE_POLL_MS		500	/* PPS re-activation poll cadence */
+#define SM5440_REENGAGE_POLL_TRIES	16	/* * 500 ms = 8 s window (> the shim's worst-case reattach) */
+#define SM5440_REENGAGE_GAP_MS		2000	/* gap between full recovery attempts (each attempt = one strike) */
+#define SM5440_REENGAGE_PPS_MV		10000	/* PPS re-activation target (the 10 V sustain baseline) */
+#define SM5440_REENGAGE_PPS_MA		3000	/* PPS re-activation current ceiling */
+
+/*
+ * TEST-ONLY (Build-2b validation): the HRST-injection over-request current.  4500
+ * mA = the device-own step-0 input (val_iout[0]/2) -- within the source's APDO (so
+ * pps_request does not clamp it away) but ABOVE the PS_RDY boundary at any VBAT the
+ * run reaches, so a held request at this value provokes a real tcpm-sent Hard Reset
+ * (the sess-233 mechanism).  REMOVE this and its sysfs knob before any production
+ * or upstream build.
+ */
+#define SM5440_HRST_INJECT_MA		4500
+
+/*
  * The device-own ladder table (gts9u DT battery,dc_step_chg_*; see the comment
  * above for the encoding + provenance).  Index = step 0..SM5440_DC_STEP_MAX;
  * cond_iin has one fewer entry (the last step has no "next").
@@ -419,6 +447,19 @@ struct sm5440 {
 	bool auto_engaged;	/* this dc run was started by the supervisor (gates auto-disengage) */
 	bool dc_err_latched;	/* engage failed SM5440_AUTO_RETRY_MAX times -- stop until charger replug */
 	int dc_retry_cnt;	/* consecutive auto-engage failures (device-own dc_retry_cnt analog) */
+
+	/*
+	 * Build-2b: re-engage-on-HRST recovery.  dc_done marks a benign engine
+	 * topoff (done_cb) so dc_monitor does NOT mistake it for an HRST;
+	 * dc_recover_armed gates the recovery worker; dc_inject_hrst is the
+	 * TEST-ONLY over-request arming (see the sysfs knob).  All accessed under
+	 * engage_lock except the two READ_ONCE/WRITE_ONCE bools crossed between the
+	 * engine done_cb / the sysfs write and dc_monitor.
+	 */
+	struct delayed_work dc_reengage_work;
+	bool dc_done;		/* engine self-DONEd (topoff) -- suppress recovery */
+	bool dc_recover_armed;	/* an HRST teardown armed the recovery worker */
+	bool dc_inject_hrst;	/* TEST-ONLY: dc_monitor holds an over-request to provoke an HRST */
 
 	/*
 	 * Increment-3b-4: the 3-step ladder state.  dc_step is the current step
@@ -1509,8 +1550,38 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 
 	/* engine left the active states (CHG_OFF/ERR/EOC) -> restore the buck. */
 	if (state < SM_DC_CHECK_VBAT) {
-		dev_warn(chip->dev, "dc engine stopped (state=%d) -> restoring buck\n", state);
-		sm5440_dc_teardown(chip);
+		bool was_auto = chip->auto_engaged;	/* capture before teardown clears it */
+		int rsoc = sm5440_read_soc(chip);
+		/*
+		 * Build-2b discriminator.  Only two things reach here: a benign engine
+		 * self-topoff (done_cb -> CHG_OFF; the SoC-95 auto-disengage goes through
+		 * dc_stop, which sync-cancels this monitor first, so it never reaches
+		 * here) and a mid-charge fault/HRST (-> SM_DC_ERR).  dc_done separates
+		 * them robustly (no dependence on the exact topoff SoC); soc>=disengage is
+		 * belt-and-suspenders.
+		 */
+		bool benign = READ_ONCE(chip->dc_done) ||
+			      (rsoc >= 0 && rsoc >= SM5440_AUTO_DISENGAGE_SOC);
+
+		WRITE_ONCE(chip->dc_inject_hrst, false);	/* TEST: the injection (if any) has now fired */
+		dev_warn(chip->dev, "dc engine stopped (state=%d, %s) -> restoring buck\n",
+			 state, benign ? "benign topoff" : "HRST/fault");
+		sm5440_dc_teardown(chip);		/* clears dc_running + auto_engaged */
+
+		/*
+		 * A supervisor-owned run that stopped mid-charge without a topoff = an
+		 * HRST/fault teardown -> arm the recovery worker (re-activate PPS +
+		 * re-engage), bounded by the 3-strike latch.  A benign topoff, a manual
+		 * dc_test run (!was_auto), or an already-latched state is left alone.
+		 */
+		if (was_auto && !benign && !chip->dc_err_latched) {
+			chip->dc_recover_armed = true;
+			mod_delayed_work(system_long_wq, &chip->dc_reengage_work,
+					 msecs_to_jiffies(SM5440_REENGAGE_DELAY_MS));
+			dev_info(chip->dev,
+				 "reengage: armed (was_auto=1 soc=%d%%) -- attempting PPS recovery\n",
+				 rsoc);
+		}
 		mutex_unlock(&chip->engage_lock);
 		return;
 	}
@@ -1533,24 +1604,40 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 	 */
 	{
 		int fgv_uv = 0, cell_mv;
-		u32 cap, eff;
 
 		if (chip->fg && !power_supply_get_property(chip->fg,
 				POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv))
 			fgv_uv = pv.intval;
 		cell_mv = fgv_uv / 1000;
 
-		cap = sm5440_ci_gl_cap(cell_mv);
-		eff = min_t(u32, cap, sm5440_dc_step_ibus[chip->dc_step]);
-		/* Fixed (production auto-engage / dc_test) runs only: the adaptive dc_probe
-		 * deliberately holds ci_gl HIGH to push ta.v_max, so the cap must not fight it. */
-		if (!chip->dc_adaptive && cell_mv > 0 && eff < chip->dc_ci_applied) {
-			sm_dc_set_ta_cmax(chip->dc, eff);	/* hold the CC peak at ci_gl (no +offset) */
-			sm_dc_set_target_ibus(chip->dc, eff);	/* divert to the re-preset at the lower cap */
-			dev_info(chip->dev,
-				 "ci_gl cap: %u -> %u mA at FG-V=%dmV (step=%d) -- VBAT-aware, boundary-safe\n",
-				 chip->dc_ci_applied, eff, cell_mv, chip->dc_step);
-			chip->dc_ci_applied = eff;
+		if (READ_ONCE(chip->dc_inject_hrst) && !chip->dc_adaptive) {
+			/*
+			 * TEST-ONLY (Build-2b validation): HOLD an over-request above the
+			 * PS_RDY boundary EACH tick (bypassing the ci_gl ratchet, which would
+			 * otherwise claw it straight back down) until the engine climbs past
+			 * the boundary and tcpm SENDS a Hard Reset.  The teardown branch above
+			 * clears the flag once the engine stops, so recovery re-engages at the
+			 * normal capped ci_gl with no re-injection.
+			 */
+			sm_dc_set_ta_cmax(chip->dc, SM5440_HRST_INJECT_MA);
+			sm_dc_set_target_ibus(chip->dc, SM5440_HRST_INJECT_MA);
+			chip->dc_ci_applied = SM5440_HRST_INJECT_MA;
+			dev_warn(chip->dev,
+				 "TEST: HRST-inject holding over-request %u mA at FG-V=%dmV\n",
+				 SM5440_HRST_INJECT_MA, cell_mv);
+		} else {
+			u32 cap = sm5440_ci_gl_cap(cell_mv);
+			u32 eff = min_t(u32, cap, sm5440_dc_step_ibus[chip->dc_step]);
+			/* Fixed (production auto-engage / dc_test) runs only: the adaptive dc_probe
+			 * deliberately holds ci_gl HIGH to push ta.v_max, so the cap must not fight it. */
+			if (!chip->dc_adaptive && cell_mv > 0 && eff < chip->dc_ci_applied) {
+				sm_dc_set_ta_cmax(chip->dc, eff);	/* hold the CC peak at ci_gl (no +offset) */
+				sm_dc_set_target_ibus(chip->dc, eff);	/* divert to the re-preset at the lower cap */
+				dev_info(chip->dev,
+					 "ci_gl cap: %u -> %u mA at FG-V=%dmV (step=%d) -- VBAT-aware, boundary-safe\n",
+					 chip->dc_ci_applied, eff, cell_mv, chip->dc_step);
+				chip->dc_ci_applied = eff;
+			}
 		}
 
 		/*
@@ -1707,6 +1794,12 @@ static void sm5440_dc_done_cb(void *ctx)
 {
 	struct sm5440 *chip = ctx;
 
+	/*
+	 * Build-2b: mark the benign topoff BEFORE stopping the engine, so the next
+	 * dc_monitor tick (which sees state<CHECK_VBAT) classifies this as a topoff,
+	 * not an HRST, and does NOT arm the re-engage recovery.
+	 */
+	WRITE_ONCE(chip->dc_done, true);
 	dev_info(chip->dev, "dc: charging done (topoff) -> stopping engine\n");
 	if (chip->dc)
 		sm_dc_stop_charging(chip->dc);
@@ -1820,6 +1913,9 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	sm5440_fg(chip);			/* lazy-cache the persistent FG handle */
 	chip->dc_running = true;
 	chip->dc_ticks = 0;
+	chip->dc_done = false;		/* Build-2b: a fresh run has not topoff'd */
+	chip->dc_recover_armed = false;	/* Build-2b: a fresh run is not itself in recovery */
+	WRITE_ONCE(chip->dc_inject_hrst, false);	/* TEST: clear any stale injection arming */
 	chip->dc_step = 0;		/* the ladder starts in step 0 (engage gate keeps SoC < 62) */
 	chip->dc_step_iin_cnt = 0;
 	chip->dc_ci_applied = target_ibus_ma;	/* Build-2a: cap-ratchet baseline; dc_monitor lowers it as the loaded cell climbs.
@@ -1869,10 +1965,12 @@ err_restore:
 static void sm5440_dc_stop(struct sm5440 *chip)
 {
 	cancel_delayed_work_sync(&chip->probe_work);
-	cancel_delayed_work_sync(&chip->dc_monitor);
+	cancel_delayed_work_sync(&chip->dc_monitor);		/* the recovery armer -- stop it first */
+	cancel_delayed_work_sync(&chip->dc_reengage_work);	/* Build-2b: kill a pending recovery */
 	mutex_lock(&chip->engage_lock);
 	if (chip->dc_running)
 		sm5440_dc_teardown(chip);
+	chip->dc_recover_armed = false;		/* Build-2b: a manual/auto stop disarms recovery */
 	mutex_unlock(&chip->engage_lock);
 }
 
@@ -1889,6 +1987,16 @@ static void sm5440_dc_intent_cb(void *ctx, bool dc_intent)
 {
 	struct sm5440 *chip = ctx;
 
+	/*
+	 * Build-2b instrumentation: log the intent transition so a run confirms the
+	 * buck worker HOLDS intent across an HRST's VBUS->5V transient.  dc_intent is
+	 * VBUS-POK + cell-temp keyed, NOT PD-contract keyed (sm5714-usb-vbus.c:828), so
+	 * it should survive an HRST (VBUS stays POK at 5 V); the recovery worker's
+	 * pre-flight abandons on !dc_intent, so this is the signal to watch.
+	 * Change-gated (the buck worker re-notifies every poll).
+	 */
+	if (READ_ONCE(chip->dc_intent) != dc_intent)
+		dev_info(chip->dev, "dc_intent -> %d (buck-worker notify)\n", dc_intent);
 	WRITE_ONCE(chip->dc_intent, dc_intent);
 	mod_delayed_work(system_long_wq, &chip->auto_engage_work, 0);
 }
@@ -1938,6 +2046,7 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 	if (!intent) {
 		chip->dc_err_latched = false;
 		chip->dc_retry_cnt = 0;
+		chip->dc_recover_armed = false;	/* Build-2b: unplug disarms any pending recovery */
 		mutex_unlock(&chip->engage_lock);
 		return;
 	}
@@ -1972,6 +2081,123 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 		dev_info(chip->dev,
 			 "auto-engage: pump engaged at SoC %d%% (ci_gl=%u mA) -- no sysfs trigger\n",
 			 soc, SM5440_AUTO_ENGAGE_CI_GL);
+	}
+	mutex_unlock(&chip->engage_lock);
+}
+
+/*
+ * Build-2b: the re-engage-on-HRST recovery worker.  Armed by dc_monitor when a
+ * supervisor-owned run stops mid-charge without a topoff (an HRST dropped the PPS
+ * contract to a FIXED PDO and the pump fell to the buck; sess-233 §9).  It
+ * re-activates PPS (re-driving PROG_ONLINE, which the keepalive stopped doing on
+ * the contract loss) and re-engages, bounded by the same 3-strike dc_retry_cnt
+ * latch as the engage path.
+ *
+ * Lock discipline mirrors dc_start's contract: the blocking PPS re-activation poll
+ * (set_property blocks up to ~10 s) runs WITHOUT engage_lock, like the keepalive;
+ * only the pre-flight gate and the final dc_start take it.  A "PPS not back yet"
+ * within the (generous, shim-reattach-exceeding) window is a WAIT, not a strike;
+ * only a full-window-deaf source OR contract-back-but-dc_start-failed is a strike.
+ * The recovery ceiling is the DISENGAGE SoC (95), not the ENGAGE gate (62): this
+ * CONTINUES an already-active run that legitimately climbed above 62 (the pump runs
+ * 62..95 once engaged), so it must not surrender the pump for a high-SoC HRST --
+ * where HRSTs are in fact more likely (the PS_RDY boundary falls with VBAT).  The
+ * ci_gl cap + this latch + the topoff self-limit bound the high-SoC re-engage.
+ */
+static void sm5440_dc_reengage_work(struct work_struct *work)
+{
+	struct sm5440 *chip = container_of(work, struct sm5440,
+					   dc_reengage_work.work);
+	bool contract = false;
+	int soc, i, ret;
+
+	/*
+	 * Pre-flight under the lock: bail if superseded (a manual run started,
+	 * disarmed, or already latched) or the charger/SoC left the window.
+	 */
+	mutex_lock(&chip->engage_lock);
+	if (chip->dc_running || !chip->dc_recover_armed || chip->dc_err_latched) {
+		mutex_unlock(&chip->engage_lock);
+		return;
+	}
+	soc = sm5440_read_soc(chip);
+	if (!READ_ONCE(chip->dc_intent) || soc < 0 || soc >= SM5440_AUTO_DISENGAGE_SOC) {
+		/*
+		 * Genuine unplug, unreadable SoC, or SoC reached the disengage ceiling
+		 * (the charge is effectively done -- the buck owns 95..100): abandon
+		 * WITHOUT a strike (unplug clears the latch via auto_engage_work's idle
+		 * path; a fail-safe SoC read leaves the buck in charge).
+		 */
+		chip->dc_recover_armed = false;
+		dev_info(chip->dev, "reengage: abandon (intent=%d soc=%d%%) -- not a strike\n",
+			 READ_ONCE(chip->dc_intent), soc);
+		mutex_unlock(&chip->engage_lock);
+		return;
+	}
+	mutex_unlock(&chip->engage_lock);
+
+	/*
+	 * Force pps_active off so the FIRST pps_request definitely re-enters the
+	 * PROG_ONLINE activation path (the keepalive should already have cleared it on
+	 * the contract loss, but do not depend on that race).  Then poll: re-invoke
+	 * pps_request EACH iteration -- a single post-HRST call hits the "activate
+	 * deferred" bail because the port is still mid-transition after the reset.
+	 */
+	WRITE_ONCE(chip->pps_active, false);
+	for (i = 0; i < SM5440_REENGAGE_POLL_TRIES; i++) {
+		if (!READ_ONCE(chip->dc_intent))
+			break;			/* unplugged mid-poll -> handled below (no strike) */
+		sm5440_pps_request(chip, SM5440_REENGAGE_PPS_MV,
+				   SM5440_REENGAGE_PPS_MA, false);
+		if (sm5440_pps_contract_active(chip)) {
+			contract = true;
+			break;
+		}
+		msleep(SM5440_REENGAGE_POLL_MS);
+	}
+
+	/* Decide under the lock. */
+	mutex_lock(&chip->engage_lock);
+	if (chip->dc_running || !chip->dc_recover_armed) {
+		mutex_unlock(&chip->engage_lock);	/* superseded during the poll */
+		return;
+	}
+	if (!READ_ONCE(chip->dc_intent)) {		/* unplugged during the poll: no strike */
+		chip->dc_recover_armed = false;
+		mutex_unlock(&chip->engage_lock);
+		return;
+	}
+
+	if (contract) {
+		ret = sm5440_dc_start(chip, SM5440_AUTO_ENGAGE_CI_GL, false);
+		if (!ret) {
+			chip->dc_retry_cnt = 0;
+			chip->auto_engaged = true;
+			chip->dc_recover_armed = false;
+			dev_info(chip->dev,
+				 "reengage: RECOVERED -- PPS re-established, pump re-engaged (ci_gl=%u mA)\n",
+				 SM5440_AUTO_ENGAGE_CI_GL);
+			mutex_unlock(&chip->engage_lock);
+			return;
+		}
+		dev_warn(chip->dev, "reengage: contract back but dc_start failed (%d)\n", ret);
+	} else {
+		dev_warn(chip->dev, "reengage: PPS did not return within %d ms (source deaf)\n",
+			 SM5440_REENGAGE_POLL_TRIES * SM5440_REENGAGE_POLL_MS);
+	}
+
+	/* Strike: deaf through the whole window, or contract back but dc_start failed. */
+	if (++chip->dc_retry_cnt >= SM5440_AUTO_RETRY_MAX) {
+		chip->dc_err_latched = true;
+		chip->dc_recover_armed = false;
+		dev_warn(chip->dev,
+			 "reengage: %d consecutive failures -- latching off until charger replug\n",
+			 chip->dc_retry_cnt);
+	} else {
+		dev_warn(chip->dev, "reengage: retry %d/%d -- re-arming in %d ms\n",
+			 chip->dc_retry_cnt, SM5440_AUTO_RETRY_MAX, SM5440_REENGAGE_GAP_MS);
+		mod_delayed_work(system_long_wq, &chip->dc_reengage_work,
+				 msecs_to_jiffies(SM5440_REENGAGE_GAP_MS));
 	}
 	mutex_unlock(&chip->engage_lock);
 }
@@ -2056,6 +2282,34 @@ static ssize_t dc_probe_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_WO(dc_probe);
 
+/*
+ * TEST-ONLY (Build-2b validation): "1" during a live auto-engage run arms a forced
+ * over-request.  dc_monitor then HOLDS the request at SM5440_HRST_INJECT_MA each
+ * tick (bypassing the ci_gl ratchet) until the engine climbs past the source's
+ * PS_RDY boundary and tcpm SENDS a real Hard Reset (the sess-233 mechanism) -- so
+ * the Build-2b recovery path can be exercised on demand instead of waiting for a
+ * stochastic field HRST.  Inert unless written; one-shot (the teardown clears it
+ * once the HRST fires).  REMOVE this knob (and SM5440_HRST_INJECT_MA + the inject
+ * consumption in dc_monitor) before any production or upstream build.
+ */
+static ssize_t dc_inject_hrst_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct sm5440 *chip = dev_get_drvdata(dev);
+	u32 v;
+
+	if (kstrtou32(buf, 0, &v) || v != 1)
+		return -EINVAL;
+	if (!READ_ONCE(chip->dc_running))
+		return -ENODEV;		/* only meaningful during a live engine run */
+	WRITE_ONCE(chip->dc_inject_hrst, true);
+	dev_warn(chip->dev,
+		 "TEST: HRST injection armed -- next dc_monitor tick over-requests %u mA\n",
+		 SM5440_HRST_INJECT_MA);
+	return count;
+}
+static DEVICE_ATTR_WO(dc_inject_hrst);
+
 static int sm5440_get_property(struct power_supply *psy,
 			       enum power_supply_property psp,
 			       union power_supply_propval *val)
@@ -2135,6 +2389,7 @@ static int sm5440_probe(struct i2c_client *client)
 	INIT_DELAYED_WORK(&chip->pump_monitor, sm5440_pump_monitor_work);
 	INIT_DELAYED_WORK(&chip->ocp_check_work, sm5440_ocp_check_work);
 	INIT_DELAYED_WORK(&chip->dc_monitor, sm5440_dc_monitor_work);
+	INIT_DELAYED_WORK(&chip->dc_reengage_work, sm5440_dc_reengage_work);	/* Build-2b */
 	INIT_DELAYED_WORK(&chip->probe_work, sm5440_dc_probe_work);
 	INIT_DELAYED_WORK(&chip->auto_engage_work, sm5440_auto_engage_work);
 	INIT_DELAYED_WORK(&chip->pps_keepalive, sm5440_pps_keepalive_work);
@@ -2237,6 +2492,8 @@ static int sm5440_probe(struct i2c_client *client)
 				dev_warn(dev, "could not create dc_test sysfs attribute\n");
 			if (device_create_file(dev, &dev_attr_dc_probe))
 				dev_warn(dev, "could not create dc_probe sysfs attribute\n");
+			if (device_create_file(dev, &dev_attr_dc_inject_hrst))	/* TEST-ONLY (Build-2b) */
+				dev_warn(dev, "could not create dc_inject_hrst sysfs attribute\n");
 			/*
 			 * Auto-engage supervisor (Inc-3b-3): register with the SM5714
 			 * buck worker (the arbiter) so the pump engages on a PD-charger
@@ -2269,6 +2526,7 @@ static void sm5440_remove(struct i2c_client *client)
 	if (chip->dc) {
 		device_remove_file(&client->dev, &dev_attr_dc_test);
 		device_remove_file(&client->dev, &dev_attr_dc_probe);
+		device_remove_file(&client->dev, &dev_attr_dc_inject_hrst);	/* TEST-ONLY (Build-2b) */
 	}
 
 	/*
@@ -2281,6 +2539,7 @@ static void sm5440_remove(struct i2c_client *client)
 	cancel_delayed_work_sync(&chip->auto_engage_work);
 	cancel_delayed_work_sync(&chip->probe_work);
 	cancel_delayed_work_sync(&chip->dc_monitor);
+	cancel_delayed_work_sync(&chip->dc_reengage_work);	/* Build-2b: after dc_monitor (its armer) */
 	cancel_delayed_work_sync(&chip->ocp_check_work);
 	cancel_delayed_work_sync(&chip->pump_monitor);
 
