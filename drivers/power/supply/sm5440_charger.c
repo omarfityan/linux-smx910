@@ -277,8 +277,9 @@ static u32 sm5440_ci_gl_cap(int fg_mv)
 {
 	if (fg_mv < 4010)	return 4000;	/* boundary >4120; sess-234 measured-safe (delivered ~3760) */
 	if (fg_mv < 4090)	return 3400;	/* boundary 4120->3880; margin >=480 mA */
-	if (fg_mv < 4170)	return 2800;	/* boundary 3880->3640; margin >=840 mA */
-	return 2200;				/* boundary <3640; CV float (4440) approaching */
+	if (fg_mv < 4170)	return 3200;	/* deliver toward ceiling (10500-2Vcell)/0.66 ~3270-3510; boundary 3880->3640, margin >=440 mA (measured-safe: 3400 held @4090, 0 HRST) */
+	if (fg_mv < 4280)	return 2900;	/* ceiling ~2940-3270; boundary ~3640->3310, margin >=410 mA */
+	return 2500;				/* ceiling ~2460-2940; boundary ~3310->2830, margin >=330; CV float (4440) approaching */
 }
 
 /*
