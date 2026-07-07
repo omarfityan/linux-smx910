@@ -206,6 +206,7 @@ extern int sm_dc_set_target_ibus(struct sm_dc_info *sm_dc, u32 target_ibus);
  * law untouched.
  */
 extern int sm_dc_set_ta_vmax(struct sm_dc_info *sm_dc, u32 v_max);
+extern int sm_dc_set_ta_cmax(struct sm_dc_info *sm_dc, u32 c_max);
 
 /* The "done" callback the topoff event invokes (supervisor stops the engine). */
 extern void sm_dc_set_done_notify(struct sm_dc_info *sm_dc,

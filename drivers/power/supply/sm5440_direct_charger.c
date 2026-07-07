@@ -1065,6 +1065,39 @@ int sm_dc_set_ta_vmax(struct sm_dc_info *sm_dc, u32 v_max)
 }
 EXPORT_SYMBOL_GPL(sm_dc_set_ta_vmax);
 
+int sm_dc_set_ta_cmax(struct sm_dc_info *sm_dc, u32 c_max)
+{
+	pr_info("%s %s: [%dmA] to [%dmA]\n", sm_dc->name, __func__, sm_dc->ta.c_max, c_max);
+
+	/*
+	 * A bare TA max-current write -- like sm_dc_set_ta_vmax, NO req_update flag and
+	 * NO state change on its own.  The caller pairs this with sm_dc_set_target_ibus,
+	 * whose req_update_ibus diverts the machine to the re-preset that recomputes
+	 * wq.ci_gl = MIN(ta.c_max, target_ibus).  Lowering ta.c_max here holds the CC
+	 * PEAK request AT ci_gl: _try_to_adjust_cc_up caps ta.c at ta.c_max, so with
+	 * ta.c_max == the (lowered) target the request has no +PPS_C_STEP*4 overshoot
+	 * above ci_gl.
+	 *
+	 * Under st_lock we ALSO clamp the live ta.c down to c_max: dc_monitor runs on a
+	 * different workqueue than the engine state-works, so a pd_cc_work that already
+	 * passed its update_work_state divert-check can reach send_power_source_msg AFTER
+	 * this lowers ta.c_max -- and that send bounds-checks (ta.c > ta.c_max) ->
+	 * SM_DC_ERR_SEND_PD_MSG -> teardown -> buck (with no re-engage above SoC 62).
+	 * Writing ta.c <= ta.c_max here closes that window.  ta.c = c_max is itself a
+	 * safe request (below the PS_RDY boundary), and the paired re-preset re-ramps
+	 * from c_max/2 regardless, so the clamp changes no steady-state behaviour -- it
+	 * is exactly the invariant _try_to_adjust_cc_up already maintains.
+	 */
+	mutex_lock(&sm_dc->st_lock);
+	if (sm_dc->ta.c > c_max)
+		sm_dc->ta.c = c_max;
+	sm_dc->ta.c_max = c_max;
+	mutex_unlock(&sm_dc->st_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(sm_dc_set_ta_cmax);
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Silicon Mitus; mainline PD-only port by omar fityan <me@omarfityan.com>");
 MODULE_DESCRIPTION("Silicon Mitus sm_dc direct-charging (PD/PPS CC/CV) engine");

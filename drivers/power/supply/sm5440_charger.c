@@ -226,16 +226,19 @@
  */
 #define SM5440_AUTO_ENGAGE_SOC		62	/* engage only when SoC < this (device-own step-0 start) */
 #define SM5440_AUTO_DISENGAGE_SOC	95	/* disengage at/above = device-own dchg_end_soc; buck finishes 95->100 */
-#define SM5440_AUTO_ENGAGE_CI_GL	4000	/* step-0 IBUS target.  The device-own step-0 is val_iout[0]/2 =
-						 * 4500, but mainline tcpm sends a Hard Reset when a PPS Request
-						 * cannot PS_RDY within tPSTransition (500 ms): the source
-						 * current-limits to ~3965 mA at the ~10.5 V ceiling, so a request
-						 * it cannot reach (4500) trips the timer (the bespoke PD stack
-						 * tolerates the missing PS_RDY; tcpm does not).  The engine walks
-						 * the request to ci_gl + 200, so cap ci_gl to keep the peak request
-						 * (4200) below the ~4450 last-good PS_RDY boundary; this still
-						 * DELIVERS ~3900 mA (the source's real ceiling), matching the
-						 * bespoke's delivered current without the reset. */
+#define SM5440_AUTO_ENGAGE_CI_GL	4000	/* engage/low-VBAT IBUS cap (mA).  The device-own step-0 is
+						 * val_iout[0]/2 = 4500, but mainline tcpm sends a Hard Reset when a
+						 * PPS Request cannot PS_RDY within tPSTransition (500 ms): the source
+						 * current-limits at the ~10.5 V ceiling, so a request above the
+						 * last-good PS_RDY boundary trips the timer (the bespoke PD stack
+						 * tolerates the missing PS_RDY; tcpm does not).  At auto-engage
+						 * ta.c_max == ci_gl, so _try_to_adjust_cc_up caps ta.c at ta.c_max
+						 * and the PEAK request == ci_gl (NOT ci_gl+200 -- that band is
+						 * unreachable once c_max binds; sess-234 measured peak 4000, delivered
+						 * ~3760, ZERO HRST at loaded 3939-4009 mV).  This 4000 is the LOW-VBAT
+						 * band only: the PS_RDY boundary FALLS as the cell climbs, so
+						 * dc_monitor's Build-2a sm5440_ci_gl_cap() ratchets ci_gl DOWN per
+						 * VBAT band to stay below the falling boundary through step 1. */
 #define SM5440_AUTO_RETRY_MAX		3	/* consecutive engage failures before latching off until replug */
 
 /*
@@ -250,6 +253,33 @@ static const u32 sm5440_dc_step_vbat[SM5440_DC_STEP_MAX + 1]     = { 4250, 4420,
 static const u32 sm5440_dc_step_ibus[SM5440_DC_STEP_MAX + 1]     = { 4500, 4100, 2000 }; /* val_iout/2 IBUS (mA) */
 static const u32 sm5440_dc_step_cond_vol[SM5440_DC_STEP_MAX + 1] = { 4250, 4420, 4440 }; /* cond_vol (mV) */
 static const u32 sm5440_dc_step_cond_iin[SM5440_DC_STEP_MAX]     = { 4100, 2000 };       /* val_iout[N+1]/2 (mA) */
+
+/*
+ * Build-2a: VBAT-aware ci_gl (INPUT-current) ceiling.  The source's PS_RDY
+ * boundary -- the maximum input current tcpm can Request before the source
+ * withholds PS_RDY within tPSTransition (500 ms) and tcpm SENDS a Hard Reset --
+ * FALLS as the cell voltage climbs (2*Vcell rises, so the source's headroom under
+ * the ~10.5 V PPS ceiling shrinks).  Empirical model (LOADED FG voltage_now, the
+ * dc_monitor's cell-V reading): boundary(mV) ~= 4450 - 3*(mV - 3900) mA -- fit to
+ * the sess-233 Hard Reset (req 4000 mA @ loaded 4050 mV) and confirmed by sess-234
+ * (req 4000 mA held, delivered ~3760 mA, ZERO HRST @ loaded 3939-4009 mV).  A
+ * FIXED cap (Build 1's 4000) eventually MEETS the falling boundary -> one miss
+ * fires the HRST -> pump drops to buck.  So cap ci_gl per VBAT band, a conservative
+ * >=480 mA below the modeled boundary, ratcheting DOWN as the cell climbs
+ * (dc_monitor applies it).  VBAT rises monotonically on charge, so the ratchet
+ * only ever lowers -> no flap, no hysteresis needed.  This caps steps 0 AND 1 (the
+ * pump runs continuously ENGAGE_SOC..DISENGAGE_SOC; step 1's 4100 mA is itself a
+ * high-VBAT HRST site).  Sub-ceiling requests DELIVER their request (the source
+ * meets them below the boundary), so the current tapers with VBAT -- the same
+ * physics the device-own sec_step_charging supervisor imposes.
+ */
+static u32 sm5440_ci_gl_cap(int fg_mv)
+{
+	if (fg_mv < 4010)	return 4000;	/* boundary >4120; sess-234 measured-safe (delivered ~3760) */
+	if (fg_mv < 4090)	return 3400;	/* boundary 4120->3880; margin >=480 mA */
+	if (fg_mv < 4170)	return 2800;	/* boundary 3880->3640; margin >=840 mA */
+	return 2200;				/* boundary <3640; CV float (4440) approaching */
+}
 
 /*
  * Increment-3a graceful-stop ramp-down (the buck handoff).  sess-206 run-1 showed
@@ -397,6 +427,7 @@ struct sm5440 {
 	 */
 	int dc_step;		/* current ladder step */
 	int dc_step_iin_cnt;	/* consecutive ticks the advance predicate held (debounce -> SM5440_DC_STEP_IIN_CNT) */
+	u32 dc_ci_applied;	/* Build-2a: currently-applied VBAT-banded ci_gl cap (mA); dc_monitor ratchets it DOWN */
 
 	/*
 	 * Increment-3c: the mainline-tcpm PPS bridge.  tcpm_psy is tcpm's
@@ -1484,41 +1515,75 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 	}
 
 	/*
-	 * The 3-step ladder (device-own sec_step_charging.c min(step_vol, step_input)).
-	 * Reached only with the engine in an ACTIVE state (we are past the teardown
-	 * check above), so a re-target can never land on a dead engine.  Advance
-	 * N->N+1 when the cell has reached this step's plateau (FG cell-V + v_margin >=
-	 * cond_vol[N]) AND the bus current has tapered (IBUS <= cond_iin[N]), debounced
-	 * SM5440_DC_STEP_IIN_CNT ticks.  FG voltage_now is the device-own VOLTAGE sensor
-	 * (matches battery->voltage_now, not the SM5440 VBAT-ADC).  The re-target is
-	 * glitch-free: vbat-up + ibus-down hits the engine's need_to_preset=0 PRE_CC
-	 * re-ramp inside the live PD contract -- no re-negotiation (no Hard-Reset risk).
-	 * Step 2 (4440 mV == chg_float) then self-terminates via the engine native
-	 * topoff; the executor's SoC >= dchg_end_soc is the ceiling backstop.
+	 * The input-current ceiling = min(Build-2a VBAT-aware cap, device-own
+	 * step_ibus[dc_step]).  Reached only with the engine ACTIVE (past the teardown
+	 * check), so a re-target never lands on a dead engine.  FG voltage_now is the
+	 * LOADED cell reading (the boundary model's domain); it reads ~300 mV above the
+	 * resting cell under a ~7.6 A charge, and is a DIFFERENT quantity from the ~2x
+	 * battery-side cell current.
+	 *
+	 * Build-2a cap: sm5440_ci_gl_cap() falls per VBAT band as the source's PS_RDY
+	 * boundary falls; we ratchet it DOWN (never up -- VBAT rises monotonically on
+	 * charge) via set_ta_cmax (holds the CC peak AT ci_gl) + set_target_ibus (diverts
+	 * the engine to a PRESET re-ramp at the lower target -- inherently safe on a
+	 * REDUCTION, re-ramping from 50% of the new cap).  This caps steps 0 AND 1: the
+	 * pump runs continuously ENGAGE_SOC(62)..DISENGAGE_SOC(95), so step 1's device-own
+	 * 4100 mA would itself over-request at its high entry VBAT -- the min() caps it.
 	 */
-	if (chip->dc_step < SM5440_DC_STEP_MAX) {
-		int n = chip->dc_step, fgv_uv = 0, cell_mv;
+	{
+		int fgv_uv = 0, cell_mv;
+		u32 cap, eff;
 
 		if (chip->fg && !power_supply_get_property(chip->fg,
 				POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv))
 			fgv_uv = pv.intval;
 		cell_mv = fgv_uv / 1000;
 
-		if (cell_mv + SM5440_DC_STEP_V_MARGIN >= sm5440_dc_step_cond_vol[n] &&
-		    ibus / 1000 <= sm5440_dc_step_cond_iin[n]) {
-			if (++chip->dc_step_iin_cnt >= SM5440_DC_STEP_IIN_CNT) {
-				chip->dc_step = n + 1;
+		cap = sm5440_ci_gl_cap(cell_mv);
+		eff = min_t(u32, cap, sm5440_dc_step_ibus[chip->dc_step]);
+		/* Fixed (production auto-engage / dc_test) runs only: the adaptive dc_probe
+		 * deliberately holds ci_gl HIGH to push ta.v_max, so the cap must not fight it. */
+		if (!chip->dc_adaptive && cell_mv > 0 && eff < chip->dc_ci_applied) {
+			sm_dc_set_ta_cmax(chip->dc, eff);	/* hold the CC peak at ci_gl (no +offset) */
+			sm_dc_set_target_ibus(chip->dc, eff);	/* divert to the re-preset at the lower cap */
+			dev_info(chip->dev,
+				 "ci_gl cap: %u -> %u mA at FG-V=%dmV (step=%d) -- VBAT-aware, boundary-safe\n",
+				 chip->dc_ci_applied, eff, cell_mv, chip->dc_step);
+			chip->dc_ci_applied = eff;
+		}
+
+		/*
+		 * The device-own 3-step CV-float ladder (sec_step_charging.c
+		 * min(step_vol, step_input)).  Advance N->N+1 when the cell reaches this
+		 * step's plateau (FG cell-V + v_margin >= cond_vol[N]) AND the bus current
+		 * has tapered (IBUS <= cond_iin[N]), debounced SM5440_DC_STEP_IIN_CNT ticks.
+		 * The step now owns ONLY target_vbat (the CV ceiling); the INPUT current is
+		 * owned by the min()-cap above, so a step entry never RAISES ibus into a
+		 * high-VBAT over-request.  (Build-1's old "vbat-up + ibus-down ->
+		 * need_to_preset=0, no Hard-Reset" claim held only for the UNCAPPED table:
+		 * under the 4000 cap step 0->1 was ibus 4000->4100 = UP, which is exactly the
+		 * over-request the cap now prevents.)  With the cap in force IBUS <=
+		 * cond_iin[N] is trivially true, so advance is cell-V gated -- the correct
+		 * CV-transition trigger.  Step 2 (4440 mV) then self-terminates via the
+		 * engine's native topoff; SoC >= dchg_end_soc is the ceiling backstop.
+		 */
+		if (chip->dc_step < SM5440_DC_STEP_MAX) {
+			int n = chip->dc_step;
+
+			if (cell_mv + SM5440_DC_STEP_V_MARGIN >= sm5440_dc_step_cond_vol[n] &&
+			    ibus / 1000 <= sm5440_dc_step_cond_iin[n]) {
+				if (++chip->dc_step_iin_cnt >= SM5440_DC_STEP_IIN_CNT) {
+					chip->dc_step = n + 1;
+					chip->dc_step_iin_cnt = 0;
+					sm_dc_set_target_vbat(chip->dc, sm5440_dc_step_vbat[n + 1]);
+					dev_info(chip->dev,
+						 "dc ladder: step %d -> %d (vbat %u->%u mV; ibus owned by ci_gl cap) at FG-V=%dmV IBUS=%dmA\n",
+						 n, n + 1, sm5440_dc_step_vbat[n], sm5440_dc_step_vbat[n + 1],
+						 cell_mv, ibus / 1000);
+				}
+			} else {
 				chip->dc_step_iin_cnt = 0;
-				sm_dc_set_target_vbat(chip->dc, sm5440_dc_step_vbat[n + 1]);
-				sm_dc_set_target_ibus(chip->dc, sm5440_dc_step_ibus[n + 1]);
-				dev_info(chip->dev,
-					 "dc ladder: step %d -> %d (vbat %u->%u mV, ibus %u->%u mA) at FG-V=%dmV IBUS=%dmA\n",
-					 n, n + 1, sm5440_dc_step_vbat[n], sm5440_dc_step_vbat[n + 1],
-					 sm5440_dc_step_ibus[n], sm5440_dc_step_ibus[n + 1],
-					 cell_mv, ibus / 1000);
 			}
-		} else {
-			chip->dc_step_iin_cnt = 0;
 		}
 	}
 
@@ -1756,6 +1821,10 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	chip->dc_ticks = 0;
 	chip->dc_step = 0;		/* the ladder starts in step 0 (engage gate keeps SoC < 62) */
 	chip->dc_step_iin_cnt = 0;
+	chip->dc_ci_applied = target_ibus_ma;	/* Build-2a: cap-ratchet baseline; dc_monitor lowers it as the loaded cell climbs.
+						 * Safe even on a high-VBAT (re-)engage: the engine PRESETs at 50% of target and
+						 * ramps ~PPS_C_STEP/tick, so the first 1 s dc_monitor tick reads the loaded cell-V
+						 * and ratchets the cap down long before the request could reach the boundary. */
 	chip->dc_adaptive = adaptive;
 	chip->probe_locked = false;
 	chip->probe_ci_gl = target_ibus_ma;
