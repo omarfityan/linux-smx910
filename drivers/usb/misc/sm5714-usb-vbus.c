@@ -163,6 +163,15 @@
 #define SM5714_CHG_POLL_MS		3000
 
 /*
+ * Bug-3 debounce: a SINGLE battery-NTC (IIO) read failure is usually a transient
+ * geni-i2c stall under pump-i2c contention, not a real fault.  Cutting charge on
+ * it slams fast-charge off and cycles dc_intent, so ride out this many CONSECUTIVE
+ * failures (poll=3s -> ~6-9s) before the fail-safe cut; a good read resets the
+ * count, and a persistent failure (dead NTC) still cuts conservatively.
+ */
+#define SM5714_TEMP_READ_FAIL_MAX	3
+
+/*
  * AFC 9V negotiation parameters.  The handshake is attempted once per charger
  * attach when the MUIC flags an HV-capable TA, with a few retries to cover a
  * transient ping error before giving up (and staying at 5 V -- never a regression).
@@ -195,6 +204,7 @@ struct sm5714_vbus {
 	bool enabled;
 	bool charge_throttled;		/* hot/cold current-throttle hysteresis */
 	bool charge_cut;		/* hot/cold FET-cut hysteresis */
+	int temp_read_fails;		/* Bug-3: consecutive NTC-read failures (debounce) */
 	enum sm5714_afc_state afc_state;	/* AFC 9V negotiation (per attach) */
 	int afc_tries;			/* negotiation attempts this attach */
 	bool afc_inhibited;		/* PD-RX up: skip AFC (set by the role/tcpm driver) */
@@ -698,6 +708,7 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 		/* input source gone -> re-arm AFC for the next charger attach */
 		sv->afc_state = SM5714_AFC_IDLE;
 		sv->afc_tries = 0;
+		sv->temp_read_fails = 0;	/* no source -> reset the temp-read debounce */
 	}
 
 	/*
@@ -711,8 +722,16 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 	 */
 	if (vbus) {
 		if (!sm5714_read_batt_temp(sv, &temp)) {
-			sv->charge_cut = true;		/* no temp -> do not charge */
+			/*
+			 * Bug-3 debounce: a single NTC-read failure is usually a
+			 * transient geni-i2c stall under pump-i2c contention -- ride it
+			 * out; only a PERSISTENT failure cuts.  A good read >=50 C still
+			 * cuts immediately in the else branch (real thermal unaffected).
+			 */
+			if (++sv->temp_read_fails >= SM5714_TEMP_READ_FAIL_MAX)
+				sv->charge_cut = true;	/* persistent -> do not charge */
 		} else {
+			sv->temp_read_fails = 0;	/* good read -> reset the debounce */
 			if (temp >= SM5714_BATT_TEMP_HOT_CUT ||
 			    temp <= SM5714_BATT_TEMP_COLD_CUT)
 				sv->charge_cut = true;
