@@ -179,6 +179,14 @@
 #define SM5440_CV_OFFSET	50
 #define SM5440_TA_MIN_VOLTAGE	8200	/* PPS request floor (device-own config) */
 #define SM5440_DC_VBUS_OVP_TH	11000	/* PPS ceiling = this - 500 = 10500 mV */
+/*
+ * Bug-1a VBUS-sanity guard floor: refuse to flip op-mode CHG_ON when the pump
+ * input VBUS has collapsed to < 2*Vcell - this (a dead ~5 V rail after a PD
+ * contract collapse).  The healthy 2:1 operating point is VBUS ~= 2*Vcell +
+ * cable-IR (~+270 mV, measured at the cool re-preset troughs) -- a full ~2000 mV
+ * above this floor; a collapse (VBUS ~= 2*Vcell - 3800) sits well below it.
+ */
+#define SM5440_DC_ENABLE_VBUS_FLOOR_MV	2000
 
 /*
  * Increment-1 guarded manual-engage parameters (NOT the production step table).
@@ -1268,6 +1276,34 @@ static int sm5440_dc_set_charging_enable(struct i2c_client *i2c, bool enable)
 {
 	struct sm5440 *chip = i2c_get_clientdata(i2c);
 
+	/*
+	 * Bug-1a VBUS-sanity guard (defense-in-depth): the 2:1 pump requires
+	 * VBUS ~= 2*Vcell.  If a mid-charge ci_gl re-preset collapsed the PD
+	 * contract to a fixed ~5 V PDO, VBUS sits FAR below 2*Vcell; flipping
+	 * op-mode CHG_ON into that dead rail is what turns a recoverable contract
+	 * loss into a VBUSOVP -- the blind re-enable at
+	 * sm5440_direct_charger.c:pd_preset_dc_work (which ignores this return).
+	 * Refuse the enable into a collapsed rail; mirrors the probe collapse-
+	 * guard (VBUS vs 2*Vcell) and dc_start's settle-verify.  Leaving op-mode
+	 * OFF makes the engine's next PRE_CC error poll (check_error_state ->
+	 * get_dc_error_status sees CHG_OFF) fault to a clean recoverable ERR ->
+	 * dc_monitor -> recovery, never an OVP-into-a-corpse.  A refuse only skips
+	 * the CHG_ON flip, so it can only PREVENT an off->on (never turns a running
+	 * pump off) and it fails OPEN on a bad sensor read (vbat_mv > 0 gate).
+	 */
+	if (enable) {
+		int vbus_uv = 0, vbat_mv = 0;
+
+		if (!sm5440_get_vbus_uv(chip, &vbus_uv) &&
+		    !sm5440_get_vbat_mv(chip, &vbat_mv) && vbat_mv > 0 &&
+		    vbus_uv / 1000 < 2 * vbat_mv - SM5440_DC_ENABLE_VBUS_FLOOR_MV) {
+			dev_err(chip->dev,
+				"enable REFUSED: VBUS=%dmV < 2*Vcell(%d)-%d mV (rail collapsed) -- fault to recovery, not OVP\n",
+				vbus_uv / 1000, vbat_mv, SM5440_DC_ENABLE_VBUS_FLOOR_MV);
+			return -EIO;
+		}
+	}
+
 	sm5440_set_op_mode(chip, enable ? SM5440_OPMODE_CHG_ON : SM5440_OPMODE_CHG_OFF);
 	sm5440_enable_wdt(chip, enable);
 	return 0;
@@ -2027,9 +2063,19 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 		/*
 		 * Only manage a run the supervisor itself started; leave a manual
 		 * dc_test/dc_probe run to the operator (dc_test=0).
+		 *
+		 * A mid-charge PPS contract loss is deliberately NOT a disengage
+		 * trigger: a fault (HRST/collapse) drops the contract with intent
+		 * still held, and disengaging here would sm5440_dc_stop() -> cancel
+		 * dc_monitor + dc_reengage_work + clear dc_recover_armed BEFORE the
+		 * dc_monitor teardown tick can arm recovery -- defeating the
+		 * re-engage-on-HRST recovery.  Let a contract-loss-with-intent flow
+		 * to the engine fault -> dc_monitor -> recovery path instead.  A
+		 * genuine unplug still disengages via !intent; the 3-strike latch
+		 * backstops a truly deaf source.
 		 */
 		if (chip->auto_engaged &&
-		    (!intent || !sm5440_pps_contract_active(chip) ||
+		    (!intent ||
 		     soc < 0 || soc >= SM5440_AUTO_DISENGAGE_SOC)) {
 			dev_info(chip->dev,
 				 "auto-disengage: intent=%d contract=%d soc=%d%%\n",
@@ -2169,14 +2215,35 @@ static void sm5440_dc_reengage_work(struct work_struct *work)
 	}
 
 	if (contract) {
-		ret = sm5440_dc_start(chip, SM5440_AUTO_ENGAGE_CI_GL, false);
+		union power_supply_propval pv = { };
+		int cell_mv = 0;
+		u32 reengage_ci;
+
+		/*
+		 * Re-engage at the VBAT-band ci_gl cap (mirroring the dc_monitor
+		 * ratchet's fuelgauge read), NOT the fixed SM5440_AUTO_ENGAGE_CI_GL:
+		 * dc_start seeds dc_ci_applied = target, so starting AT the band cap
+		 * makes the first dc_monitor tick eff == dc_ci_applied -- no immediate
+		 * re-ratchet.  Re-engaging at 4000 above the boundary would re-preset
+		 * -> re-collapse at once, and dc_retry_cnt resets on each success so it
+		 * never latches -> livelock.  sm5440_fg() ensures chip->fg is cached; a
+		 * failed read falls back to the fixed engage current.
+		 */
+		sm5440_fg(chip);
+		if (chip->fg && !power_supply_get_property(chip->fg,
+				POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv))
+			cell_mv = pv.intval / 1000;
+		reengage_ci = cell_mv > 0 ? sm5440_ci_gl_cap(cell_mv)
+					  : SM5440_AUTO_ENGAGE_CI_GL;
+
+		ret = sm5440_dc_start(chip, reengage_ci, false);
 		if (!ret) {
 			chip->dc_retry_cnt = 0;
 			chip->auto_engaged = true;
 			chip->dc_recover_armed = false;
 			dev_info(chip->dev,
 				 "reengage: RECOVERED -- PPS re-established, pump re-engaged (ci_gl=%u mA)\n",
-				 SM5440_AUTO_ENGAGE_CI_GL);
+				 reengage_ci);
 			mutex_unlock(&chip->engage_lock);
 			return;
 		}
