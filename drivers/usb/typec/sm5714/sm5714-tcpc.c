@@ -131,6 +131,7 @@
 #define SM5714_PD_CNTL4_CABLE_RESET	0x02	/* send a Cable Reset (SM5714_ATTACH_SOURCE<<1) */
 #define SM5714_PD_CNTL4_HARD_RESET	0x04	/* send a Hard Reset  (SM5714_ATTACH_SOURCE<<2) */
 #define SM5714_PD_CNTL4_PRL_RESET	0x08	/* reset the protocol layer (<<3) */
+#define SM5714_PD_CNTL4_NOTIFY_RESET_DONE 0x01	/* tell the PRL a hard reset finished (SM5714_ATTACH_SOURCE) */
 
 #define SM5714_REG_RX_HEADER_00		0x42	/* 2-byte block: PD message header */
 #define SM5714_REG_RX_PAYLOAD		0x44	/* N*4-byte block: data objects */
@@ -150,6 +151,7 @@ struct sm5714_tcpc {
 	struct fwnode_handle *fwnode;	/* the DT "connector" child node (DRP caps + graph) */
 	struct mutex lock;		/* serializes the i2c register sequences */
 	bool pd_rx_enabled;		/* set_pd_rx state; gates INT4 handling */
+	bool hard_reset_pending;	/* a hard reset was sent/received; emit NOTIFY_RESET_DONE on RX re-arm */
 
 	/*
 	 * Post-hard-reset recovery.  When a mid-charge hard reset drops the PD
@@ -502,6 +504,26 @@ static int sm5714_tcpc_set_pd_rx(struct tcpc_dev *tcpc, bool on)
 
 	mutex_lock(&st->lock);
 	if (on) {
+		/*
+		 * If a hard reset was just sent or received, the sm5714 protocol
+		 * layer stays latched in the hard-reset condition until it is told
+		 * the reset finished.  A latched PRL is a deaf receiver -- the
+		 * source's post-reset Source_Caps are dropped (0 PD RX) -- and it
+		 * cannot emit a clean hard reset again.  The device's own driver
+		 * clears this in PE_SNK_transition_to_default /
+		 * PE_SRC_transition_to_pwr_on by writing NOTIFY_RESET_DONE to
+		 * PD_CNTL4; do the same here, at the mainline RX re-arm point
+		 * (SNK_WAIT_CAPABILITIES) reached after the hard-reset VBUS
+		 * recovery, before the protocol-layer reset below -- mirroring the
+		 * downstream notify-then-(later)-PRL-reset order.
+		 */
+		if (st->hard_reset_pending) {
+			sm5714_write(st, SM5714_REG_PD_CNTL4,
+				     SM5714_PD_CNTL4_NOTIFY_RESET_DONE);
+			st->hard_reset_pending = false;
+			dev_info(&st->client->dev,
+				 "post-HRST: NOTIFY_RESET_DONE -> PRL, RX re-armed\n");
+		}
 		sm5714_write(st, SM5714_REG_RX_BUF_ST, SM5714_RX_BUF_FLUSH);
 		sm5714_write(st, SM5714_REG_PD_CNTL4, SM5714_PD_CNTL4_PRL_RESET);
 		sm5714_write(st, SM5714_REG_INT_MASK4, SM5714_INT_MASK4_PD);
@@ -548,6 +570,13 @@ static int sm5714_tcpc_pd_transmit(struct tcpc_dev *tcpc,
 		val |= (type == TCPC_TX_HARD_RESET) ?
 			SM5714_PD_CNTL4_HARD_RESET : SM5714_PD_CNTL4_CABLE_RESET;
 		ret = sm5714_write(st, SM5714_REG_PD_CNTL4, val);
+		/*
+		 * A sent hard reset latches the PRL until NOTIFY_RESET_DONE; arm the
+		 * emission on the next RX re-arm (set_pd_rx(true)).  A cable reset
+		 * (SOP') does not need it.
+		 */
+		if (type == TCPC_TX_HARD_RESET)
+			st->hard_reset_pending = true;
 		break;
 	default:				/* SOP* message */
 		if (!msg) {
@@ -657,8 +686,10 @@ static irqreturn_t sm5714_tcpc_irq(int irq, void *data)
 			tx_fail = true;
 		if (intr[3] & SM5714_INT4_TX_DISCARD)
 			tx_disc = true;
-		if (intr[3] & SM5714_INT4_HRST_RCVED)
+		if (intr[3] & SM5714_INT4_HRST_RCVED) {
 			hrst = true;
+			st->hard_reset_pending = true;	/* received HRST also latches the PRL */
+		}
 	}
 
 	/* Read the message out of the FIFO under the lock; hand it up after. */
