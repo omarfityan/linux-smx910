@@ -248,6 +248,23 @@
 						 * dc_monitor's Build-2a sm5440_ci_gl_cap() ratchets ci_gl DOWN per
 						 * VBAT band to stay below the falling boundary through step 1. */
 #define SM5440_AUTO_RETRY_MAX		3	/* consecutive engage failures before latching off until replug */
+/*
+ * dc_intent false-transition debounce depth (consecutive buck-worker false polls
+ * required before committing dc_intent=false).  dc_intent is VBUS-POK keyed
+ * (sm5714-usb-vbus.c: dc_intent = vbus && !charge_cut) and the buck worker is a
+ * PURE 3 s poller (SM5714_CHG_POLL_MS, no IRQ wired).  A PD Hard Reset drives VBUS
+ * to vSafe0V for ~825 ms (< one poll period), so at most ONE poll samples the
+ * transient -> one false notify -> the NEXT poll (VBUS back) re-asserts true.
+ * Committing false on that single transient misfires auto_engage_work's !intent
+ * disengage (cancels the dc_reengage_work recovery -> the pump strands on a fixed
+ * PDO).  Requiring 2 consecutive false polls holds dc_intent true across a
+ * single-poll HRST transient yet still disengages a genuine unplug within one extra
+ * poll.  Grid-synchronised to poll COUNT (not wall-clock), so immune to the poll
+ * body's variable duration (i2c stalls / an AFC 9 V handshake in the corrective
+ * poll).  2 is the LARGEST depth that still commits false inside the reengage
+ * no-strike window on a real unplug.
+ */
+#define SM5440_DC_INTENT_FALSE_DEBOUNCE	2
 
 /*
  * Build-2b: re-engage-on-HRST recovery.  A real Hard Reset drops the PPS contract
@@ -451,7 +468,8 @@ struct sm5440 {
 	 * in the executor -- the cb must not take engage_lock; see sm5440_dc_intent_cb).
 	 */
 	struct delayed_work auto_engage_work;
-	bool dc_intent;		/* last buck-worker notify: charger present + cell temp OK */
+	bool dc_intent;		/* DEBOUNCED buck-worker notify: charger present + cell temp OK */
+	int dc_intent_false_cnt;	/* consecutive false polls; commit false only at SM5440_DC_INTENT_FALSE_DEBOUNCE (HRST VBUS-off debounce).  cb-only -- single serial writer, no lock needed */
 	bool auto_engaged;	/* this dc run was started by the supervisor (gates auto-disengage) */
 	bool dc_err_latched;	/* engage failed SM5440_AUTO_RETRY_MAX times -- stop until charger replug */
 	int dc_retry_cnt;	/* consecutive auto-engage failures (device-own dc_retry_cnt analog) */
@@ -2019,21 +2037,44 @@ static void sm5440_dc_stop(struct sm5440 *chip)
  * WRITE_ONCE pairs with the executor's READ_ONCE.  system_long_wq because the
  * executor may sleep for the full engage (msleep 300) / graceful-stop ramp (~3 s).
  */
-static void sm5440_dc_intent_cb(void *ctx, bool dc_intent)
+static void sm5440_dc_intent_cb(void *ctx, bool intent)
 {
 	struct sm5440 *chip = ctx;
+	bool commit = READ_ONCE(chip->dc_intent);	/* default: HOLD the last committed value */
 
 	/*
-	 * Build-2b instrumentation: log the intent transition so a run confirms the
-	 * buck worker HOLDS intent across an HRST's VBUS->5V transient.  dc_intent is
-	 * VBUS-POK + cell-temp keyed, NOT PD-contract keyed (sm5714-usb-vbus.c:828), so
-	 * it should survive an HRST (VBUS stays POK at 5 V); the recovery worker's
-	 * pre-flight abandons on !dc_intent, so this is the signal to watch.
-	 * Change-gated (the buck worker re-notifies every poll).
+	 * Debounce the FALSE transition.  dc_intent is VBUS-POK keyed
+	 * (sm5714-usb-vbus.c: dc_intent = vbus && !charge_cut) and a PD Hard Reset
+	 * drives VBUS to vSafe0V for ~825 ms.  The buck worker is a pure 3 s poller (no
+	 * IRQ), so at most ONE poll samples that sub-period transient; committing
+	 * dc_intent=false on it would misfire auto_engage_work's !intent disengage,
+	 * cancel the dc_reengage_work recovery, and strand the pump on a fixed contract.
+	 * Hold true across a single false poll; commit false only after
+	 * SM5440_DC_INTENT_FALSE_DEBOUNCE consecutive false polls (a genuine unplug).  A
+	 * true notify clears the counter at once (charger present overrides).  The
+	 * counter is cb-only -- this cb runs synchronously inside the buck worker's
+	 * single, serial charger_work (the sole writer of dc_intent) -- so it needs no
+	 * locking; READ_ONCE/WRITE_ONCE stay on dc_intent for its cross-thread readers.
 	 */
-	if (READ_ONCE(chip->dc_intent) != dc_intent)
-		dev_info(chip->dev, "dc_intent -> %d (buck-worker notify)\n", dc_intent);
-	WRITE_ONCE(chip->dc_intent, dc_intent);
+	if (intent) {
+		chip->dc_intent_false_cnt = 0;
+		commit = true;
+	} else if (++chip->dc_intent_false_cnt >= SM5440_DC_INTENT_FALSE_DEBOUNCE) {
+		commit = false;
+	}
+
+	if (READ_ONCE(chip->dc_intent) != commit)
+		dev_info(chip->dev, "dc_intent -> %d (buck notify; false_cnt=%d)\n",
+			 commit, chip->dc_intent_false_cnt);
+	else if (!intent && chip->dc_intent_false_cnt == 1)
+		dev_info(chip->dev,
+			 "dc_intent HELD true across a transient VBUS-off (false_cnt=1) -- HRST debounce suppressed a disengage\n");
+	WRITE_ONCE(chip->dc_intent, commit);
+	/*
+	 * Kick the executor UNCONDITIONALLY (not only on a commit change): the
+	 * auto-engage retry path re-attempts a failed dc_start "on the next poll",
+	 * which only happens because every notify kicks auto_engage_work.
+	 */
 	mod_delayed_work(system_long_wq, &chip->auto_engage_work, 0);
 }
 
@@ -2109,6 +2150,18 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 		return;
 	}
 
+	/*
+	 * Force a fresh PPS (re-)activation before engaging.  If a prior HRST collapse
+	 * routed recovery through auto-disengage->auto-engage, the contract can be a
+	 * FIXED PDO while pps_active stayed stale-true (sm5440_pps_contract_active reads
+	 * true on a PPS-capable adapter even at fixed 9 V, so the keepalive never cleared
+	 * it) -- then pps_request skips PROG_ONLINE and the pump strands on the fixed
+	 * contract at half rate.  Mirror the reengage worker (which forces pps_active
+	 * false) so the auto-engage fallback rebuilds real PPS regardless of which
+	 * recovery path ran.  Kept here (not in dc_start) so reengage does not
+	 * double-force and the manual dc_test/dc_probe paths are unchanged.
+	 */
+	WRITE_ONCE(chip->pps_active, false);
 	ret = sm5440_dc_start(chip, SM5440_AUTO_ENGAGE_CI_GL, false);
 	if (ret) {
 		if (++chip->dc_retry_cnt >= SM5440_AUTO_RETRY_MAX) {
