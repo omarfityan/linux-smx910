@@ -482,6 +482,7 @@ struct tcpm_port {
 	 * SNK_READY.
 	 */
 	bool pps_reassert;
+	bool pps_nr_tx_failed;	/* PPS Request got no GoodCRC ack; waiting to adopt a late Accept */
 
 	/* Requested current / voltage to the port partner */
 	u32 req_current_limit;
@@ -3259,7 +3260,24 @@ static void tcpm_pd_data_request(struct tcpm_port *port,
 		 */
 			port->ams = POWER_NEGOTIATION;
 			port->in_ams = true;
-			tcpm_set_state(port, SNK_NEGOTIATE_CAPABILITIES, 0);
+			/*
+			 * If we held an explicit PPS contract before a soft
+			 * reset, its Source_Capabilities refresh lands here
+			 * (state == SNK_WAIT_CAPABILITIES). A plain
+			 * renegotiation drops us to a fixed PDO and tears the
+			 * PPS contract down -- the pump collapse. Re-assert the
+			 * held APDO instead; tcpm_pd_select_pps_apdo() scans the
+			 * fresh caps by req_out_volt/req_op_curr and does not
+			 * depend on pps_data.supported (which a soft reset
+			 * leaves intact anyway).
+			 */
+			if (port->pps_data.active) {
+				port->pps_reassert = true;
+				tcpm_set_state(port,
+					       SNK_NEGOTIATE_PPS_CAPABILITIES, 0);
+			} else {
+				tcpm_set_state(port, SNK_NEGOTIATE_CAPABILITIES, 0);
+			}
 		} else {
 			if (port->ams == GET_SOURCE_CAPABILITIES)
 				tcpm_ams_finish(port);
@@ -3566,6 +3584,21 @@ static void tcpm_pd_ctrl_request(struct tcpm_port *port,
 			tcpm_set_state(port, SNK_TRANSITION_SINK, 0);
 			break;
 		case SNK_NEGOTIATE_PPS_CAPABILITIES:
+			if (port->pps_nr_tx_failed) {
+				/*
+				 * This Accept answers a PPS Request whose GoodCRC
+				 * ack we lost (TCPC_TX_FAILED) -- the source
+				 * plainly received it. Our TX path leaves
+				 * message_id un-incremented on a failed send, so
+				 * advance it now to match the source's
+				 * expectation; otherwise the next keepalive
+				 * Request carries a stale id the source drops as a
+				 * duplicate, ending in a hard reset.
+				 */
+				port->message_id = (port->message_id + 1) &
+						   PD_HEADER_ID_MASK;
+				port->pps_nr_tx_failed = false;
+			}
 			port->pps_data.active = true;
 			port->pps_data.min_volt = port->pps_data.req_min_volt;
 			port->pps_data.max_volt = port->pps_data.req_max_volt;
@@ -4568,6 +4601,7 @@ static void tcpm_reset_port(struct tcpm_port *port)
 	port->pd_capable = false;
 	port->pps_data.supported = false;
 	port->pps_reassert = false;
+	port->pps_nr_tx_failed = false;
 	tcpm_set_partner_usb_comm_capable(port, false);
 
 	/*
@@ -5321,7 +5355,30 @@ static void run_state_machine(struct tcpm_port *port)
 		break;
 	case SNK_NEGOTIATE_PPS_CAPABILITIES:
 		ret = tcpm_pd_send_pps_request(port);
-		if (ret < 0) {
+		port->pps_nr_tx_failed = false;
+		if (ret == -EIO && !port->update_sink_caps && !port->pps_reassert) {
+			/*
+			 * The PPS Request got no GoodCRC ack (TCPC_TX_FAILED).
+			 * At high charging current this is almost always a lost
+			 * ack, not a lost Request: the source received it and
+			 * will Accept. Abandoning to SNK_READY here makes that
+			 * Accept look unexpected -> soft reset -> the PPS
+			 * contract is torn down (the high-current charging
+			 * thrash). Instead keep waiting tSenderResponse for the
+			 * Accept, the way the factory sec_pd stack does. If it
+			 * arrives we resync MessageID and adopt the contract
+			 * (the PD_CTRL_ACCEPT handler); if it does not we revert
+			 * to SNK_READY on the still-valid prior contract
+			 * (pps_status stays 0 -- for a keepalive the held
+			 * contract is unchanged, so the caller sees success).
+			 * Restore the vbus-discharge threshold the send relaxed.
+			 */
+			tcpm_set_auto_vbus_discharge_threshold(port, TYPEC_PWR_MODE_PD,
+							       port->pps_data.active,
+							       port->supply_voltage);
+			port->pps_nr_tx_failed = true;
+			tcpm_set_state_cond(port, SNK_READY, PD_T_SENDER_RESPONSE);
+		} else if (ret < 0) {
 			/* Restore back to the original state */
 			tcpm_set_auto_vbus_discharge_threshold(port, TYPEC_PWR_MODE_PD,
 							       port->pps_data.active,
