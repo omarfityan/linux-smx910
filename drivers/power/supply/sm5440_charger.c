@@ -243,10 +243,10 @@
 						 * ta.c_max == ci_gl, so _try_to_adjust_cc_up caps ta.c at ta.c_max
 						 * and the PEAK request == ci_gl (NOT ci_gl+200 -- that band is
 						 * unreachable once c_max binds; sess-234 measured peak 4000, delivered
-						 * ~3760, ZERO HRST at loaded 3939-4009 mV).  This 4000 is the LOW-VBAT
-						 * band only: the PS_RDY boundary FALLS as the cell climbs, so
-						 * dc_monitor's Build-2a sm5440_ci_gl_cap() ratchets ci_gl DOWN per
-						 * VBAT band to stay below the falling boundary through step 1. */
+						 * ~3760, ZERO HRST at loaded 3939-4009 mV).  dc_monitor then hands the
+						 * goal to the device-own step ladder (sm5440_dc_step_ibus); the
+						 * delivered current tapers on its own as the cell climbs, because
+						 * IBUS = (ta.v - 2*Vcell - v_offset)/r_ttl and ta.v is ceilinged. */
 #define SM5440_AUTO_RETRY_MAX		3	/* consecutive engage failures before latching off until replug */
 /*
  * dc_intent false-transition debounce depth (consecutive buck-worker false polls
@@ -308,31 +308,61 @@ static const u32 sm5440_dc_step_cond_vol[SM5440_DC_STEP_MAX + 1] = { 4250, 4420,
 static const u32 sm5440_dc_step_cond_iin[SM5440_DC_STEP_MAX]     = { 4100, 2000 };       /* val_iout[N+1]/2 (mA) */
 
 /*
- * Build-2a: VBAT-aware ci_gl (INPUT-current) ceiling.  The source's PS_RDY
- * boundary -- the maximum input current tcpm can Request before the source
- * withholds PS_RDY within tPSTransition (500 ms) and tcpm SENDS a Hard Reset --
- * FALLS as the cell voltage climbs (2*Vcell rises, so the source's headroom under
- * the ~10.5 V PPS ceiling shrinks).  Empirical model (LOADED FG voltage_now, the
- * dc_monitor's cell-V reading): boundary(mV) ~= 4450 - 3*(mV - 3900) mA -- fit to
- * the sess-233 Hard Reset (req 4000 mA @ loaded 4050 mV) and confirmed by sess-234
- * (req 4000 mA held, delivered ~3760 mA, ZERO HRST @ loaded 3939-4009 mV).  A
- * FIXED cap (Build 1's 4000) eventually MEETS the falling boundary -> one miss
- * fires the HRST -> pump drops to buck.  So cap ci_gl per VBAT band, a conservative
- * >=480 mA below the modeled boundary, ratcheting DOWN as the cell climbs
- * (dc_monitor applies it).  VBAT rises monotonically on charge, so the ratchet
- * only ever lowers -> no flap, no hysteresis needed.  This caps steps 0 AND 1 (the
- * pump runs continuously ENGAGE_SOC..DISENGAGE_SOC; step 1's 4100 mA is itself a
- * high-VBAT HRST site).  Sub-ceiling requests DELIVER their request (the source
- * meets them below the boundary), so the current tapers with VBAT -- the same
- * physics the device-own sec_step_charging supervisor imposes.
+ * VBAT-banded ci_gl (INPUT-current) ceiling.
+ *
+ * !! THIS TABLE'S ORIGINAL RATIONALE IS WRONG, AND ITS CURRENT ONE IS EMPIRICAL ONLY. !!
+ *
+ * It was introduced to stay under a modelled "PS_RDY boundary" -- the claim that the source
+ * withholds PS_RDY as the cell climbs, forcing tcpm to Hard Reset, per
+ * boundary(mA) ~= 4450 - 3*(cell_mV - 3900).  THAT MECHANISM DOES NOT EXIST.  Across every
+ * capture the source ACCEPTED every APDO Request it received (258 Requests / 260 Accepts;
+ * zero Rejects).  Steady-state current is just Ohm's law through the device-own path
+ * resistance:
+ *
+ *	IBUS = (ta.v - 2*Vcell - v_offset) / r_ttl
+ *
+ * with r_ttl = 500 mOhm straight from the device's own DT (SM5440_GTS9U_R_TTL_UOHM) -- the
+ * same relation the engine already feeds forward when it computes ta.v.  The old comment on
+ * this table very nearly had it ("ceiling (10500-2Vcell)/0.66"); it used 0.66 instead of the
+ * device's 0.5 and then buried the physics under a refusal narrative.
+ *
+ * The table is KEPT anyway, because REMOVING it measurably REGRESSED the device.  Uncapped,
+ * the pump reached 3580 mA / 30.7 W in CC on the production auto-engage path (vs ~2900 mA /
+ * ~24.4 W capped -- so the removal DOES deliver the current it promises), then collapsed;
+ * repeated collapses reached the 3-strike latch-off.  Capped, the same hardware ran 26 W for
+ * 25 minutes with ZERO collapses.
+ *
+ * WHAT CAUSES THOSE COLLAPSES IS UNDIAGNOSED.  Two candidate explanations were BOTH refuted
+ * by measurement -- do not resurrect either:
+ *   - "the source refuses"  -> NO: it Accepts (above).
+ *   - "high current corrupts the PD comms, so this cap holds us under a noise floor" -> NO:
+ *     a collapse was observed at ta.c = 2000 mA / IBUS 2006 mA during PRE_CC, BELOW this
+ *     table's own smallest band -- which the table therefore could not have prevented.
+ * WIRE-PROVEN: the SINK sends the Hard Reset (tcpm SNK_NEGOTIATE_PPS_CAPABILITIES ->
+ * HARD_RESET_SEND after tSenderResponse, 60 ms) when an Accept does not arrive -- i.e.
+ * Accepts are lost INTERMITTENTLY.  WHY is the open question.  One confound was never
+ * cleared: the test source had absorbed ~10 Hard Resets and was seen holding VBUS = 10243 mV
+ * at IBUS = 0 (a wedged-source signature), so source state is not ruled out.
+ *
+ * SO: this is a MITIGATION OF AN UNDIAGNOSED FAULT, retained on evidence that it helps and
+ * that removing it hurts -- NOT a model of the hardware.  Do not read these numbers as
+ * physics; do not extend them by curve-fitting.  DELETE THEM once the lost-Accept mechanism
+ * is understood: the device-own step ladder (sm5440_dc_step_ibus = val_iout/2 from the DT) is
+ * the vendor's actual authority for the input-current goal, and it permits 4500 mA to cell
+ * 4250 mV -- which is where the ~30 W "match stock" target lives.
+ *
+ * The likely cure (device-own source, RULE #1): sm5714_policy.c PE_SNK_Select_Capability
+ * waits tSenderResponse for the Accept REGARDLESS of TX status -- the vendor does NOT Hard
+ * Reset on a missed Accept.  Our tcpm port covers only the TX-fail (-EIO) case, not the
+ * Accept-lost-after-successful-TX case observed here.
  */
 static u32 sm5440_ci_gl_cap(int fg_mv)
 {
-	if (fg_mv < 4010)	return 4000;	/* boundary >4120; sess-234 measured-safe (delivered ~3760) */
-	if (fg_mv < 4090)	return 3400;	/* boundary 4120->3880; margin >=480 mA */
-	if (fg_mv < 4170)	return 3200;	/* deliver toward ceiling (10500-2Vcell)/0.66 ~3270-3510; boundary 3880->3640, margin >=440 mA (measured-safe: 3400 held @4090, 0 HRST) */
-	if (fg_mv < 4280)	return 2900;	/* ceiling ~2940-3270; boundary ~3640->3310, margin >=410 mA */
-	return 2500;				/* ceiling ~2460-2940; boundary ~3310->2830, margin >=330; CV float (4440) approaching */
+	if (fg_mv < 4010)	return 4000;
+	if (fg_mv < 4090)	return 3400;
+	if (fg_mv < 4170)	return 3200;
+	if (fg_mv < 4280)	return 2900;
+	return 2500;
 }
 
 /*
@@ -410,6 +440,23 @@ static u32 sm5440_ci_gl_cap(int fg_mv)
 #define SM5440_TCPM_SOURCE_PSY		"tcpm-source-psy-1-0033"
 #define SM5440_PPS_KEEPALIVE_MS		5000	/* re-ping < source tPPSTimeout (~12 s) */
 #define SM5440_PPS_KEEPALIVE_SKIP_MS	3000	/* skip the ping if the engine stepped recently */
+/*
+ * Consecutive keepalive polls with the source reading OFFLINE before "gone" is committed.
+ * A RECEIVED Hard Reset drives VBUS to vSafe0V and tcpm does tcpm_set_charge(false) for
+ * ~1-2 s, so ONLINE reads OFFLINE transiently -- committing "gone" on that single sample
+ * would stop the keepalive at exactly the moment its re-arm is needed.  Same transient and
+ * same reasoning as SM5440_DC_INTENT_FALSE_DEBOUNCE; 2 polls (>= 10 s) covers it with
+ * margin while a real unplug still stops within one extra period.
+ */
+#define SM5440_PPS_GONE_DEBOUNCE	2
+/*
+ * Floor between PROG_ONLINE (re-)activation attempts.  tcpm_pps_activate() BLOCKS on
+ * wait_for_completion_timeout(pps_complete) for up to PD_PPS_CTRL_TIMEOUT (10 s) when the
+ * source will not enter PPS, and BOTH the engine's CC loop and the keepalive can reach it.
+ * Without a floor, a persistently non-PPS contract would stall the engine workqueue ~10 s
+ * per step.  One keepalive period is the natural floor.
+ */
+#define SM5440_PPS_REARM_MIN_MS		SM5440_PPS_KEEPALIVE_MS
 
 struct sm5440 {
 	struct device *dev;
@@ -495,7 +542,7 @@ struct sm5440 {
 	 */
 	int dc_step;		/* current ladder step */
 	int dc_step_iin_cnt;	/* consecutive ticks the advance predicate held (debounce -> SM5440_DC_STEP_IIN_CNT) */
-	u32 dc_ci_applied;	/* Build-2a: currently-applied VBAT-banded ci_gl cap (mA); dc_monitor ratchets it DOWN */
+	u32 dc_ci_applied;	/* currently-applied ci_gl goal (mA); dc_monitor ratchets it DOWN per ladder step */
 
 	/*
 	 * Increment-3c: the mainline-tcpm PPS bridge.  tcpm_psy is tcpm's
@@ -512,6 +559,8 @@ struct sm5440 {
 	u32 pps_target_mv, pps_target_ma;	/* desired (the keepalive re-issues this) */
 	u32 pps_sent_mv, pps_sent_ma;		/* last actually sent (skip-unchanged) */
 	unsigned long pps_last_step;		/* jiffies of the last step (keepalive backoff) */
+	u8 pps_gone_cnt;			/* consecutive keepalive polls with the source absent */
+	unsigned long pps_rearm_next;		/* jiffies floor for the next PROG_ONLINE attempt */
 };
 
 /*
@@ -808,29 +857,130 @@ static void sm5440_pump_disengage_chip(struct sm5440 *chip)
  * ===================================================================== */
 
 /*
- * True iff a PPS-capable PD contract is up.  usb_type == PD_PPS is derived from
- * the SOURCE's advertised caps (an APDO present), NOT from our contract being on
- * the PPS APDO right now -- so it reads true with a PPS-capable adapter even at
- * the 9 V FIXED pre-activation state.  That is exactly the non-circular gate the
- * supervisor needs: it must pass BEFORE the engine activates PPS.  A non-PPS PD
- * charger reads plain PD here, so the pump cleanly declines to engage on a
- * source it could not step.
+ * PRE-ACTIVATION gate: is a PPS-capable PD source attached at all?
+ *
+ * usb_type == PD_PPS is derived from the SOURCE's advertised caps (an APDO present),
+ * NOT from our contract being on the PPS APDO right now -- so it reads true with a
+ * PPS-capable adapter even at the 9 V FIXED pre-activation state.  That is exactly the
+ * non-circular gate the engage paths need: they must pass BEFORE the engine activates
+ * PPS.  A non-PPS PD charger reads plain PD here, so the pump cleanly declines to engage
+ * on a source it could not step.
+ *
+ * This is deliberately NOT a liveness test: FIXED_ONLINE passes it by design.  To ask
+ * "is PPS live right now?" use sm5440_pps_contract_live() -- see the comment there for
+ * what happens when the two questions are conflated.
  */
-static bool sm5440_pps_contract_active(struct sm5440 *chip)
+static bool sm5440_pd_source_usable(struct sm5440 *chip)
 {
 	union power_supply_propval pv;
 
 	if (!chip->tcpm_psy)
 		return false;
 	if (power_supply_get_property(chip->tcpm_psy,
+				      POWER_SUPPLY_PROP_ONLINE, &pv))
+		return false;
+	if (pv.intval == SM5440_TCPM_PSY_OFFLINE)
+		return false;
+
+	/*
+	 * PROG_ONLINE is DEFINITIVE and must short-circuit: it means pps_data.active,
+	 * so the source is by construction PPS-capable and steppable.  Do NOT consult
+	 * usb_type here -- it LAGS.  tcpm sets psy_type in tcpm_pd_build_pps_request(),
+	 * i.e. on the NEXT request after activation, and a Hard Reset rebuilds a FIXED
+	 * request which resets it to plain PD.  So after a re-arm there is a window in
+	 * which ONLINE already reads PROG_ONLINE while usb_type still reads PD.
+	 *
+	 * Requiring PD_PPS in that window broke the handoff invariant: it let
+	 * sm5440_pps_contract_live() (ONLINE == PROG_ONLINE) pass while THIS gate
+	 * failed, so dc_reengage_work's poll declared "contract back" and the very next
+	 * sm5440_dc_start() returned -ENOTCONN -> a strike -> 3 strikes ->
+	 * dc_err_latched -> pump off until a physical replug.  Measured on-device: three
+	 * consecutive "reengage: contract back but dc_start failed (-107)" then
+	 * "latching off until charger replug", on a source that was perfectly healthy.
+	 *
+	 * Before the predicates were split, the poll and dc_start called the SAME
+	 * helper, so "poll passed => dc_start passes" held by construction.  This
+	 * short-circuit restores that invariant: contract_live() == true now implies
+	 * pd_source_usable() == true, always.
+	 */
+	if (pv.intval == SM5440_TCPM_PSY_PROG_ONLINE)
+		return true;
+
+	/*
+	 * FIXED_ONLINE: the genuine pre-activation state.  usb_type is then the only
+	 * evidence that the source advertises an APDO at all, so a plain (non-PPS) PD
+	 * charger reads PD here and the pump cleanly declines to engage on a source it
+	 * could not step.
+	 */
+	if (power_supply_get_property(chip->tcpm_psy,
 				      POWER_SUPPLY_PROP_USB_TYPE, &pv))
 		return false;
-	if (pv.intval != POWER_SUPPLY_USB_TYPE_PD_PPS)
+	return pv.intval == POWER_SUPPLY_USB_TYPE_PD_PPS;
+}
+
+/*
+ * POST-ACTIVATION check: is the PPS contract LIVE right now?
+ *
+ * ONLINE == PROG_ONLINE is the ONLY truthful signal.  tcpm_psy_get_online() reports
+ * PROG_ONLINE iff (vbus_charge && pps_data.active), so it tracks PPS liveness exactly.
+ *
+ * NEITHER of the pre-activation gate's tests can answer this question:
+ *   - usb_type stays STALE at PD_PPS after the contract falls back to a FIXED PDO
+ *     (it describes the source's advertised caps, which do not change), and
+ *   - FIXED_ONLINE satisfies "!= OFFLINE".
+ * So sm5440_pd_source_usable() returns TRUE while we are stranded on a fixed contract.
+ * Using it as a liveness test -- one predicate answering two opposite questions -- is
+ * what let the strand below go unobserved:
+ *
+ * A RECEIVED Hard Reset zeroes tcpm's pps_data and re-negotiates from our sink-caps,
+ * which selects a FIXED PDO (PPS is opt-in via PROG_ONLINE and nothing re-arms it).
+ * pps_active then stays stale-true, sm5440_pps_request() skips re-activation, and every
+ * setpoint write is silently discarded -- the pump strands on the FIXED contract at HALF
+ * rate.  Measured on-device: a 10500 mV x 4000 mA request delivering 2040 mA / 15.8 W
+ * with ONLINE=1, voltage_max=9000000, current_max=3000000 (the 9 V fixed PDO) while
+ * usb_type still read PD_PPS; a replug restored PROG_ONLINE, the 11000 mV / 5000 mA APDO
+ * window, 3184 mA and 26.1 W with zero collapses.
+ */
+static bool sm5440_pps_contract_live(struct sm5440 *chip)
+{
+	union power_supply_propval pv;
+
+	if (!chip->tcpm_psy)
 		return false;
 	if (power_supply_get_property(chip->tcpm_psy,
 				      POWER_SUPPLY_PROP_ONLINE, &pv))
 		return false;
-	return pv.intval != SM5440_TCPM_PSY_OFFLINE;
+	return pv.intval == SM5440_TCPM_PSY_PROG_ONLINE;
+}
+
+/*
+ * Classify a PPS setpoint-step errno, and act on the one that matters.
+ *
+ * -EOPNOTSUPP is tcpm's IN-BAND, SYNCHRONOUS "PPS is not active": tcpm_pps_set_out_volt()
+ * / _set_out_curr() return it the instant !pps_data.active.  It is UNIQUE to that
+ * condition -- -EAGAIN is "not SNK_READY (AMS in flight)", -EINVAL is "outside the PPS
+ * window", -ETIMEDOUT is "slow PS_RDY on a still-live contract".  So it is a race-free
+ * strand detector that costs nothing: no extra psy read, no poll, no window in which the
+ * answer can change under us.
+ *
+ * tcpm was returning this on EVERY write while the pump sat stranded on a FIXED PDO at
+ * half rate -- several times per second, correctly, unambiguously -- and it went to
+ * dev_dbg, which is compiled out / off by default.  The strand was therefore invisible
+ * while the engine logged healthy-looking requests it did not have a contract for.  Warn,
+ * and drop pps_active so the next step re-enters PROG_ONLINE activation.
+ */
+static void sm5440_pps_step_err(struct sm5440 *chip, int ret, const char *what, u32 val)
+{
+	if (ret != -EOPNOTSUPP) {
+		dev_dbg(chip->dev, "pps: set %s=%u (%d, absorbed)\n", what, val, ret);
+		return;
+	}
+	if (READ_ONCE(chip->pps_active)) {
+		dev_warn(chip->dev,
+			 "pps: STRANDED -- tcpm reports PPS inactive on set %s=%u (-EOPNOTSUPP): the contract fell back to a FIXED PDO; re-arming PROG_ONLINE\n",
+			 what, val);
+		WRITE_ONCE(chip->pps_active, false);
+	}
 }
 
 /*
@@ -873,12 +1023,42 @@ static int sm5440_pps_request(struct sm5440 *chip, u32 mv, u32 ma, bool force)
 	 * and return 0 so the engine is not faulted; the next step (or dc_start's
 	 * VBUS-verify abort + the supervisor's retry) re-attempts.  On success arm
 	 * the keepalive and reset the sent-cache so the first step emits both V + I.
+	 *
+	 * Rate-limited: tcpm_pps_activate() BLOCKS on wait_for_completion_timeout() for up
+	 * to PD_PPS_CTRL_TIMEOUT (10 s) when the source will not enter PPS, and BOTH this
+	 * engine path (every CC/CV loop, < 3 s) and the keepalive re-arm can land here.  A
+	 * floor keeps a persistently non-PPS contract from stalling the engine workqueue
+	 * ~10 s per step.  Deliberate re-arm sites (auto-engage / re-engage) clear the floor
+	 * so their first attempt is never throttled.
 	 */
 	if (!READ_ONCE(chip->pps_active)) {
+		if (time_before(jiffies, READ_ONCE(chip->pps_rearm_next))) {
+			dev_dbg(chip->dev, "pps: activate rate-limited\n");
+			return 0;
+		}
 		pv.intval = SM5440_TCPM_PSY_PROG_ONLINE;
 		ret = power_supply_set_property(chip->tcpm_psy,
 						POWER_SUPPLY_PROP_ONLINE, &pv);
 		if (ret) {
+			/*
+			 * Arm the floor ONLY on the return that actually cost us the wait.
+			 * tcpm_pps_activate() reaches its wait_for_completion_timeout()
+			 * (PD_PPS_CTRL_TIMEOUT, 10 s) only AFTER tcpm_ams_start() succeeds -- i.e.
+			 * only once the port already IS SNK_READY.  -EAGAIN (state != SNK_READY)
+			 * and -EOPNOTSUPP (PPS unsupported) fast-fail instantly and cost nothing.
+			 *
+			 * This matters: -EAGAIN is EXACTLY the post-Hard-Reset mid-transition state
+			 * that dc_reengage_work's poll re-invokes us to wait out (16 tries x 500 ms).
+			 * Flooring on that free failure would cut the poll to ~2 real attempts and
+			 * straddle the ~1-2 s window in which the port becomes ready -- delaying
+			 * recovery, and at the tail exhausting the poll into a dc_retry_cnt strike
+			 * (3 -> dc_err_latched -> pump off until a physical replug).  Arming after
+			 * the call also removes the check-then-set window on pps_rearm_next between
+			 * the engine and the keepalive: no fast-fail path installs a floor at all.
+			 */
+			if (ret == -ETIMEDOUT)
+				WRITE_ONCE(chip->pps_rearm_next,
+					   jiffies + msecs_to_jiffies(SM5440_PPS_REARM_MIN_MS));
 			dev_dbg(chip->dev, "pps: activate deferred (%d)\n", ret);
 			return 0;
 		}
@@ -927,7 +1107,7 @@ static int sm5440_pps_request(struct sm5440 *chip, u32 mv, u32 ma, bool force)
 		ret = power_supply_set_property(chip->tcpm_psy,
 						POWER_SUPPLY_PROP_CURRENT_NOW, &pv);
 		if (ret) {
-			dev_dbg(chip->dev, "pps: set I=%u mA (%d, absorbed)\n", ma, ret);
+			sm5440_pps_step_err(chip, ret, "I", ma);
 		} else {
 			WRITE_ONCE(chip->pps_sent_ma, ma);
 			/*
@@ -949,7 +1129,7 @@ static int sm5440_pps_request(struct sm5440 *chip, u32 mv, u32 ma, bool force)
 		ret = power_supply_set_property(chip->tcpm_psy,
 						POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv);
 		if (ret) {
-			dev_dbg(chip->dev, "pps: set V=%u mV (%d, absorbed)\n", mv, ret);
+			sm5440_pps_step_err(chip, ret, "V", mv);
 		} else {
 			WRITE_ONCE(chip->pps_sent_mv, mv);
 			WRITE_ONCE(chip->pps_last_step, jiffies);	/* real send -> refresh the skip window */
@@ -971,20 +1151,52 @@ static int sm5440_pps_request(struct sm5440 *chip, u32 mv, u32 ma, bool force)
 static void sm5440_pps_keepalive_work(struct work_struct *work)
 {
 	struct sm5440 *chip = container_of(work, struct sm5440, pps_keepalive.work);
+	bool restrand = false;
 	unsigned long flags;
 	u32 mv, ma;
 
 	if (!READ_ONCE(chip->pps_active))
 		return;
 
-	if (!sm5440_pps_contract_active(chip)) {
-		dev_info(chip->dev, "pps keepalive: contract gone -- stopping\n");
+	/*
+	 * Is the source GONE (a real unplug), or merely OFFLINE for an instant?  A RECEIVED
+	 * Hard Reset drives VBUS to vSafe0V and tcpm does tcpm_set_charge(false) for ~1-2 s,
+	 * so ONLINE reads OFFLINE transiently.  Committing "gone" on that single sample would
+	 * stop this worker at precisely the moment its re-arm below is needed -- the same
+	 * transient, and the same trap, as the dc_intent false-poll (see
+	 * SM5440_DC_INTENT_FALSE_DEBOUNCE).  So debounce it.
+	 */
+	if (!sm5440_pd_source_usable(chip)) {
+		if (++chip->pps_gone_cnt < SM5440_PPS_GONE_DEBOUNCE) {
+			dev_dbg(chip->dev, "pps keepalive: source absent (%u/%u) -- debouncing\n",
+				chip->pps_gone_cnt, SM5440_PPS_GONE_DEBOUNCE);
+			goto rearm;
+		}
+		dev_info(chip->dev, "pps keepalive: source gone -- stopping\n");
+		chip->pps_gone_cnt = 0;
 		WRITE_ONCE(chip->pps_active, false);
 		return;			/* do not reschedule */
 	}
+	chip->pps_gone_cnt = 0;
 
-	/* The engine pinged recently: it owns the cadence this window; just rearm. */
-	if (time_before(jiffies, READ_ONCE(chip->pps_last_step) +
+	/*
+	 * Source attached but PPS NOT live => the contract fell back to a FIXED PDO and
+	 * pps_active is stale.  This is the strand: every setpoint write is being silently
+	 * discarded and the pump is running at half rate.  Drop the stale flag so the forced
+	 * re-Request below re-enters the PROG_ONLINE activation in sm5440_pps_request().
+	 */
+	if (!sm5440_pps_contract_live(chip)) {
+		dev_warn(chip->dev,
+			 "pps keepalive: contract fell back to a FIXED PDO -- re-arming PROG_ONLINE\n");
+		WRITE_ONCE(chip->pps_active, false);
+		restrand = true;
+	}
+
+	/*
+	 * The engine pinged recently: it owns the cadence this window; just rearm.  NEVER
+	 * skip on a strand -- the re-Request is the recovery, not a keepalive ping.
+	 */
+	if (!restrand && time_before(jiffies, READ_ONCE(chip->pps_last_step) +
 				 msecs_to_jiffies(SM5440_PPS_KEEPALIVE_SKIP_MS)))
 		goto rearm;
 
@@ -993,10 +1205,18 @@ static void sm5440_pps_keepalive_work(struct work_struct *work)
 	ma = chip->pps_target_ma;
 	spin_unlock_irqrestore(&chip->pps_lock, flags);
 
-	sm5440_pps_request(chip, mv, ma, true);		/* force the re-Request */
+	sm5440_pps_request(chip, mv, ma, true);		/* force the re-Request (re-arms PPS if stranded) */
 	dev_dbg(chip->dev, "pps keepalive: re-Request %u mV\n", mv);
 
 rearm:
+	/*
+	 * Guarded, NOT unconditional: sm5440_remove() clears pps_active precisely so an
+	 * in-flight keepalive cannot re-queue itself during teardown.  If a strand re-arm
+	 * above failed, pps_active stays false and this worker stops -- that is safe, because
+	 * the engine calls sm5440_pps_request() every CC/CV loop (< 3 s), which re-activates
+	 * PPS and re-arms this worker itself.  Recovery does not depend on the keepalive
+	 * surviving; it depends on pps_active being FALSE when PPS is not live.
+	 */
 	if (READ_ONCE(chip->pps_active))
 		schedule_delayed_work(&chip->pps_keepalive,
 				      msecs_to_jiffies(SM5440_PPS_KEEPALIVE_MS));
@@ -1094,7 +1314,7 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 {
 	int vbat_mv = 0, target_mv, off_mv, ret;
 
-	if (!sm5440_pps_contract_active(chip)) {
+	if (!sm5440_pd_source_usable(chip)) {
 		dev_warn(chip->dev,
 			 "engage: no PPS contract active -- arm pd_request + plug first\n");
 		return -ENOTCONN;
@@ -1641,20 +1861,17 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 	}
 
 	/*
-	 * The input-current ceiling = min(Build-2a VBAT-aware cap, device-own
-	 * step_ibus[dc_step]).  Reached only with the engine ACTIVE (past the teardown
-	 * check), so a re-target never lands on a dead engine.  FG voltage_now is the
-	 * LOADED cell reading (the boundary model's domain); it reads ~300 mV above the
-	 * resting cell under a ~7.6 A charge, and is a DIFFERENT quantity from the ~2x
-	 * battery-side cell current.
+	 * The input-current goal = the device-own step ladder, step_ibus[dc_step].  Reached
+	 * only with the engine ACTIVE (past the teardown check), so a re-target never lands
+	 * on a dead engine.  FG voltage_now is the LOADED cell reading; it reads ~300 mV
+	 * above the resting cell under a ~7.6 A charge, and is a DIFFERENT quantity from the
+	 * ~2x battery-side cell current.  It drives the LADDER (cond_vol) only -- it no
+	 * longer selects a current band.
 	 *
-	 * Build-2a cap: sm5440_ci_gl_cap() falls per VBAT band as the source's PS_RDY
-	 * boundary falls; we ratchet it DOWN (never up -- VBAT rises monotonically on
-	 * charge) via set_ta_cmax (holds the CC peak AT ci_gl) + set_target_ibus (diverts
-	 * the engine to a PRESET re-ramp at the lower target -- inherently safe on a
-	 * REDUCTION, re-ramping from 50% of the new cap).  This caps steps 0 AND 1: the
-	 * pump runs continuously ENGAGE_SOC(62)..DISENGAGE_SOC(95), so step 1's device-own
-	 * 4100 mA would itself over-request at its high entry VBAT -- the min() caps it.
+	 * We ratchet the goal DOWN, never up (the ladder only ever steps down), via
+	 * set_ta_cmax (holds the CC peak AT ci_gl) + set_target_ibus (diverts the engine to
+	 * a PRESET re-ramp at the lower target -- inherently safe on a REDUCTION, re-ramping
+	 * from 50% of the new goal).  This is what applies the ladder's step-2 taper.
 	 */
 	{
 		int fgv_uv = 0, cell_mv;
@@ -1680,15 +1897,49 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 				 "TEST: HRST-inject holding over-request %u mA at FG-V=%dmV\n",
 				 SM5440_HRST_INJECT_MA, cell_mv);
 		} else {
+			/*
+			 * The device-own step ladder is the ONLY authority on the input-current
+			 * goal (val_iout/2 from the device's own DT).  The VBAT-band cap that used
+			 * to shadow it here was ours, not the vendor's, and its premise -- "the
+			 * source withholds PS_RDY as the cell climbs, so tcpm SENDS a Hard Reset"
+			 * -- describes an event that occurs in NO capture: across every run the
+			 * source Accepted every APDO Request (258 Requests / 260 Accepts, zero
+			 * Rejects, zero tcpm-sent Hard Resets).  A PPS Request's operating current
+			 * is a CEILING the source regulates to, not a demand it can refuse; the
+			 * source has no knowledge of our cell voltage and no reason to object.
+			 * Measured: a cap-exempt run held 4000 mA across cell 4096->4200 mV for
+			 * 185 s with zero Hard Resets, delivering ~31.9 W into the cell, exactly
+			 * where the cap would have throttled to 3200 mA (~24 W).
+			 *
+			 * Removing it costs no protection: the cap is an input-current throttle,
+			 * never a voltage limit.  The cell is protected by the CV chain, which is
+			 * wholly independent of it -- sm_dc_set_target_vbat() per ladder step ->
+			 * re-PRESET -> VBATREG = target + SM5440_CV_OFFSET (the HW ceiling), plus
+			 * the polled LOOP_VBATREG -> SM_DC_CV transition -- and the current is
+			 * bounded by ta.c_max, the IBUSLIM HW limit, and the SW-OCP backstop.
+			 *
+			 * The ratchet below is KEPT: these are the only sm_dc_set_ta_cmax() /
+			 * sm_dc_set_target_ibus() calls after dc_start's one-time seed, so they are
+			 * what applies the ladder's step-2 taper (2000 mA) as the cell tops out.
+			 */
+			/*
+			 * min(mitigation cap, device-own step ladder).  The ladder
+			 * (sm5440_dc_step_ibus = val_iout/2) is the VENDOR's authority and permits
+			 * 4500 mA to cell 4250; the cap is ours and is an empirical mitigation of an
+			 * UNDIAGNOSED collapse -- see sm5440_ci_gl_cap() for what is and is not
+			 * established, and for why it must be deleted once the lost-Accept mechanism
+			 * is understood.  Removing it was TRIED and regressed the device.
+			 */
 			u32 cap = sm5440_ci_gl_cap(cell_mv);
 			u32 eff = min_t(u32, cap, sm5440_dc_step_ibus[chip->dc_step]);
+
 			/* Fixed (production auto-engage / dc_test) runs only: the adaptive dc_probe
-			 * deliberately holds ci_gl HIGH to push ta.v_max, so the cap must not fight it. */
+			 * deliberately holds ci_gl HIGH to push ta.v_max, so this must not fight it. */
 			if (!chip->dc_adaptive && cell_mv > 0 && eff < chip->dc_ci_applied) {
 				sm_dc_set_ta_cmax(chip->dc, eff);	/* hold the CC peak at ci_gl (no +offset) */
-				sm_dc_set_target_ibus(chip->dc, eff);	/* divert to the re-preset at the lower cap */
+				sm_dc_set_target_ibus(chip->dc, eff);	/* divert to the re-preset at the lower goal */
 				dev_info(chip->dev,
-					 "ci_gl cap: %u -> %u mA at FG-V=%dmV (step=%d) -- VBAT-aware, boundary-safe\n",
+					 "ci_gl: %u -> %u mA at FG-V=%dmV (step=%d) -- min(mitigation cap, device-own val_iout/2)\n",
 					 chip->dc_ci_applied, eff, cell_mv, chip->dc_step);
 				chip->dc_ci_applied = eff;
 			}
@@ -1719,7 +1970,7 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 					chip->dc_step_iin_cnt = 0;
 					sm_dc_set_target_vbat(chip->dc, sm5440_dc_step_vbat[n + 1]);
 					dev_info(chip->dev,
-						 "dc ladder: step %d -> %d (vbat %u->%u mV; ibus owned by ci_gl cap) at FG-V=%dmV IBUS=%dmA\n",
+						 "dc ladder: step %d -> %d (vbat %u->%u mV; ibus = device-own val_iout/2) at FG-V=%dmV IBUS=%dmA\n",
 						 n, n + 1, sm5440_dc_step_vbat[n], sm5440_dc_step_vbat[n + 1],
 						 cell_mv, ibus / 1000);
 				}
@@ -1870,7 +2121,7 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	struct sm_dc_power_source_info ta = { };
 	int vbat_mv = 0, target_mv, off_mv, vbus_mv, diff, ret, engage_off, i;
 
-	if (!sm5440_pps_contract_active(chip)) {
+	if (!sm5440_pd_source_usable(chip)) {
 		dev_warn(chip->dev, "dc start: no PPS contract -- arm pd_request + plug first\n");
 		return -ENOTCONN;
 	}
@@ -1972,7 +2223,7 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	WRITE_ONCE(chip->dc_inject_hrst, false);	/* TEST: clear any stale injection arming */
 	chip->dc_step = 0;		/* the ladder starts in step 0 (engage gate keeps SoC < 62) */
 	chip->dc_step_iin_cnt = 0;
-	chip->dc_ci_applied = target_ibus_ma;	/* Build-2a: cap-ratchet baseline; dc_monitor lowers it as the loaded cell climbs.
+	chip->dc_ci_applied = target_ibus_ma;	/* ratchet baseline; dc_monitor lowers it as the ladder steps.
 						 * Safe even on a high-VBAT (re-)engage: the engine PRESETs at 50% of target and
 						 * ramps ~PPS_C_STEP/tick, so the first 1 s dc_monitor tick reads the loaded cell-V
 						 * and ratchets the cap down long before the request could reach the boundary. */
@@ -2120,7 +2371,7 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 		     soc < 0 || soc >= SM5440_AUTO_DISENGAGE_SOC)) {
 			dev_info(chip->dev,
 				 "auto-disengage: intent=%d contract=%d soc=%d%%\n",
-				 intent, sm5440_pps_contract_active(chip), soc);
+				 intent, sm5440_pd_source_usable(chip), soc);
 			mutex_unlock(&chip->engage_lock);
 			sm5440_dc_stop(chip);
 			return;
@@ -2144,7 +2395,7 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 	 * ceiling (above it a step-0-only engine has nothing to do; the buck owns it).
 	 */
 	if (chip->pump_engaged || chip->dc_err_latched ||
-	    !sm5440_pps_contract_active(chip) ||
+	    !sm5440_pd_source_usable(chip) ||
 	    soc < 0 || soc >= SM5440_AUTO_ENGAGE_SOC) {
 		mutex_unlock(&chip->engage_lock);
 		return;
@@ -2162,6 +2413,7 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 	 * double-force and the manual dc_test/dc_probe paths are unchanged.
 	 */
 	WRITE_ONCE(chip->pps_active, false);
+	WRITE_ONCE(chip->pps_rearm_next, jiffies);	/* deliberate re-arm: never rate-limit it */
 	ret = sm5440_dc_start(chip, SM5440_AUTO_ENGAGE_CI_GL, false);
 	if (ret) {
 		if (++chip->dc_retry_cnt >= SM5440_AUTO_RETRY_MAX) {
@@ -2201,7 +2453,7 @@ static void sm5440_auto_engage_work(struct work_struct *work)
  * CONTINUES an already-active run that legitimately climbed above 62 (the pump runs
  * 62..95 once engaged), so it must not surrender the pump for a high-SoC HRST --
  * where HRSTs are in fact more likely (the PS_RDY boundary falls with VBAT).  The
- * ci_gl cap + this latch + the topoff self-limit bound the high-SoC re-engage.
+ * the step ladder + this latch + the topoff self-limit bound the high-SoC re-engage.
  */
 static void sm5440_dc_reengage_work(struct work_struct *work)
 {
@@ -2243,12 +2495,20 @@ static void sm5440_dc_reengage_work(struct work_struct *work)
 	 * deferred" bail because the port is still mid-transition after the reset.
 	 */
 	WRITE_ONCE(chip->pps_active, false);
+	WRITE_ONCE(chip->pps_rearm_next, jiffies);	/* deliberate re-arm: never rate-limit it */
 	for (i = 0; i < SM5440_REENGAGE_POLL_TRIES; i++) {
 		if (!READ_ONCE(chip->dc_intent))
 			break;			/* unplugged mid-poll -> handled below (no strike) */
 		sm5440_pps_request(chip, SM5440_REENGAGE_PPS_MV,
 				   SM5440_REENGAGE_PPS_MA, false);
-		if (sm5440_pps_contract_active(chip)) {
+		/*
+		 * Liveness, NOT mere attachment: this poll exists to confirm the PPS contract
+		 * came BACK after the reset.  The pre-activation gate would report success the
+		 * moment the source is simply attached -- i.e. on the FIXED PDO tcpm
+		 * re-negotiated -- and we would re-engage the pump onto a fixed contract at
+		 * half rate, which is the exact failure this recovery path exists to avoid.
+		 */
+		if (sm5440_pps_contract_live(chip)) {
 			contract = true;
 			break;
 		}
@@ -2273,14 +2533,17 @@ static void sm5440_dc_reengage_work(struct work_struct *work)
 		u32 reengage_ci;
 
 		/*
-		 * Re-engage at the VBAT-band ci_gl cap (mirroring the dc_monitor
-		 * ratchet's fuelgauge read), NOT the fixed SM5440_AUTO_ENGAGE_CI_GL:
-		 * dc_start seeds dc_ci_applied = target, so starting AT the band cap
-		 * makes the first dc_monitor tick eff == dc_ci_applied -- no immediate
-		 * re-ratchet.  Re-engaging at 4000 above the boundary would re-preset
-		 * -> re-collapse at once, and dc_retry_cnt resets on each success so it
-		 * never latches -> livelock.  sm5440_fg() ensures chip->fg is cached; a
-		 * failed read falls back to the fixed engage current.
+		 * Re-engage AT the VBAT-band cap (mirroring the dc_monitor ratchet's fuelgauge
+		 * read), NOT the fixed SM5440_AUTO_ENGAGE_CI_GL: dc_start seeds
+		 * dc_ci_applied = target, so starting AT the band cap makes the first
+		 * dc_monitor tick eff == dc_ci_applied -- no immediate re-ratchet.  Seeding
+		 * 4000 above the cap would re-preset -> re-collapse at once, and dc_retry_cnt
+		 * resets on each success so it never latches -> LIVELOCK.  sm5440_fg() ensures
+		 * chip->fg is cached; a failed read falls back to the fixed engage current.
+		 *
+		 * (This pairs with sm5440_ci_gl_cap(): both halves live or die together.  It
+		 * was briefly removed while the cap was, and must be removed WITH it when the
+		 * lost-Accept mechanism is understood and the ladder becomes the only goal.)
 		 */
 		sm5440_fg(chip);
 		if (chip->fg && !power_supply_get_property(chip->fg,
