@@ -484,6 +484,19 @@ struct tcpm_port {
 	bool pps_reassert;
 	bool pps_nr_tx_failed;	/* PPS Request got no GoodCRC ack; waiting to adopt a late Accept */
 
+	/*
+	 * Alert (ADO) received while in SNK_TRANSITION_SINK[_VBUS]. PD 3.0
+	 * 8.3.3.4.1.1 would have us Hard Reset on any Message received during
+	 * a power transition, but a benign unsolicited Alert (e.g. an
+	 * operating-condition change) can legitimately race PS_RDY there and
+	 * must not tear down a working (PPS) contract. Latch it and replay via
+	 * tcpm_handle_alert() once we reach SNK_READY, mirroring the sm5714
+	 * downstream mask-gated transition wait (only PS_RDY | Get_Sink_Cap
+	 * wake the wait; every other message is deferred to PE_SNK_Ready).
+	 */
+	bool pending_alert;
+	__le32 pending_alert_ado;
+
 	/* Requested current / voltage to the port partner */
 	u32 req_current_limit;
 	u32 req_supply_voltage;
@@ -3391,12 +3404,25 @@ static void tcpm_pd_data_request(struct tcpm_port *port,
 		tcpm_pd_handle_state(port, BIST_RX, BIST, 0);
 		break;
 	case PD_DATA_ALERT:
-		if (port->state != SRC_READY && port->state != SNK_READY)
+		/*
+		 * Defer an Alert that arrives mid power-transition instead of
+		 * Hard Resetting (PD 3.0 8.3.3.4.1.1, which tcpm_pd_handle_state()
+		 * enforces at the SNK_TRANSITION_SINK case): latch the ADO and
+		 * replay it once the contract settles in SNK_READY.
+		 */
+		if (port->state == SNK_TRANSITION_SINK ||
+		    port->state == SNK_TRANSITION_SINK_VBUS) {
+			port->pending_alert_ado = msg->payload[0];
+			port->pending_alert = true;
+			tcpm_log(port,
+				 "Alert during SNK power transition; deferring to SNK_READY");
+		} else if (port->state != SRC_READY && port->state != SNK_READY) {
 			tcpm_pd_handle_state(port, port->pwr_role == TYPEC_SOURCE ?
 					     SRC_SOFT_RESET_WAIT_SNK_TX : SNK_SOFT_RESET,
 					     NONE_AMS, 0);
-		else
+		} else {
 			tcpm_handle_alert(port, msg->payload, cnt);
+		}
 		break;
 	case PD_DATA_BATT_STATUS:
 	case PD_DATA_GET_COUNTRY_INFO:
@@ -4602,6 +4628,7 @@ static void tcpm_reset_port(struct tcpm_port *port)
 	port->pps_data.supported = false;
 	port->pps_reassert = false;
 	port->pps_nr_tx_failed = false;
+	port->pending_alert = false;
 	tcpm_set_partner_usb_comm_capable(port, false);
 
 	/*
@@ -5479,6 +5506,18 @@ static void run_state_machine(struct tcpm_port *port)
 			port->send_discover_prime = false;
 		}
 
+		/*
+		 * Replay an Alert that was deferred during the power transition
+		 * (see PD_DATA_ALERT). This runs after tcpm_pps_complete() above,
+		 * so the (PPS) contract has already been reported as successful;
+		 * the Alert is then serviced via the normal Get_Status path
+		 * without the spurious Hard Reset PD 3.0 8.3.3.4.1.1 mandates.
+		 */
+		if (port->pending_alert) {
+			port->pending_alert = false;
+			tcpm_handle_alert(port, &port->pending_alert_ado, 1);
+		}
+
 		power_supply_changed(port->psy);
 		break;
 
@@ -5517,6 +5556,14 @@ static void run_state_machine(struct tcpm_port *port)
 	case HARD_RESET_START:
 		port->sink_cap_done = false;
 		port->pps_reassert = false;
+		/*
+		 * Drop any Alert deferred during a power transition: both reset
+		 * directions converge here (sink-sent via HARD_RESET_SEND;
+		 * source-received via _tcpm_pd_hard_reset()), so a stale ADO
+		 * cannot survive the renegotiation and replay in the fresh
+		 * SNK_READY. Mirrors sm5714_hard_reset() zeroing status_reg.
+		 */
+		port->pending_alert = false;
 		if (port->tcpc->enable_frs)
 			port->tcpc->enable_frs(port->tcpc, false);
 		port->hard_reset_count++;
