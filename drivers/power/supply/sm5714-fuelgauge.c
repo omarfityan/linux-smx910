@@ -30,9 +30,38 @@
  * registers, since pushing the model table is a separate, larger task.
  */
 
+#include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/power_supply.h>
+
+/*
+ * Early-boot probe retry.
+ *
+ * The fuel gauge sits on the I2C-master-hub bus (&i2c_hub_8 / 9a0000.i2c)
+ * alongside the SM5714 charger (0x49) and MUIC (0x25).  That controller
+ * intermittently loses the bus while the boot is still busy:
+ *
+ *   geni_i2c 9a0000.i2c: Bus arbitration lost, clock line undriveable
+ *   sm5714-fuelgauge 0-0071: error -ETIMEDOUT: not responding at 0x71
+ *
+ * The controller could not drive SCL, so the chip was never addressed -- a
+ * bus-level transient, not an absent or sleeping device.  The IC is powered
+ * continuously from the cell (see the file comment above) and answers normally
+ * once boot settles; the same stall is ridden out on the charger's NTC read
+ * (sm5714-usb-vbus.c, SM5714_TEMP_READ_FAIL_MAX).
+ *
+ * Treating one such failure as fatal costs far more than a missing battery
+ * icon.  With no fuel-gauge power_supply registered, sm5440_read_soc() returns
+ * -1 and the charge-pump auto-engage gate (sm5440_charger.c, "soc < 0")
+ * declines to engage, so the device silently charges on the ~16 W buck path
+ * instead of ~32 W direct charging -- for the rest of that boot.
+ *
+ * Retry a few times to ride out a short stall, then hand back -EPROBE_DEFER so
+ * the driver core re-runs us later for a longer one.
+ */
+#define SM5714_FG_PROBE_RETRIES		5
+#define SM5714_FG_PROBE_RETRY_MS	20
 
 /* Direct (non-SRAM) registers */
 #define SM5714_FG_REG_DEVICE_ID		0x00
@@ -210,7 +239,7 @@ static int sm5714_fg_probe(struct i2c_client *client)
 {
 	struct power_supply_config cfg = { };
 	struct sm5714_fg *fg;
-	int id, status;
+	int id, status, try;
 
 	fg = devm_kzalloc(&client->dev, sizeof(*fg), GFP_KERNEL);
 	if (!fg)
@@ -218,12 +247,24 @@ static int sm5714_fg_probe(struct i2c_client *client)
 
 	fg->client = client;
 
-	/* Confirm the chip answers at this address before registering. */
-	id = i2c_smbus_read_word_data(client, SM5714_FG_REG_DEVICE_ID);
-	if (id < 0)
-		return dev_err_probe(&client->dev, id,
-				     "SM5714 fuel-gauge not responding at 0x%02x\n",
-				     client->addr);
+	/*
+	 * Confirm the chip answers at this address before registering, riding
+	 * out an early-boot bus stall (see SM5714_FG_PROBE_RETRIES above).
+	 */
+	for (try = 0; ; try++) {
+		id = i2c_smbus_read_word_data(client, SM5714_FG_REG_DEVICE_ID);
+		if (id >= 0)
+			break;
+		if (try == SM5714_FG_PROBE_RETRIES)
+			return dev_err_probe(&client->dev, -EPROBE_DEFER,
+					     "not responding at 0x%02x after %d tries (%pe); deferring\n",
+					     client->addr, try + 1, ERR_PTR(id));
+		msleep(SM5714_FG_PROBE_RETRY_MS);
+	}
+	if (try)
+		dev_info(&client->dev,
+			 "answered at 0x%02x after %d retry(s) -- early-boot bus stall\n",
+			 client->addr, try);
 
 	status = i2c_smbus_read_word_data(client, SM5714_FG_REG_SYSTEM_STATUS);
 	if (status >= 0 && !(status & SM5714_FG_SYSTEM_STATUS_INIT))
