@@ -234,19 +234,29 @@
  */
 #define SM5440_AUTO_ENGAGE_SOC		62	/* engage only when SoC < this (device-own step-0 start) */
 #define SM5440_AUTO_DISENGAGE_SOC	95	/* disengage at/above = device-own dchg_end_soc; buck finishes 95->100 */
-#define SM5440_AUTO_ENGAGE_CI_GL	4000	/* engage/low-VBAT IBUS cap (mA).  The device-own step-0 is
-						 * val_iout[0]/2 = 4500, but mainline tcpm sends a Hard Reset when a
-						 * PPS Request cannot PS_RDY within tPSTransition (500 ms): the source
-						 * current-limits at the ~10.5 V ceiling, so a request above the
-						 * last-good PS_RDY boundary trips the timer (the bespoke PD stack
-						 * tolerates the missing PS_RDY; tcpm does not).  At auto-engage
-						 * ta.c_max == ci_gl, so _try_to_adjust_cc_up caps ta.c at ta.c_max
-						 * and the PEAK request == ci_gl (NOT ci_gl+200 -- that band is
-						 * unreachable once c_max binds; sess-234 measured peak 4000, delivered
-						 * ~3760, ZERO HRST at loaded 3939-4009 mV).  dc_monitor then hands the
-						 * goal to the device-own step ladder (sm5440_dc_step_ibus); the
-						 * delivered current tapers on its own as the cell climbs, because
-						 * IBUS = (ta.v - 2*Vcell - v_offset)/r_ttl and ta.v is ceilinged. */
+#define SM5440_AUTO_ENGAGE_CI_GL	4500	/* engage/low-VBAT IBUS goal (mA) = the device-own step-0,
+						 * val_iout[0]/2 (sm5440_dc_step_ibus[0]).  This is the vendor's own
+						 * authority for the input-current goal and is what stock requests.
+						 *
+						 * It was previously held at 4000 on the rationale that "the bespoke PD
+						 * stack tolerates a missing PS_RDY where tcpm does not".  THAT RATIONALE
+						 * IS REFUTED from the device's own downstream source: stock's
+						 * tPSTransition is 480 ms (sm5714_pd.h) -- SHORTER than mainline tcpm's
+						 * 500 ms -- and sm5714_policy.c hard-resets on that timeout identically.
+						 * Stock is STRICTER, not more tolerant, so tcpm's timer cannot be why
+						 * stock reaches 4500 and we did not.
+						 *
+						 * At auto-engage ta.c_max == ci_gl, so _try_to_adjust_cc_up caps ta.c at
+						 * ta.c_max and the PEAK request == ci_gl (NOT ci_gl+200 -- that band is
+						 * unreachable once c_max binds).  dc_monitor then hands the goal to the
+						 * device-own step ladder (sm5440_dc_step_ibus); the delivered current
+						 * tapers on its own as the cell climbs, because
+						 * IBUS = (ta.v - 2*Vcell - v_offset)/r_ttl and ta.v is ceilinged.
+						 *
+						 * NOTE the seed is a HARD ceiling on this path: dc_start seeds
+						 * dc_ci_applied from its argument and the dc_monitor ratchet is
+						 * one-directional (it only lowers).  Raising the ratchet's ceiling
+						 * without raising this seed therefore has NO effect. */
 #define SM5440_AUTO_RETRY_MAX		3	/* consecutive engage failures before latching off until replug */
 /*
  * dc_intent false-transition debounce depth (consecutive buck-worker false polls
@@ -344,19 +354,39 @@ static const u32 sm5440_dc_step_cond_iin[SM5440_DC_STEP_MAX]     = { 4100, 2000 
  * cleared: the test source had absorbed ~10 Hard Resets and was seen holding VBUS = 10243 mV
  * at IBUS = 0 (a wedged-source signature), so source state is not ruled out.
  *
- * SO: this is a MITIGATION OF AN UNDIAGNOSED FAULT, retained on evidence that it helps and
- * that removing it hurts -- NOT a model of the hardware.  Do not read these numbers as
- * physics; do not extend them by curve-fitting.  DELETE THEM once the lost-Accept mechanism
- * is understood: the device-own step ladder (sm5440_dc_step_ibus = val_iout/2 from the DT) is
- * the vendor's actual authority for the input-current goal, and it permits 4500 mA to cell
- * 4250 mV -- which is where the ~30 W "match stock" target lives.
+ * SO: this was a MITIGATION OF AN UNDIAGNOSED FAULT, retained on evidence that it helped and
+ * that removing it hurt -- NOT a model of the hardware.  Do not read these numbers as
+ * physics; do not extend them by curve-fitting.  The device-own step ladder
+ * (sm5440_dc_step_ibus = val_iout/2 from the DT) is the vendor's actual authority for the
+ * input-current goal, and it permits 4500 mA to cell 4250 mV.
  *
- * The likely cure (device-own source, RULE #1): sm5714_policy.c PE_SNK_Select_Capability
- * waits tSenderResponse for the Accept REGARDLESS of TX status -- the vendor does NOT Hard
- * Reset on a missed Accept.  Our tcpm port covers only the TX-fail (-EIO) case, not the
- * Accept-lost-after-successful-TX case observed here.
+ * !! CURRENTLY NOT WIRED IN. !!  The dc_monitor ratchet and the re-engage path now take the
+ * input-current goal from the device-own step ladder ALONE.  This table is kept for its record
+ * and for a cheap revert, not because anything calls it.  To restore: reinstate
+ * min_t(u32, sm5440_ci_gl_cap(cell_mv), sm5440_dc_step_ibus[chip->dc_step]) in dc_monitor,
+ * restore the paired fuelgauge-read seed in the re-engage path, and lower
+ * SM5440_AUTO_ENGAGE_CI_GL.  All three move together.
+ *
+ * CORRECTION 1 -- a "likely cure" previously recorded here was WRONG; do not design against
+ * it.  It read: "sm5714_policy.c PE_SNK_Select_Capability waits tSenderResponse for the Accept
+ * REGARDLESS of TX status -- the vendor does NOT Hard Reset on a missed Accept."  Read
+ * directly, the vendor DOES hard reset on a true timeout: sm5714_usbpd_wait_msg() returns 0
+ * when its wait_for_completion_timeout(tSenderResponse) expires, and
+ * sm5714_usbpd_policy_snk_select_capability() then returns PE_SNK_Hard_Reset.  Mainline also
+ * already matches the vendor on Reject/Wait (tcpm_pd_ctrl_request -> tcpm_set_state(port,
+ * SNK_READY, 0)).  There is no vendor tolerance left to port.
+ *
+ * CORRECTION 2 -- the "WIRE-PROVEN: the SINK sends the Hard Reset" paragraph above is
+ * INCOMPLETE as a description of the uncapped collapse.  Cap-exempt runs collapsed via a
+ * SOURCE-SENT reset ("Received hard reset" -> HARD_RESET_START) with ZERO sink-sent
+ * HARD_RESET_SEND and no Alert in the window -- a different mode from the sink-sent one
+ * described above.  Note also WHICH runs collapsed: they were driven by the ADAPTIVE probe,
+ * which by design holds its goal ABOVE what the source can deliver and therefore PARKS at the
+ * source's current ceiling.  A satisfiable, regulated cap-exempt run at 4000 mA held 185 s
+ * across cell 4096-4200 mV with zero resets.  The collapse may therefore belong to the parked
+ * operating point rather than to the current level; that is what removing this table tests.
  */
-static u32 sm5440_ci_gl_cap(int fg_mv)
+static u32 __maybe_unused sm5440_ci_gl_cap(int fg_mv)
 {
 	if (fg_mv < 4010)	return 4000;
 	if (fg_mv < 4090)	return 3400;
@@ -1922,16 +1952,7 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 			 * sm_dc_set_target_ibus() calls after dc_start's one-time seed, so they are
 			 * what applies the ladder's step-2 taper (2000 mA) as the cell tops out.
 			 */
-			/*
-			 * min(mitigation cap, device-own step ladder).  The ladder
-			 * (sm5440_dc_step_ibus = val_iout/2) is the VENDOR's authority and permits
-			 * 4500 mA to cell 4250; the cap is ours and is an empirical mitigation of an
-			 * UNDIAGNOSED collapse -- see sm5440_ci_gl_cap() for what is and is not
-			 * established, and for why it must be deleted once the lost-Accept mechanism
-			 * is understood.  Removing it was TRIED and regressed the device.
-			 */
-			u32 cap = sm5440_ci_gl_cap(cell_mv);
-			u32 eff = min_t(u32, cap, sm5440_dc_step_ibus[chip->dc_step]);
+			u32 eff = sm5440_dc_step_ibus[chip->dc_step];
 
 			/* Fixed (production auto-engage / dc_test) runs only: the adaptive dc_probe
 			 * deliberately holds ci_gl HIGH to push ta.v_max, so this must not fight it. */
@@ -1939,7 +1960,7 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 				sm_dc_set_ta_cmax(chip->dc, eff);	/* hold the CC peak at ci_gl (no +offset) */
 				sm_dc_set_target_ibus(chip->dc, eff);	/* divert to the re-preset at the lower goal */
 				dev_info(chip->dev,
-					 "ci_gl: %u -> %u mA at FG-V=%dmV (step=%d) -- min(mitigation cap, device-own val_iout/2)\n",
+					 "ci_gl: %u -> %u mA at FG-V=%dmV (step=%d) -- device-own val_iout/2 ladder\n",
 					 chip->dc_ci_applied, eff, cell_mv, chip->dc_step);
 				chip->dc_ci_applied = eff;
 			}
@@ -2528,29 +2549,29 @@ static void sm5440_dc_reengage_work(struct work_struct *work)
 	}
 
 	if (contract) {
-		union power_supply_propval pv = { };
-		int cell_mv = 0;
 		u32 reengage_ci;
 
 		/*
-		 * Re-engage AT the VBAT-band cap (mirroring the dc_monitor ratchet's fuelgauge
-		 * read), NOT the fixed SM5440_AUTO_ENGAGE_CI_GL: dc_start seeds
-		 * dc_ci_applied = target, so starting AT the band cap makes the first
-		 * dc_monitor tick eff == dc_ci_applied -- no immediate re-ratchet.  Seeding
-		 * 4000 above the cap would re-preset -> re-collapse at once, and dc_retry_cnt
-		 * resets on each success so it never latches -> LIVELOCK.  sm5440_fg() ensures
-		 * chip->fg is cached; a failed read falls back to the fixed engage current.
+		 * Re-engage at the fixed engage goal, which is now the device-own step-0
+		 * input current.  This used to mirror the VBAT-band cap's fuelgauge read so
+		 * the run would start AT the band value and the first dc_monitor tick would
+		 * see eff == dc_ci_applied (no immediate re-preset -> no livelock, since
+		 * dc_retry_cnt resets on each success and would never latch).  That property
+		 * is preserved for free now the band cap is gone: sm5440_dc_start() resets
+		 * dc_step to 0, so the first tick computes eff = sm5440_dc_step_ibus[0],
+		 * which IS this value -- the ratchet (one-directional, eff < dc_ci_applied)
+		 * therefore does not fire.
 		 *
-		 * (This pairs with sm5440_ci_gl_cap(): both halves live or die together.  It
-		 * was briefly removed while the cap was, and must be removed WITH it when the
-		 * lost-Accept mechanism is understood and the ladder becomes the only goal.)
+		 * Do NOT "improve" this by seeding sm5440_dc_step_ibus[chip->dc_step]: that
+		 * is evaluated BEFORE dc_start resets dc_step, so after a recovery from a
+		 * later step it would seed low (e.g. 4100) while the first tick computed
+		 * 4500 -- and because the ratchet only lowers, the goal would stay pinned at
+		 * the stale value for the rest of the run.
+		 *
+		 * The pairing recorded in sm5440_ci_gl_cap() is honoured: both halves are
+		 * removed together.
 		 */
-		sm5440_fg(chip);
-		if (chip->fg && !power_supply_get_property(chip->fg,
-				POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv))
-			cell_mv = pv.intval / 1000;
-		reengage_ci = cell_mv > 0 ? sm5440_ci_gl_cap(cell_mv)
-					  : SM5440_AUTO_ENGAGE_CI_GL;
+		reengage_ci = SM5440_AUTO_ENGAGE_CI_GL;
 
 		ret = sm5440_dc_start(chip, reengage_ci, false);
 		if (!ret) {
