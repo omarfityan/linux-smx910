@@ -348,11 +348,12 @@ static const u32 sm5440_dc_step_cond_iin[SM5440_DC_STEP_MAX]     = { 4100, 2000 
  *   - "high current corrupts the PD comms, so this cap holds us under a noise floor" -> NO:
  *     a collapse was observed at ta.c = 2000 mA / IBUS 2006 mA during PRE_CC, BELOW this
  *     table's own smallest band -- which the table therefore could not have prevented.
- * WIRE-PROVEN: the SINK sends the Hard Reset (tcpm SNK_NEGOTIATE_PPS_CAPABILITIES ->
- * HARD_RESET_SEND after tSenderResponse, 60 ms) when an Accept does not arrive -- i.e.
- * Accepts are lost INTERMITTENTLY.  WHY is the open question.  One confound was never
- * cleared: the test source had absorbed ~10 Hard Resets and was seen holding VBUS = 10243 mV
- * at IBUS = 0 (a wedged-source signature), so source state is not ruled out.
+ * The SINK sends a Hard Reset in the sink-sent mode.  !! The cause originally recorded here
+ * ("SNK_NEGOTIATE_PPS_CAPABILITIES -> HARD_RESET_SEND after tSenderResponse, 60 ms when an
+ * Accept does not arrive -- i.e. Accepts are lost INTERMITTENTLY") is REFUTED; see
+ * CORRECTION 3 below.  One confound was never cleared: the test source had absorbed ~10 Hard
+ * Resets and was seen holding VBUS = 10243 mV at IBUS = 0 (a wedged-source signature), so
+ * source state is not ruled out.
  *
  * SO: this was a MITIGATION OF AN UNDIAGNOSED FAULT, retained on evidence that it helped and
  * that removing it hurt -- NOT a model of the hardware.  Do not read these numbers as
@@ -360,12 +361,19 @@ static const u32 sm5440_dc_step_cond_iin[SM5440_DC_STEP_MAX]     = { 4100, 2000 
  * (sm5440_dc_step_ibus = val_iout/2 from the DT) is the vendor's actual authority for the
  * input-current goal, and it permits 4500 mA to cell 4250 mV.
  *
- * !! CURRENTLY NOT WIRED IN. !!  The dc_monitor ratchet and the re-engage path now take the
- * input-current goal from the device-own step ladder ALONE.  This table is kept for its record
- * and for a cheap revert, not because anything calls it.  To restore: reinstate
- * min_t(u32, sm5440_ci_gl_cap(cell_mv), sm5440_dc_step_ibus[chip->dc_step]) in dc_monitor,
- * restore the paired fuelgauge-read seed in the re-engage path, and lower
- * SM5440_AUTO_ENGAGE_CI_GL.  All three move together.
+ * !! THE TABLE ITSELF IS NOW DELETED. !!  The dc_monitor ratchet and the re-engage path take
+ * the input-current goal from the device-own step ladder ALONE, and the production auto-engage
+ * path has since been exercised at ci_gl = 4500 and HELD -- unaided, across a full 29-minute
+ * arc with zero faults, and again from SoC 1 % on a subsequent boot.  The precondition for
+ * keeping a mitigation of an undiagnosed fault ("removing it regressed the device") no longer
+ * holds: removing it now demonstrably does not.
+ *
+ * Its values are retained here for the record only:
+ *	cell < 4010 mV -> 4000 mA;  < 4090 -> 3400;  < 4170 -> 3200;  < 4280 -> 2900;  else 2500.
+ * To restore, reinstate a min_t(u32, <that table>, sm5440_dc_step_ibus[chip->dc_step]) in
+ * dc_monitor, restore the paired fuelgauge-read seed in the re-engage path, and lower
+ * SM5440_AUTO_ENGAGE_CI_GL.  All three move together.  This whole comment is kept because the
+ * refutations below are load-bearing knowledge, not because the table is coming back.
  *
  * CORRECTION 1 -- a "likely cure" previously recorded here was WRONG; do not design against
  * it.  It read: "sm5714_policy.c PE_SNK_Select_Capability waits tSenderResponse for the Accept
@@ -385,15 +393,39 @@ static const u32 sm5440_dc_step_cond_iin[SM5440_DC_STEP_MAX]     = { 4100, 2000 
  * source's current ceiling.  A satisfiable, regulated cap-exempt run at 4000 mA held 185 s
  * across cell 4096-4200 mV with zero resets.  The collapse may therefore belong to the parked
  * operating point rather than to the current level; that is what removing this table tests.
+ *
+ * CORRECTION 3 -- the sink-sent reset is a lost PS_RDY, NOT a lost Accept.  Captured live off
+ * the tcpm debugfs ring (the authoritative source; tcpm does NOT log state changes to dmesg on
+ * this kernel, so any dmesg-derived tally reads zero whether or not a reset fired):
+ *
+ *	Requesting APDO 4: 10500 mV, 4500 mA		<- engine issues the PPS Request
+ *	PD TX complete, status: 0			<- transmitted OK
+ *	state change SNK_NEGOTIATE_PPS_CAPABILITIES -> SNK_TRANSITION_SINK
+ *							<- *** the ACCEPT ARRIVED, in 20 ms ***
+ *	pending state change SNK_TRANSITION_SINK -> HARD_RESET_SEND @ 500 ms
+ *	state change SNK_TRANSITION_SINK -> HARD_RESET_SEND [delayed 500 ms]
+ *							<- *** PS_RDY NEVER CAME -> sink resets ***
+ *
+ * Window tallies: PS_RDY timeouts = 1, ACCEPT timeouts = 0, Accepts = 84, PS_RDY = 85.  The
+ * Accept is HEALTHY.  The source Accepts the Request and then fails to complete the power
+ * transition and report PS_RDY inside tcpm's tPSTransition (500 ms).
+ *
+ * => Any cure aimed at Accept tolerance (tSenderResponse, PE_SNK_Select_Capability, the
+ * vendor-vs-mainline comparison in CORRECTION 1) CANNOT fix this -- it treats a timeout that
+ * does not occur.  Aim at the PS_RDY/tPSTransition path instead.  Mechanism consistent with
+ * the rest of this comment: the engine re-Requests 10500 mV while the source already sits in
+ * CC at the current limit we asked for, so VBUS is pinned near 2*Vcell + I*r_ttl (~8.8 V), far
+ * below the request; the source is asked to re-run a power transition it cannot complete as
+ * specified, and occasionally does not report PS_RDY in time.
+ *
+ * DISCRIMINATING THE TWO SINK-SENT CAUSES (use these, not a bare HARD_RESET_SEND count):
+ *	SNK_TRANSITION_SINK -> HARD_RESET_SEND [delayed		= PS_RDY timeout
+ *	SNK_NEGOTIATE_PPS_CAPABILITIES -> HARD_RESET_SEND [delayed = Accept timeout
+ * And for source-sent, "Received hard reset" is the ONLY unambiguous marker -- matching
+ * "-> HARD_RESET_START" also matches HARD_RESET_SEND -> HARD_RESET_START, i.e. the sink's own
+ * reset progressing, which counts every sink-sent reset again as source-sent and INVERTS the
+ * attribution.
  */
-static u32 __maybe_unused sm5440_ci_gl_cap(int fg_mv)
-{
-	if (fg_mv < 4010)	return 4000;
-	if (fg_mv < 4090)	return 3400;
-	if (fg_mv < 4170)	return 3200;
-	if (fg_mv < 4280)	return 2900;
-	return 2500;
-}
 
 /*
  * Increment-3a graceful-stop ramp-down (the buck handoff).  sess-206 run-1 showed
@@ -2568,7 +2600,7 @@ static void sm5440_dc_reengage_work(struct work_struct *work)
 		 * 4500 -- and because the ratchet only lowers, the goal would stay pinned at
 		 * the stale value for the rest of the run.
 		 *
-		 * The pairing recorded in sm5440_ci_gl_cap() is honoured: both halves are
+		 * The pairing recorded in the deleted ci_gl band-cap comment is honoured: both halves are
 		 * removed together.
 		 */
 		reengage_ci = SM5440_AUTO_ENGAGE_CI_GL;
