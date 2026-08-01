@@ -101,10 +101,16 @@
  * ADC enable, telemetry-only (device-own sm5440_init_reg_param +
  * enable_adc / set_adc_rate):
  *   ADCCNTL2 = 0xdf  - per-channel enable (device-own value, verbatim)
- *   ADCCNTL1 = 0x0b  - bit0 ADC enable | bit1 continuous rate | bit3 32-avg
+ *
+ * ADCCNTL1 has NO whole-register constant on purpose.  The device-own driver
+ * only ever touches it by single-bit read-modify-write -- bit0 (enable_adc),
+ * bit1 (set_adc_rate), bit3 (32-sample average) -- and never writes bit 2.
+ * Bit 2 is therefore a power-on default the vendor's code preserves, and a
+ * wholesale write clears it: stock runs ADCCNTL1 = 0x0F with bit 2 set in
+ * 230/230 live register dumps, while we were writing 0x0b.  Use
+ * sm5440_adc_enable_continuous() and never a bare regmap_write() here.
  */
 #define SM5440_ADCCNTL2_CHANNELS	0xdf
-#define SM5440_ADCCNTL1_ENABLE		0x0b
 
 /*
  * op-mode field (CNTL5 bits[3:2], device-own enum sm5440_op_mode).  CHG_OFF is
@@ -783,6 +789,28 @@ static int sm5440_enable_chg_timer(struct sm5440 *chip, bool enable)
 	return sm5440_update_field(chip, SM5440_REG_CNTL3, enable, 0x1, 2);
 }
 
+/*
+ * Enable the telemetry ADC the device-own way: single-bit read-modify-write of
+ * bit3 (32-sample average), bit1 (continuous rate) then bit0 (enable), in that
+ * order -- averaging and rate are configured before the converter is started,
+ * mirroring the vendor's enable_adc(0) / set_adc_rate() / enable_adc(1).
+ *
+ * NEVER write ADCCNTL1 as a whole register.  The vendor never writes bit 2, so
+ * it is a power-on default their RMW preserves; a wholesale write clears it.
+ */
+static int sm5440_adc_enable_continuous(struct sm5440 *chip)
+{
+	int ret;
+
+	ret = sm5440_update_field(chip, SM5440_REG_ADCCNTL1, 1, 0x1, 3);
+	if (ret)
+		return ret;
+	ret = sm5440_update_field(chip, SM5440_REG_ADCCNTL1, 1, 0x1, 1);
+	if (ret)
+		return ret;
+	return sm5440_update_field(chip, SM5440_REG_ADCCNTL1, 1, 0x1, 0);
+}
+
 /* SW reset: write CNTL1 bit0, then poll it clear (device-own sm5440_sw_reset). */
 static int sm5440_sw_reset(struct sm5440 *chip)
 {
@@ -876,15 +904,25 @@ static int sm5440_read_soc(struct sm5440 *chip)
  */
 static int sm5440_pump_engage_chip(struct sm5440 *chip, u32 ibus_ma, u32 vbat_mv)
 {
+	unsigned int por;
 	int ret;
 
 	ret = sm5440_sw_reset(chip);
 	if (ret)
 		return ret;
 
+	/*
+	 * sw_reset restores the power-on defaults and nothing has written
+	 * ADCCNTL1 yet, so this read is the chip's true POR value.  Logged
+	 * because the bit-2 default was previously inferred from stock register
+	 * dumps rather than measured on this device.
+	 */
+	if (!regmap_read(chip->regmap, SM5440_REG_ADCCNTL1, &por))
+		dev_info(chip->dev, "ADCCNTL1 POR default = 0x%02x\n", por);
+
 	sm5440_init_reg_param(chip);
 	/* re-enable continuous telemetry ADC (sw_reset cleared ADCCNTL1). */
-	regmap_write(chip->regmap, SM5440_REG_ADCCNTL1, SM5440_ADCCNTL1_ENABLE);
+	sm5440_adc_enable_continuous(chip);
 
 	sm5440_set_ibuslim(chip, ibus_ma);
 	/* en_vbatreg=0 on gts9u: the chip CV ceiling sits CV_OFFSET above target. */
@@ -905,7 +943,7 @@ static void sm5440_pump_disengage_chip(struct sm5440 *chip)
 	sm5440_set_op_mode(chip, SM5440_OPMODE_CHG_OFF);
 	sm5440_enable_wdt(chip, false);
 	regmap_write(chip->regmap, SM5440_REG_ADCCNTL2, SM5440_ADCCNTL2_CHANNELS);
-	regmap_write(chip->regmap, SM5440_REG_ADCCNTL1, SM5440_ADCCNTL1_ENABLE);
+	sm5440_adc_enable_continuous(chip);
 }
 
 /* ===================================================================== *
@@ -1553,7 +1591,7 @@ static int sm5440_dc_set_adc_mode(struct i2c_client *i2c, u8 mode)
 {
 	struct sm5440 *chip = i2c_get_clientdata(i2c);
 
-	return regmap_write(chip->regmap, SM5440_REG_ADCCNTL1, SM5440_ADCCNTL1_ENABLE);
+	return sm5440_adc_enable_continuous(chip);
 }
 
 /* op 3: is the pump switching? */
@@ -2173,6 +2211,7 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 {
 	struct sm_dc_power_source_info ta = { };
 	int vbat_mv = 0, target_mv, off_mv, vbus_mv, diff, ret, engage_off, i;
+	unsigned int por;
 
 	if (!sm5440_pd_source_usable(chip)) {
 		dev_warn(chip->dev, "dc start: no PPS contract -- arm pd_request + plug first\n");
@@ -2191,8 +2230,19 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	ret = sm5440_sw_reset(chip);
 	if (ret)
 		goto err_restore;
+
+	/*
+	 * Same POR probe as the pump-engage path: sw_reset has restored the
+	 * power-on defaults and nothing has written ADCCNTL1 yet, so this read is
+	 * the chip's true POR value.  This is the path the auto-engage supervisor
+	 * and the manual engine run both take, so without it a real charge arc
+	 * would produce no POR line at all.
+	 */
+	if (!regmap_read(chip->regmap, SM5440_REG_ADCCNTL1, &por))
+		dev_info(chip->dev, "ADCCNTL1 POR default = 0x%02x\n", por);
+
 	sm5440_init_reg_param(chip);
-	regmap_write(chip->regmap, SM5440_REG_ADCCNTL1, SM5440_ADCCNTL1_ENABLE);
+	sm5440_adc_enable_continuous(chip);
 
 	/* precondition the PPS input to ~2*Vcell + IR offset, clamped to
 	 * [ta_min_voltage, dc_vbus_ovp_th - 500], and verify VBUS transitioned. */
@@ -2878,8 +2928,7 @@ static int sm5440_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to select ADC channels\n");
 
-	ret = regmap_write(chip->regmap, SM5440_REG_ADCCNTL1,
-			   SM5440_ADCCNTL1_ENABLE);
+	ret = sm5440_adc_enable_continuous(chip);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to enable ADC\n");
 
