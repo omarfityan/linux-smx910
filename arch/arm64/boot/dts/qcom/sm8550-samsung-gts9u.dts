@@ -67,16 +67,23 @@
 
 	aliases {
 		/*
-		 * serial0 = uart7 is REQUIRED even though uart7 is the BT serdev
-		 * engine, not a console: qcom_geni_serial's uart driver assigns its
-		 * port line via of_alias_get_id(node, "serial") and FAILS probe
-		 * ("Invalid line -19" = -ENODEV) without an alias. This ONLY numbers
-		 * the port; it does NOT make uart7 a console — there is no stdout-path
-		 * here and the cmdline carries no console=ttyMSM0, so no console is
-		 * registered on it (and the bluetooth serdev child claims the port).
-		 * Console is tty0 (panel) + the USB CDC-ACM gadget (ttyGS0).
+		 * A "serial" alias is REQUIRED for every enabled GENI UART:
+		 * qcom_geni_serial assigns the port line via
+		 * of_alias_get_id(node, "serial") and FAILS probe ("Invalid line
+		 * -19" = -ENODEV) without one. The numbering mirrors the in-tree
+		 * sm8550-qrd.dts reference, which carries these same two entries.
+		 *
+		 * uart14 is the Bluetooth serdev engine (see the &uart14 block
+		 * below). The alias ONLY numbers its port; it does NOT make it a
+		 * console — there is no stdout-path here and the cmdline carries no
+		 * console=ttyMSM0, so no console is registered on it (and the
+		 * bluetooth serdev child claims the port). Console is tty0 (panel)
+		 * + the USB CDC-ACM gadget (ttyGS0). uart7 stays disabled; its
+		 * alias is kept so that enabling it later as a debug console does
+		 * not renumber uart14.
 		 */
 		serial0 = &uart7;
+		serial1 = &uart14;
 
 		/*
 		 * Pin the SM5714 charger/PDIC i2c-hub bus numbers, and place the
@@ -1242,32 +1249,46 @@
 /*
  * Bluetooth — the device's own WCN7850 ("kiwi") BT controller over UART.
  *
- * GOLDEN-RULE value (device's own resolved DTS, gts9uwifi_eur_open_w00_r03):
- * the stock BT HCI runs on qcom,qup_hsuart@0xa9c000 = QUP1 Serial Engine 7,
- * pins gpio26 (TX) / gpio27 (RX), 2-wire with QCA in-band-sleep (the stock
- * "qcom,wakeup-byte"). In mainline that engine is uart7 — NOT the QRD's
- * uart14 that ADR-0016 named. The base node is qcom,geni-debug-uart (a
- * polled console); override it with the full serdev-capable geni-uart so
- * hci_qca can drive the HCI link. Pinctrl (qup_uart7_default = gpio26/27,
- * 2-wire) is inherited from sm8550.dtsi and already matches the device; the
- * board does NOT route CTS/RTS to BT, so no flow-control pins are added.
+ * GOLDEN-RULE value (this device's own downstream source): the stock BT HCI
+ * transport is qcom,qup_uart@898000 = qupv3_se14_4uart, on QUPv3 wrapper 2
+ * Serial Engine 6 (GCC_QUPV3_WRAP2_S6_CLK) — mainline's uart14. It is a
+ * 4-wire port with real hardware flow control:
+ *
+ *   gpio76 CTS  qup2_se6_l0        gpio78 TX  qup2_se6_l2
+ *   gpio77 RTS  qup2_se6_l1        gpio79 RX  qup2_se6_l3
+ *
+ * Sources: kalama-qupv3.dtsi qupv3_se14_4uart (the SoC node), kalama-pinctrl.dtsi
+ * qupv3_se14_4uart_pins (its active pin states), and the board fragment that
+ * sets that node status = "ok". Corroborated on the live stock system, where
+ * the Bluetooth HAL holds /dev/ttyHS0 = 898000.qcom,qup_uart as its only tty,
+ * that engine accrues ~277 s of runtime-PM active time against 278 ms for
+ * a9c000, and its node is owned bluetooth:net_bt while a9c000 is root:radio.
+ * The pads form one contiguous run with the WCN7850 control pins already
+ * confirmed from the stock bt_kiwi node: 76 CTS, 77 RTS, 78 TX, 79 RX,
+ * 80 WLAN_EN, 81 BT_EN, 82 SW_CTRL.
+ *
+ * This corrects an earlier binding to &uart7 (SE7, 0xa9c000, gpio26/27), which
+ * came from reading a node NAMED qupv3_se7_2hsuart_pins as "2-wire, therefore
+ * Bluetooth". The stock bt_kiwi node names no UART at all, and gpio26/27 sit
+ * beside gpio24/25, which belong to the Goodix touchscreen. Hardware flow
+ * control is therefore left ON — the earlier qcom,disable-hw-flow-control
+ * opt-out existed only because CTS/RTS were believed absent.
+ *
+ * Pinctrl is inherited from sm8550.dtsi (qup_uart14_default = gpio78/79,
+ * qup_uart14_cts_rts = gpio76/77, function qup2_se6, drive-strength 2),
+ * verified pad-for-pad against the device's own values. Two idle-bias deltas
+ * are known and deliberately left at mainline's values, which are also what
+ * the in-tree sm8550-qrd.dts reference uses for this same chip: mainline
+ * biases gpio76 CTS pull-down where stock leaves it bias-disable, and gpio79
+ * RX pull-up where stock leaves it bias-disable. Both are permissive on lines
+ * driven push-pull at each end.
  *
  * Power is owned by the wcn7850-pmu pwrseq node above (bt-enable-gpios =
  * TLMM 81); per the mainline-qrd convention the bluetooth node OMITS
  * enable-gpios and only lists its supplies (the PMU's vreg_pmu_* LDOs).
  */
-&uart7 {
-	compatible = "qcom,geni-uart";
+&uart14 {
 	status = "okay";
-
-	/*
-	 * The WCN7850 BT link is 2-wire (TX=gpio26, RX=gpio27); its CTS/RTS
-	 * pins (gpio24/25) belong to the Goodix touchscreen, so no flow-control
-	 * wires are routed to BT. hci_qca forces HW flow control on serdev,
-	 * gating TX on the absent CTS, so run this UART without HW flow control
-	 * to match the device's stock 2-wire HS-UART.
-	 */
-	qcom,disable-hw-flow-control;
 
 	bluetooth {
 		compatible = "qcom,wcn7850-bt";
@@ -1281,6 +1302,42 @@
 		vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
 
 		max-speed = <3200000>;
+
+		/*
+		 * NVM selection. btqca asks the controller for a board ID and
+		 * builds the NVM name from it (qca_get_nvm_name_by_board); this
+		 * controller answers 0/0xffff, so the driver falls back to the bare
+		 * qca/hmtnv20.bin. That file, from the device's own vendor image, is
+		 * the BTFW.HAMILTON_C.2.0.1-00128 build, while the rampatch we load
+		 * (qca/hmtbtfw20.tlv) is -00280. The controller accepts the rampatch
+		 * and then answers the first NVM TLV segment with HCI status 0x0C
+		 * "Command Disallowed" (-EBADE), so setup fails.
+		 *
+		 * firmware-name[0] overrides the NVM name (firmware-name[1] would
+		 * override the rampatch; leaving it unset keeps the default). Name
+		 * the -00280 NVM explicitly. Of the device's three shipped variants
+		 * hmtnv20.b21 / .b22 / .b38, b22 and b38 are byte-identical and b22
+		 * is the one this controller was measured to accept, after which it
+		 * reports BTFW.HAMILTON_C.2.0.1-00280-PATCHZ-1.52014.13 running.
+		 */
+		firmware-name = "hmtnv20.b22";
+
+		/*
+		 * The controller has no BD address programmed: Read BD ADDR returns
+		 * 00:00:00:00:5A:AD, so BlueZ raises "Unconfigured Index Added" and
+		 * refuses to power the adapter. hci_dev_get_bd_addr_from_property()
+		 * reads this property and, exactly when the controller's own address
+		 * is invalid and hdev->set_bdaddr exists (both true here), programs
+		 * it via the QCA vendor command.
+		 *
+		 * GOLDEN-RULE value: this device's OWN factory address, read from
+		 * its EFS partition at /efs/bluetooth/bt_addr = 08:A5:DF:7E:7A:1E.
+		 * (Its Wi-Fi MAC in /efs/wifi/.mac.info is ...:1F; the BT address was
+		 * read, not derived from it.) bdaddr_t is little-endian, so the bytes
+		 * are the address reversed. Do NOT add qcom,local-bd-address-broken:
+		 * that sets HCI_QUIRK_BDADDR_PROPERTY_BROKEN, which byte-swaps again.
+		 */
+		local-bd-address = [1E 7A 7E DF A5 08];
 	};
 };
 
