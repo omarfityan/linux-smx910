@@ -22,6 +22,8 @@
 
 #include <drm/display/drm_dsc.h>
 #include <drm/display/drm_dsc_helper.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
@@ -121,6 +123,17 @@ struct ana38407 {
 	struct drm_dsc_config dsc;
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data *supplies;
+
+	/*
+	 * drm_panel_funcs hands the panel no mode: prepare/enable/disable/
+	 * unprepare all take only the drm_panel, and struct drm_panel carries
+	 * neither a connector nor a mode. The DDIC bytes below are per-mode, so
+	 * the connector is stashed in get_modes() and the active mode read back
+	 * out of its atomic state at prepare time. This is the idiom upstream's
+	 * panel-novatek-nt35950.c uses for the same problem.
+	 */
+	struct drm_connector *connector;
+	int cur_mode;
 };
 
 /*
@@ -159,11 +172,253 @@ static void ana38407_reset(struct ana38407 *ctx)
 	usleep_range(5000, 6000);
 }
 
+/*
+ * ===========================================================================
+ * MODE TABLE
+ * ===========================================================================
+ *
+ * Two modes, both measured free of the dark-seam banding artifact that this
+ * port fought for many months. Native 2960x1848 landscape; physical 313x196 mm.
+ *
+ * The artifact was a per-frame transient at a fixed panel row, and it turned
+ * out to be governed by the relationship between the DDIC's scan rate and the
+ * host's transfer cadence -- not by any register value. The DDIC can scan at
+ * either 120 Hz or 60 Hz, selected by the VRR bytes stored per mode below;
+ * TE follows the SCAN. When the host's frame rate equals the DDIC's scan rate
+ * the host transmits on EVERY TE and the panel is clean. When the host runs at
+ * half the scan rate (a 60 Hz host against a 120 Hz scan -- the "PHS"
+ * low-frequency-driving regime, which every earlier revision of this driver
+ * ran) it transmits on every OTHER TE, and the artifact appears.
+ *
+ * Both entries here therefore pair a host frame rate with the DDIC byte set
+ * that makes the DDIC scan at that same rate:
+ *
+ *     120 Hz host + VRR_120HS scan   0 detections / 46 fiducial-verified
+ *                                    transmitted frames (p = 1.2e-27)
+ *      60 Hz host + VRR_60HS  scan   0 detections / 722 video frames
+ *
+ * The 60 Hz arm is the stronger evidence about MECHANISM: the frame transfer
+ * still occupies only 43 % of the frame period there -- the exact duty cycle
+ * that bands with p = 1.0 in the 120HS-scan regime -- so the duty cycle is
+ * exonerated and the TE:transfer ratio is what matters. (Its denominator is
+ * video frames rather than fiducial-verified transmitted frames: the 60HS
+ * gamma regime lifts mid-tones enough to collapse the fiducial's ON/OFF
+ * separation. The screen was demonstrably animating throughout.)
+ *
+ * ---------------------------------------------------------------------------
+ * WHY HORIZONTAL BLANKING IS A CLOCK DIAL AND NOT PANEL TIMING
+ * ---------------------------------------------------------------------------
+ *
+ * In command mode the host never programs the porches into hardware --
+ * dsi_timing_setup() writes only STREAM0_CTRL (word count from the DSC
+ * slice_chunk_size) and STREAM0_TOTAL (hdisplay/vdisplay); REG_DSI_ACTIVE_H,
+ * REG_DSI_TOTAL and REG_DSI_ACTIVE_HSYNC are not written at all. The blanking
+ * survives only inside the pixel-clock computation, which msm documents as
+ * "the overhead to the image data transfer".
+ *
+ * Working the algebra through dsi_adjust_pclk_for_compression(), htotal cancels
+ * and the link rate reduces to a function of the blanking alone:
+ *
+ *     pclk = vtotal * refresh * (hblank + hdisplay * bpp / (bpc * 3))
+ *          = vtotal * refresh * (hblank + 987)
+ *     bit clock = 6 * pclk
+ *
+ * so hblank sets how fast one frame is pushed into the DDIC's GRAM, at a fixed
+ * frame cadence and with the transmitted payload unchanged. vtotal, by
+ * contrast, IS hardware-visible in command mode -- it sets the tear-check
+ * vsync_count and sync_cfg_height -- so vtotal must be the panel's real value
+ * while hblank is free.
+ *
+ * This knob is EMPIRICALLY LOAD-BEARING: the artifact's row position tracked
+ * it. Measured, single-variable, with everything else held identical:
+ *
+ *     bit clk 1495.2 -> row ~146      bit clk 1011.9 -> row 66.29 +- 1.12
+ *     bit clk 2242.9 -> row 144.45 +- 0.50
+ *
+ * 144.45 - 66.29 = 78.16, and slice_height is 77: the band moved by exactly ONE
+ * SLICE ROW and back. A fourth point at bit clk 1182, deliberately BETWEEN the
+ * two rates that gave different rows, landed on 144 and NOT between -- so the
+ * position is QUANTISED to the DSC slice grid. The link rate SELECTS which
+ * slice boundary the artifact occupies; it does not position it continuously.
+ * The occurrence rate did not change across any of it (17.9 % of frames before
+ * and after), so the link rate set WHERE the artifact landed, never WHETHER.
+ *
+ * DO NOT slow the link below ~1 Gbps/lane. hblank 6 (846.5 Mbps, 78 % transfer)
+ * made the display unusably slow -- that starves real bandwidth.
+ *
+ * ---------------------------------------------------------------------------
+ * THE LINK RATE IS A DECLARED CONSTANT, NOT A DERIVED ONE
+ * ---------------------------------------------------------------------------
+ *
+ * Measured on live stock across a 4x framerate change: 1,524,097,904 Hz at
+ * 30 fps and 1,524,052,192 Hz at 120 fps -- 0.003 % apart, and both equal to
+ * the panel node's qcom,mdss-dsi-panel-clockrate = <0x5ad66500> =
+ * 1,524,000,000 Hz. Stock programs the PLL from that constant regardless of
+ * mode. msm instead DERIVES it from the timings, so hblank has to be chosen to
+ * land on it, and has to be re-chosen whenever vtotal or the framerate changes.
+ * That is why neither mode below uses its vendor node's own blanking value.
+ *
+ * Both modes land within 0.015 % of the declared constant, and within 0.0023 %
+ * of EACH OTHER. That second property is deliberate: the link rate is the knob
+ * that moves the artifact's row position, so holding it equal across the two
+ * modes keeps the mode switch a single-variable change.
+ *
+ * (An earlier revision of this comment claimed qcom,mdss-mdp-transfer-time-us
+ * is "an MDP pacing target" and that stock "paces the DPU's output". Read in
+ * the device's own downstream driver, that property has exactly two consumers
+ * -- the MDP core-clock vote (_sde_crtc_reserve_resource) and the plane QoS
+ * watermark (sde_crtc_update_line_time) -- both fetch-side. It does not pace
+ * output. Measured on live stock it is simply how long the transfer TAKES: one
+ * 2960x1848 8bpp-DSC frame over 4 lanes at the declared rate is 7.178 ms,
+ * against the DT's 7533 us.)
+ */
+
+enum ana38407_mode_id {
+	/*
+	 * Index 0 is both the PREFERRED mode and the fallback returned by
+	 * ana38407_get_current_mode() when the connector has no usable state.
+	 * Keeping those the same means a fallback lands on the mode DRM is
+	 * actually about to program, rather than on an untested pairing.
+	 */
+	ANA38407_MODE_120HS,
+	ANA38407_MODE_60HS,
+	ANA38407_NUM_MODES
+};
+
+struct ana38407_mode_data {
+	struct drm_display_mode mode;
+	/*
+	 * The DDIC bytes that select the VRR regime; see VRR_SETTING in
+	 * ana38407_on(). Register 0xDD is 0x00 in both regimes, so it is not
+	 * stored per-mode.
+	 */
+	u8 vrr_60;
+	u8 vrr_b9[4];
+};
+
+static const struct ana38407_mode_data ana38407_modes[ANA38407_NUM_MODES] = {
+	/*
+	 * 120 Hz -- the mode stock actually runs under load. Live capture of
+	 * OneUI: idle it sits in the DT's 30 Hz node, under load it selects the
+	 * 120 Hz node (2960(30|16|36|0)x1848(32|16|32|0)@120fps, measured
+	 * 118.7). It never chose 60 Hz. The vertical timing here is that node's
+	 * exactly: vfp 16, vpulse 32, vbp 32 -> vtotal 1928.
+	 *
+	 * hblank 111 rather than the node's own 82:
+	 *     pclk = 1928 * 120 * (111 + 987) = 254,033,280 Hz
+	 *     bit clock = 1,524,199,680 Hz   (0.013 % from the declared value)
+	 * The node's own 82 would give 1,483,943,040 Hz (2.6 % low).
+	 *
+	 * Frame transfer is ~7.18 ms in both modes, but the frame period halves
+	 * here, so the transfer occupies ~86 % of it -- which is what stock runs.
+	 */
+	[ANA38407_MODE_120HS] = {
+		.mode = {
+			.clock = (2960 + 45 + 36 + 30) * (1848 + 16 + 32 + 32) * 120 / 1000,
+			.hdisplay = 2960,
+			.hsync_start = 2960 + 45,
+			.hsync_end = 2960 + 45 + 36,
+			.htotal = 2960 + 45 + 36 + 30,
+			.vdisplay = 1848,
+			.vsync_start = 1848 + 16,
+			.vsync_end = 1848 + 16 + 32,
+			.vtotal = 1848 + 16 + 32 + 32,
+			.width_mm = 313,
+			.height_mm = 196,
+			.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
+		},
+		.vrr_60 = 0x00,
+		.vrr_b9 = { 0x80, 0x00, 0x00, 0x00 },
+	},
+	/*
+	 * 60 Hz -- the vendor's wqxga60hs node. Vertical timing verbatim from
+	 * it: vfp 127, vpulse 256, vbp 137 -> vtotal 2368.
+	 *
+	 * The vendor's DT carries the two 60 Hz regimes as separate timing nodes
+	 * with IDENTICAL host timing: wqxga60hs and wqxga60phs are both vtotal
+	 * 2368 and hblank 767, differing only by one line moved between vfp and
+	 * vbp (60HS is 127/256/137, 60PHS is 128/256/136). The 60HS<->60PHS
+	 * distinction is carried ENTIRELY by the DDIC bytes below.
+	 *
+	 * hblank 801 rather than the node's own 767:
+	 *     pclk = 2368 * 60 * (801 + 987) = 254,039,040 Hz
+	 *     bit clock = 1,524,234,240 Hz   (0.015 % from the declared value)
+	 * The node's own 767 would give 1,495,249,920 Hz (1.9 % low).
+	 */
+	[ANA38407_MODE_60HS] = {
+		.mode = {
+			.clock = (2960 + 267 + 267 + 267) * (1848 + 127 + 256 + 137) * 60 / 1000,
+			.hdisplay = 2960,
+			.hsync_start = 2960 + 267,
+			.hsync_end = 2960 + 267 + 267,
+			.htotal = 2960 + 267 + 267 + 267,
+			.vdisplay = 1848,
+			.vsync_start = 1848 + 127,
+			.vsync_end = 1848 + 127 + 256,
+			.vtotal = 1848 + 127 + 256 + 137,
+			.width_mm = 313,
+			.height_mm = 196,
+			.type = DRM_MODE_TYPE_DRIVER,
+		},
+		.vrr_60 = 0x10,
+		.vrr_b9 = { 0xaa, 0xaa, 0xaa, 0xaa },
+	},
+};
+
+/*
+ * Resolve the mode DRM is about to program, so ana38407_on() can send the
+ * matching DDIC byte set.
+ *
+ * Every path logs. Driving one mode's host timing with the other mode's DDIC
+ * bytes is precisely the untested pairing that produces the banding artifact,
+ * and it looks entirely plausible on a static desktop -- so a silent fallback
+ * here would be indistinguishable from a working mode switch. The journal, not
+ * the eye, is what proves which branch ran.
+ */
+static int ana38407_get_current_mode(struct ana38407 *ctx)
+{
+	struct drm_connector *connector = ctx->connector;
+	struct drm_crtc_state *crtc_state;
+	int i;
+
+	if (!connector || !connector->state || !connector->state->crtc) {
+		dev_info(&ctx->dsi->dev,
+			 "no connector state yet; using preferred mode (%d Hz)\n",
+			 drm_mode_vrefresh(&ana38407_modes[0].mode));
+		return 0;
+	}
+
+	crtc_state = connector->state->crtc->state;
+
+	for (i = 0; i < ANA38407_NUM_MODES; i++) {
+		if (drm_mode_match(&crtc_state->mode, &ana38407_modes[i].mode,
+				   DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK)) {
+			dev_info(&ctx->dsi->dev,
+				 "mode %d selected: %d Hz, vtotal %d, htotal %d\n",
+				 i, drm_mode_vrefresh(&ana38407_modes[i].mode),
+				 ana38407_modes[i].mode.vtotal,
+				 ana38407_modes[i].mode.htotal);
+			return i;
+		}
+	}
+
+	dev_warn(&ctx->dsi->dev,
+		 "active mode " DRM_MODE_FMT " matches no table entry; falling back to mode 0 (%d Hz) -- DDIC scan rate will NOT match the host frame rate\n",
+		 DRM_MODE_ARG(&crtc_state->mode),
+		 drm_mode_vrefresh(&ana38407_modes[0].mode));
+
+	return 0;
+}
+
 static int ana38407_on(struct ana38407 *ctx)
 {
 	struct mipi_dsi_device *dsi = ctx->dsi;
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
 	struct drm_dsc_picture_parameter_set pps;
+	const struct ana38407_mode_data *md;
+
+	ctx->cur_mode = ana38407_get_current_mode(ctx);
+	md = &ana38407_modes[ctx->cur_mode];
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
@@ -380,52 +635,61 @@ static int ana38407_on(struct ana38407 *ctx)
 	 *                   (the rev-D/"CtoZ" branch; rev-A/B's 0xF7 0x07 latch is
 	 *                   not sent on rev D)
 	 *
-	 * *** THIS BUILD SELECTS NATIVE VRR_60HS. ***
-	 * It is the first build in this port whose DDIC scan rate and host frame rate
-	 * agree. Every previous build sent the 60PHS byte set (0x60 = 0x00, 0xB9 =
-	 * 0x80 0x00 0x00 0x00), which keeps the DDIC SCANNING at 120HS and derives a
-	 * 60 Hz refresh by low-frequency driving instead. TE follows the SCAN, so a
-	 * 60 Hz host in the 60PHS regime transmits on every OTHER TE; under 60HS the
-	 * DDIC scans at 60, TE arrives at 60, and the host transmits on EVERY TE.
+	 * *** THE BYTES BELOW ARE PER-MODE. *** Each mode in ana38407_modes[]
+	 * stores the byte set that makes the DDIC SCAN at that mode's host frame
+	 * rate, so the two always agree:
 	 *
-	 * The vendor's own DT carries the two regimes as separate timing nodes with
-	 * IDENTICAL host timing: wqxga60hs and wqxga60phs are both vtotal 2368 and
-	 * hblank 767, differing only by one line moved between vfp and vbp (60HS is
-	 * 127/256/137, 60PHS is 128/256/136). The 60HS<->60PHS distinction is
-	 * therefore carried ENTIRELY by the three DDIC bytes above, which is what
-	 * makes this a single-variable test against the instrumented 60 Hz control
-	 * (47/47 transmitted frames):
+	 *     120 Hz host -> VRR_120HS   0x60 = 0x00, 0xB9 = 0x80 0x00 0x00 0x00
+	 *      60 Hz host -> VRR_60HS    0x60 = 0x10, 0xB9 = 0xAA x4
 	 *
-	 *     host timing   unchanged from that control (vtotal 2368, 60 Hz)
-	 *     link rate     unchanged, so the ~7.18 ms transfer still occupies 43%
-	 *                   of the frame period -- the known-BAD duty, deliberately HELD
-	 *     DDIC scan     120HS -> 60HS    (THE variable; TE:transfer 2:1 -> 1:1)
+	 * TE follows the SCAN. When the two agree the host transmits on EVERY TE.
+	 * Every revision of this driver before the two modes existed sent the
+	 * VRR_120HS set unconditionally, so a 60 Hz host transmitted on every OTHER
+	 * TE -- that is the "PHS" low-frequency-driving regime, and it banded.
 	 *
-	 *   band GONE    => the TE:transfer ratio is the mechanism. Because duty is
-	 *                   held at the known-bad 43%, that also makes the 120 Hz
-	 *                   result a FIX rather than a duty-cycle mask, and it means
-	 *                   a flicker-free 60 Hz exists.
-	 *   band PRESENT => the TE-ratio model is wrong; what mattered at 120 Hz was
-	 *                   the frame period or the transfer duty, not TE alignment.
+	 * 0xDD does not move: the table gives 0x00 for 120HS and 60HS alike, and a
+	 * 60 Hz build with 0xDD forced to 0x00 was separately shown to keep the
+	 * band. The DDIC's emission rate is not the variable. (Note that this is
+	 * also what makes the pre-two-mode byte set a native VRR_120HS set rather
+	 * than a 60PHS one: 60PHS wants 0xDD = 0x01, which was never sent.)
 	 *
-	 * 0xDD does not move: the table gives 0x00 for 120HS and 60HS alike, it is
-	 * already 0x00 here, and a 60 Hz build with 0xDD forced to 0x00 was already
-	 * shown to keep the band. The DDIC's emission rate is not the variable.
+	 * GLUT NOTE -- a KNOWN, DELIBERATE DIVERGENCE FROM THE VENDOR.
+	 * update_glut() in the device's own downstream driver selects the gamma
+	 * offset table by VRR base: ss_get_vrr_mode_base() maps 120 Hz -> VRR_120HS
+	 * and 60 Hz + !phs -> VRR_60HS, and the table is then glut_offset_120hs or
+	 * glut_offset_60hs respectively. This driver sends the 60HS table in BOTH
+	 * modes, so at 120 Hz it sends a table the vendor would not.
 	 *
-	 * GLUT NOTE: ss_get_vrr_mode_base() maps 60 Hz + !phs to VRR_60HS, so the
-	 * 60HS gamma-offset table this driver already sends becomes the CORRECT one
-	 * for this regime. Under 60PHS the base was VRR_120HS, whose table OneUI
-	 * emits as all zeros -- i.e. the GLUT selection moves from mismatched to
-	 * matched here. Any appearance change is that correction and is NOT evidence
-	 * about the band; glut_zero=1 still forces OneUI's 120HS-base all-zero GLUT.
+	 * That is intentional and is NOT an oversight:
+	 *   - it is exactly what the measured-clean 120 Hz build sent, so keeping it
+	 *     leaves that arm byte-identical to its verified configuration;
+	 *   - the contents of glut_offset_120hs have not been established from the
+	 *     device's own data file. It is a runtime-parsed table, and the belief
+	 *     that it is all zeros rests on a live capture, not on the source.
+	 * Switching it is therefore not yet actionable. glut_zero=1 already forces
+	 * an all-zero GLUT if a comparison is wanted, with no code change.
 	 */
 	ana38407_unlock_lvl0(&dsi_ctx);
 	ana38407_unlock_lvl1(&dsi_ctx);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x10);
+	{
+		/*
+		 * Both writes carry a runtime value, so they use
+		 * write_buffer_multi: the _seq_multi macro builds a
+		 * `static const u8[]` and only accepts literals.
+		 */
+		u8 c60[] = { 0x60, md->vrr_60 };
+
+		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, c60, sizeof(c60));
+	}
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x13, 0xdd);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdd, 0x00);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x10, 0xb9);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0xaa, 0xaa, 0xaa, 0xaa);
+	{
+		u8 b9[] = { 0xb9, md->vrr_b9[0], md->vrr_b9[1],
+			    md->vrr_b9[2], md->vrr_b9[3] };
+
+		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, b9, sizeof(b9));
+	}
 	ana38407_lock_lvl0(&dsi_ctx);
 	ana38407_lock_lvl1(&dsi_ctx);
 
@@ -599,154 +863,35 @@ static int ana38407_unprepare(struct drm_panel *panel)
 	return dsi_ctx.accum_err;
 }
 
-/*
- * V0 fixed 60 Hz mode (the downstream wqxga60hs timing). Native 2960x1848
- * landscape; physical 313x196 mm.
- *
- * Horizontal blanking is a DSI TRANSPORT-RATE knob on this panel, not panel
- * timing. In command mode the host never programs the porches into hardware --
- * dsi_timing_setup() writes only STREAM0_CTRL (word count from the DSC
- * slice_chunk_size) and STREAM0_TOTAL (hdisplay/vdisplay); REG_DSI_ACTIVE_H,
- * REG_DSI_TOTAL and REG_DSI_ACTIVE_HSYNC are not written at all. The blanking
- * survives only inside the pixel-clock computation, which msm documents as
- * "the overhead to the image data transfer".
- *
- * Working the algebra through dsi_adjust_pclk_for_compression(), htotal cancels
- * and the link rate reduces to a function of the blanking alone:
- *
- *     pclk = vtotal * 60 * (hblank + hdisplay * bpp / (bpc * 3))
- *          = 2368 * 60 * (hblank + 987)
- *
- * so hblank sets how fast one frame is pushed into the DDIC's GRAM, at a fixed
- * 60 Hz frame cadence and with the transmitted payload unchanged.
- *
- * This knob is EMPIRICALLY LOAD-BEARING: the display artifact's row position
- * tracks it. Measured, single-variable, with everything else held identical:
- *
- *     hblank 767  ->  bit clk 1495.2 Mbps/lane  ->  artifact at panel row ~146
- *     hblank 200  ->  bit clk 1011.9 Mbps/lane  ->  artifact at panel row 66.3
- *
- * (43 firings, sd 1.12; an ~80-row shift against a 7.6-row instrument floor.)
- * The occurrence rate did not change -- 17.9% of frames both before and after --
- * so the link rate sets WHERE the artifact lands, not WHETHER it happens.
- *
- * A third point at hblank 1644 (bit clk 2243 Mbps) put the row back at 144.45,
- * i.e. essentially where it started -- so the position is NOT a monotonic
- * function of the link rate, and every continuous model of it is wrong:
- *
- *     bit clk 1495.2 -> row ~146      bit clk 1011.9 -> row 66.29 +- 1.12
- *     bit clk 2242.9 -> row 144.45 +- 0.50
- *
- * 144.45 - 66.29 = 78.16, and slice_height is 77: the band appears to move by
- * exactly ONE SLICE ROW and back, which would make the position QUANTISED to
- * the DSC slice grid rather than continuous in the rate.
- *
- * hblank 400 answered that: bit clock 1182 Mbps, deliberately BETWEEN the two
- * rates that gave different rows -- and the band landed on 144, NOT between.
- * The position is QUANTISED. The link rate SELECTS which slice boundary the
- * artifact occupies; it does not position it continuously:
- *
- *     bit clk  846 -> ?          bit clk 1011.9 -> row 66.3   (index N=1)
- *     bit clk 1182 -> row 144    bit clk 1495.2 -> row ~146   (index N=2)
- *     bit clk 2243 -> row 144.45                              (index N=2)
- *
- * The discrete positions are ~78 rows apart, one slice_height. This also
- * explains the old slice_height result: 77->66 moved the band 154->132, both
- * 2*slice_height -- N stayed at 2 while the grid rescaled. Grid spacing and
- * grid index are two separate knobs onto the same quantity.
- *
- * DO NOT slow the link below ~1 Gbps/lane. hblank 6 (846.5 Mbps, 78% transfer)
- * made the display unusably slow -- that starves real bandwidth.
- *
- * CORRECTION: an earlier revision of this comment claimed
- * qcom,mdss-mdp-transfer-time-us is "an MDP pacing target" and that stock
- * "paces the DPU's output". Read in the device's own downstream driver, that
- * property has exactly two consumers -- the MDP core-clock vote
- * (_sde_crtc_reserve_resource) and the plane QoS watermark
- * (sde_crtc_update_line_time) -- both fetch-side. It does not pace output.
- * Measured on live stock it is simply how long the transfer TAKES: one
- * 2960x1848 8bpp-DSC frame over 4 lanes at the declared rate is 7.178 ms,
- * against the DT's 7533 us.
- *
- * THE LINK RATE IS A DECLARED CONSTANT, NOT A DERIVED ONE. Measured on live
- * stock across a 4x framerate change: 1,524,097,904 Hz at 30 fps and
- * 1,524,052,192 Hz at 120 fps -- 0.003% apart, and both equal to the panel
- * node's qcom,mdss-dsi-panel-clockrate = <0x5ad66500> = 1,524,000,000 Hz.
- * Stock programs the PLL from that constant regardless of mode. msm instead
- * DERIVES it from the timings, so hblank has to be chosen to land on it, and
- * has to be re-chosen whenever vtotal or the framerate changes.
- *
- * THE MODE IS 120 Hz -- the one stock actually runs. Live capture of OneUI:
- * idle it sits in the DT's 30 Hz node, under load it selects the 120 Hz node
- * (2960(30|16|36|0)x1848(32|16|32|0)@120fps, measured 118.7). It never chose
- * 60 Hz. The vertical timing below is that node's, exactly: vfp 16, vpulse 32,
- * vbp 32 -> vtotal 1928. vtotal is hardware-visible in command mode (it sets
- * the tear-check vsync_count and sync_cfg_height), so it must be the real one.
- *
- * hblank is NOT hardware-visible in command mode, so it stays a pure clock
- * dial, and it is set to hold the link rate where it already was -- 111 rather
- * than the node's own 82 -- so that framerate is the ONLY variable changing
- * against the sess-269 rate sweep:
- *
- *     pclk = 1928 * 120 * (111 + 987) = 254,033,280 Hz
- *     bit clock = 1,524,199,680 Hz  -- 0.0023% from the previous 60 Hz build,
- *                                     0.013% from the device's declared value
- *
- * The node's own hblank 82 would give 1,483,943,040 Hz (2.6% low) and would
- * confound a framerate change with a rate change. Frame transfer is unchanged
- * at ~7.18 ms, but the frame period halves, so the transfer now occupies ~86%
- * of it -- which is what stock runs at 120 Hz.
- */
-/*
- * NATIVE 60HS -- the host timing is returned to the instrumented 60 Hz control.
- *
- * The DDIC now scans at 60 Hz (VRR_SETTING above selects the vendor's 60HS byte
- * set), so this build restores the control's host timing exactly. That makes the
- * comparison run against the only arm with published control statistics
- * (141/721 frames, 47/47 epochs, row 146.27 sd 0.44), with the DDIC's scan mode
- * as the sole difference from it.
- *
- * The VERTICAL timing here is the vendor's wqxga60hs node verbatim: vfp 127,
- * vpulse 256, vbp 137 -> vtotal 2368. (wqxga60phs is 128/256/136 -- the same
- * total with one line moved.) vtotal IS hardware-visible in command mode, since
- * it sets the tear-check vsync_count and sync_cfg_height, and for the first time
- * it describes a panel that is genuinely scanning at that rate.
- *
- * hblank 801 is NOT the vendor's porch -- the 60hs node's own blanking is 767.
- * In command mode the porches never reach hardware, so hblank is a pure clock
- * dial and the vendor's real declared hardware value is the link rate itself:
- * qcom,mdss-dsi-panel-clockrate = <0x5ad66500> = 1,524,000,000 Hz, which stock
- * programs directly in every mode. msm instead DERIVES the rate from timings:
- *
- *     pclk = vtotal * 60 * (hblank + 987) ;  bit clock = 6 * pclk
- *     hblank 801 -> 1,524,234,240   (0.015% from the device's declared constant)
- *     hblank 767 -> 1,495,249,920   (1.9% low)
- *
- * So 801 is the value that honours the vendor's declared rate, and it also holds
- * the link rate equal to the control's. That second property is required: the
- * link rate is known to move the artifact's ROW POSITION, so letting it drift
- * would add a second variable to a test whose entire purpose is to isolate the
- * TE ratio.
- */
-static const struct drm_display_mode ana38407_mode = {
-	.clock = (2960 + 267 + 267 + 267) * (1848 + 127 + 256 + 137) * 60 / 1000,
-	.hdisplay = 2960,
-	.hsync_start = 2960 + 267,
-	.hsync_end = 2960 + 267 + 267,
-	.htotal = 2960 + 267 + 267 + 267,
-	.vdisplay = 1848,
-	.vsync_start = 1848 + 127,
-	.vsync_end = 1848 + 127 + 256,
-	.vtotal = 1848 + 127 + 256 + 137,
-	.width_mm = 313,
-	.height_mm = 196,
-	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
-};
-
 static int ana38407_get_modes(struct drm_panel *panel,
 			      struct drm_connector *connector)
 {
-	return drm_connector_helper_get_modes_fixed(connector, &ana38407_mode);
+	struct ana38407 *ctx = to_ana38407(panel);
+	int i;
+
+	for (i = 0; i < ANA38407_NUM_MODES; i++) {
+		struct drm_display_mode *mode;
+
+		mode = drm_mode_duplicate(connector->dev,
+					  &ana38407_modes[i].mode);
+		if (!mode)
+			return -ENOMEM;
+
+		drm_mode_set_name(mode);
+		drm_mode_probed_add(connector, mode);
+	}
+
+	connector->display_info.width_mm = ana38407_modes[0].mode.width_mm;
+	connector->display_info.height_mm = ana38407_modes[0].mode.height_mm;
+
+	/*
+	 * The only place DRM hands this panel its connector. Stash it so
+	 * ana38407_get_current_mode() can read the active mode back out of the
+	 * atomic state at prepare time; drm_panel_funcs offers no other route.
+	 */
+	ctx->connector = connector;
+
+	return ANA38407_NUM_MODES;
 }
 
 static const struct drm_panel_funcs ana38407_panel_funcs = {
