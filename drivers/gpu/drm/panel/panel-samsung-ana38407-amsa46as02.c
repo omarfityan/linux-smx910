@@ -692,22 +692,44 @@ static int ana38407_unprepare(struct drm_panel *panel)
  * of it -- which is what stock runs at 120 Hz.
  */
 /*
- * SEPARATOR PROBE: the mode is back to the 60 Hz timing EXACTLY as the build that
- * fired on 47/47 transmitted frames -- same vtotal 2368, same hblank 801, so the
- * derived DSI rate returns to 1,524,234,240 Hz and the transfer occupies 43% of
- * the frame period again. The ONLY difference from that build is the DDIC LFD
- * divisor above (0xDD = 0x00 instead of 0x01). See the VRR_SETTING comment.
+ * SEPARATOR PROBE #2 -- vtotal against frame period.
+ *
+ * Probe #1 (60 Hz host, LFD off) brought the band back, proving the DDIC's
+ * emission rate is irrelevant and the cause is host-side. But going 60 -> 120 Hz
+ * had moved TWO host-side quantities together:
+ *
+ *   (1) the frame period 16.67 -> 8.33 ms, hence the transfer's SHARE of it
+ *       43% -> 86% (link rate and payload are fixed, so the ~7.18 ms transfer
+ *       itself never changes -- only what fraction of the frame it occupies);
+ *   (2) vtotal 2368 -> 1928, which IS hardware-visible in command mode: it sets
+ *       the tear-check vsync_count and sync_cfg_height.
+ *
+ * This build keeps the 120 Hz node's vtotal 1928 but runs the host at 60 Hz, so
+ * it differs from the VERIFIED-CLEAN 120 Hz build by the framerate alone:
+ *
+ *     vtotal       1928           (held -- the "good" value)
+ *     0xDD         0x00           (held -- shown irrelevant by probe #1)
+ *     bit clock    1,524,199,680  (held; hblank 1209 is purely the clock dial,
+ *                                  pclk = 1928 * 60 * (1209+987) = 254,033,280)
+ *     framerate    60             (THE variable; transfer duty back to 43%)
+ *
+ *   band RETURNS  => the frame period / transfer duty is the cause, vtotal is not
+ *   band STAYS GONE => vtotal, and the tear-check programming derived from it, is
+ *
+ * hblank is a pure clock dial in command mode (the porches never reach hardware),
+ * so 1209 carries no timing meaning -- it exists only to hold the link rate equal
+ * to the clean build's so the framerate is genuinely the single variable.
  */
 static const struct drm_display_mode ana38407_mode = {
-	.clock = (2960 + 267 + 267 + 267) * (1848 + 127 + 256 + 137) * 60 / 1000,
+	.clock = (2960 + 1143 + 36 + 30) * (1848 + 16 + 32 + 32) * 60 / 1000,
 	.hdisplay = 2960,
-	.hsync_start = 2960 + 267,
-	.hsync_end = 2960 + 267 + 267,
-	.htotal = 2960 + 267 + 267 + 267,
+	.hsync_start = 2960 + 1143,
+	.hsync_end = 2960 + 1143 + 36,
+	.htotal = 2960 + 1143 + 36 + 30,
 	.vdisplay = 1848,
-	.vsync_start = 1848 + 127,
-	.vsync_end = 1848 + 127 + 256,
-	.vtotal = 1848 + 127 + 256 + 137,
+	.vsync_start = 1848 + 16,
+	.vsync_end = 1848 + 16 + 32,
+	.vtotal = 1848 + 16 + 32 + 32,
 	.width_mm = 313,
 	.height_mm = 196,
 	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
