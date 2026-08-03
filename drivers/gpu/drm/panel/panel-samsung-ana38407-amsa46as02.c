@@ -587,16 +587,28 @@ static int ana38407_unprepare(struct drm_panel *panel)
  * The occurrence rate did not change -- 17.9% of frames both before and after --
  * so the link rate sets WHERE the artifact lands, not WHETHER it happens.
  *
- * hblank 1644 is the opposite-direction third point: pclk 373.8 MHz, bit clock
- * ~2243 Mbps/lane, frame transfer ~4.9 ms = ~29% of the period. If the coupling
- * is real the row must move DOWN, past its original ~146.
+ * A third point at hblank 1644 (bit clk 2243 Mbps) put the row back at 144.45,
+ * i.e. essentially where it started -- so the position is NOT a monotonic
+ * function of the link rate, and every continuous model of it is wrong:
+ *
+ *     bit clk 1495.2 -> row ~146      bit clk 1011.9 -> row 66.29 +- 1.12
+ *     bit clk 2242.9 -> row 144.45 +- 0.50
+ *
+ * 144.45 - 66.29 = 78.16, and slice_height is 77: the band appears to move by
+ * exactly ONE SLICE ROW and back, which would make the position QUANTISED to
+ * the DSC slice grid rather than continuous in the rate.
+ *
+ * hblank 400 tests exactly that. pclk 197.1 MHz, bit clock ~1182 Mbps/lane,
+ * frame transfer ~9.3 ms = ~55% of the period -- deliberately BETWEEN the two
+ * settings that produced different rows. Continuous => the row lands somewhere
+ * new between 66 and 144. Quantised => it lands on one of them, never between.
  */
 static const struct drm_display_mode ana38407_mode = {
-	.clock = (2960 + 550 + 544 + 550) * (1848 + 127 + 256 + 137) * 60 / 1000,
+	.clock = (2960 + 134 + 133 + 133) * (1848 + 127 + 256 + 137) * 60 / 1000,
 	.hdisplay = 2960,
-	.hsync_start = 2960 + 550,
-	.hsync_end = 2960 + 550 + 544,
-	.htotal = 2960 + 550 + 544 + 550,
+	.hsync_start = 2960 + 134,
+	.hsync_end = 2960 + 134 + 133,
+	.htotal = 2960 + 134 + 133 + 133,
 	.vdisplay = 1848,
 	.vsync_start = 1848 + 127,
 	.vsync_end = 1848 + 127 + 256,
