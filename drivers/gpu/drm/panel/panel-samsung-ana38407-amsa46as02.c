@@ -598,17 +598,32 @@ static int ana38407_unprepare(struct drm_panel *panel)
  * exactly ONE SLICE ROW and back, which would make the position QUANTISED to
  * the DSC slice grid rather than continuous in the rate.
  *
- * hblank 400 tests exactly that. pclk 197.1 MHz, bit clock ~1182 Mbps/lane,
- * frame transfer ~9.3 ms = ~55% of the period -- deliberately BETWEEN the two
- * settings that produced different rows. Continuous => the row lands somewhere
- * new between 66 and 144. Quantised => it lands on one of them, never between.
+ * hblank 400 answered that: bit clock 1182 Mbps, deliberately BETWEEN the two
+ * rates that gave different rows -- and the band landed on 144, NOT between.
+ * The position is QUANTISED. The link rate SELECTS which slice boundary the
+ * artifact occupies; it does not position it continuously:
+ *
+ *     bit clk  846 -> ?          bit clk 1011.9 -> row 66.3   (index N=1)
+ *     bit clk 1182 -> row 144    bit clk 1495.2 -> row ~146   (index N=2)
+ *     bit clk 2243 -> row 144.45                              (index N=2)
+ *
+ * The discrete positions are ~78 rows apart, one slice_height. This also
+ * explains the old slice_height result: 77->66 moved the band 154->132, both
+ * 2*slice_height -- N stayed at 2 while the grid rescaled. Grid spacing and
+ * grid index are two separate knobs onto the same quantity.
+ *
+ * hblank 6 asks whether there is an N=0, which would put the band at row ~0 --
+ * off the visible area entirely. pclk 141.1 MHz, bit clock ~846.5 Mbps/lane,
+ * frame transfer ~12.9 ms = ~78% of the period. This is the SLOWEST the
+ * blanking knob can reach: the compressed active data contributes a fixed 987
+ * to (hblank + 987) that cannot be removed.
  */
 static const struct drm_display_mode ana38407_mode = {
-	.clock = (2960 + 134 + 133 + 133) * (1848 + 127 + 256 + 137) * 60 / 1000,
+	.clock = (2960 + 2 + 2 + 2) * (1848 + 127 + 256 + 137) * 60 / 1000,
 	.hdisplay = 2960,
-	.hsync_start = 2960 + 134,
-	.hsync_end = 2960 + 134 + 133,
-	.htotal = 2960 + 134 + 133 + 133,
+	.hsync_start = 2960 + 2,
+	.hsync_end = 2960 + 2 + 2,
+	.htotal = 2960 + 2 + 2 + 2,
 	.vdisplay = 1848,
 	.vsync_start = 1848 + 127,
 	.vsync_end = 1848 + 127 + 256,
