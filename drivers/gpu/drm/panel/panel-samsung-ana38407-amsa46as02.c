@@ -577,19 +577,26 @@ static int ana38407_unprepare(struct drm_panel *panel)
  * so hblank sets how fast one frame is pushed into the DDIC's GRAM, at a fixed
  * 60 Hz frame cadence and with the transmitted payload unchanged.
  *
- * hblank 767 (= 256+256+255) put the frame transfer at ~7.3 ms, ~44% of the
- * 16.67 ms frame period. The vendor's own panel node instead declares
- * mdss-mdp-transfer-time-us of 15866 us at 60 Hz -- ~95% -- i.e. it spreads the
- * GRAM write across nearly the whole frame rather than bursting it. hblank 200
- * moves us toward that: pclk 168.6 MHz, DSI bit clock ~1012 Mbps/lane, frame
- * transfer ~10.8 ms = ~65% of the period.
+ * This knob is EMPIRICALLY LOAD-BEARING: the display artifact's row position
+ * tracks it. Measured, single-variable, with everything else held identical:
+ *
+ *     hblank 767  ->  bit clk 1495.2 Mbps/lane  ->  artifact at panel row ~146
+ *     hblank 200  ->  bit clk 1011.9 Mbps/lane  ->  artifact at panel row 66.3
+ *
+ * (43 firings, sd 1.12; an ~80-row shift against a 7.6-row instrument floor.)
+ * The occurrence rate did not change -- 17.9% of frames both before and after --
+ * so the link rate sets WHERE the artifact lands, not WHETHER it happens.
+ *
+ * hblank 1644 is the opposite-direction third point: pclk 373.8 MHz, bit clock
+ * ~2243 Mbps/lane, frame transfer ~4.9 ms = ~29% of the period. If the coupling
+ * is real the row must move DOWN, past its original ~146.
  */
 static const struct drm_display_mode ana38407_mode = {
-	.clock = (2960 + 68 + 66 + 66) * (1848 + 127 + 256 + 137) * 60 / 1000,
+	.clock = (2960 + 550 + 544 + 550) * (1848 + 127 + 256 + 137) * 60 / 1000,
 	.hdisplay = 2960,
-	.hsync_start = 2960 + 68,
-	.hsync_end = 2960 + 68 + 66,
-	.htotal = 2960 + 68 + 66 + 66,
+	.hsync_start = 2960 + 550,
+	.hsync_end = 2960 + 550 + 544,
+	.htotal = 2960 + 550 + 544 + 550,
 	.vdisplay = 1848,
 	.vsync_start = 1848 + 127,
 	.vsync_end = 1848 + 127 + 256,
