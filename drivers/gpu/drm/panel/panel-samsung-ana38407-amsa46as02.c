@@ -559,13 +559,37 @@ static int ana38407_unprepare(struct drm_panel *panel)
 /*
  * V0 fixed 60 Hz mode (the downstream wqxga60hs timing). Native 2960x1848
  * landscape; physical 313x196 mm.
+ *
+ * Horizontal blanking is a DSI TRANSPORT-RATE knob on this panel, not panel
+ * timing. In command mode the host never programs the porches into hardware --
+ * dsi_timing_setup() writes only STREAM0_CTRL (word count from the DSC
+ * slice_chunk_size) and STREAM0_TOTAL (hdisplay/vdisplay); REG_DSI_ACTIVE_H,
+ * REG_DSI_TOTAL and REG_DSI_ACTIVE_HSYNC are not written at all. The blanking
+ * survives only inside the pixel-clock computation, which msm documents as
+ * "the overhead to the image data transfer".
+ *
+ * Working the algebra through dsi_adjust_pclk_for_compression(), htotal cancels
+ * and the link rate reduces to a function of the blanking alone:
+ *
+ *     pclk = vtotal * 60 * (hblank + hdisplay * bpp / (bpc * 3))
+ *          = 2368 * 60 * (hblank + 987)
+ *
+ * so hblank sets how fast one frame is pushed into the DDIC's GRAM, at a fixed
+ * 60 Hz frame cadence and with the transmitted payload unchanged.
+ *
+ * hblank 767 (= 256+256+255) put the frame transfer at ~7.3 ms, ~44% of the
+ * 16.67 ms frame period. The vendor's own panel node instead declares
+ * mdss-mdp-transfer-time-us of 15866 us at 60 Hz -- ~95% -- i.e. it spreads the
+ * GRAM write across nearly the whole frame rather than bursting it. hblank 200
+ * moves us toward that: pclk 168.6 MHz, DSI bit clock ~1012 Mbps/lane, frame
+ * transfer ~10.8 ms = ~65% of the period.
  */
 static const struct drm_display_mode ana38407_mode = {
-	.clock = (2960 + 256 + 256 + 255) * (1848 + 127 + 256 + 137) * 60 / 1000,
+	.clock = (2960 + 68 + 66 + 66) * (1848 + 127 + 256 + 137) * 60 / 1000,
 	.hdisplay = 2960,
-	.hsync_start = 2960 + 256,
-	.hsync_end = 2960 + 256 + 256,
-	.htotal = 2960 + 256 + 256 + 255,
+	.hsync_start = 2960 + 68,
+	.hsync_end = 2960 + 68 + 66,
+	.htotal = 2960 + 68 + 66 + 66,
 	.vdisplay = 1848,
 	.vsync_start = 1848 + 127,
 	.vsync_end = 1848 + 127 + 256,
