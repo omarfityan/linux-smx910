@@ -380,46 +380,52 @@ static int ana38407_on(struct ana38407 *ctx)
 	 *                   (the rev-D/"CtoZ" branch; rev-A/B's 0xF7 0x07 latch is
 	 *                   not sent on rev D)
 	 *
-	 * 0xDD = 0x00 disables the LFD division, so the DDIC emits at its full 120HS
-	 * scan rate. It was 0x01 (= 60PHS, ÷2) for as long as the mode below was 60 Hz.
+	 * *** THIS BUILD SELECTS NATIVE VRR_60HS. ***
+	 * It is the first build in this port whose DDIC scan rate and host frame rate
+	 * agree. Every previous build sent the 60PHS byte set (0x60 = 0x00, 0xB9 =
+	 * 0x80 0x00 0x00 0x00), which keeps the DDIC SCANNING at 120HS and derives a
+	 * 60 Hz refresh by low-frequency driving instead. TE follows the SCAN, so a
+	 * 60 Hz host in the 60PHS regime transmits on every OTHER TE; under 60HS the
+	 * DDIC scans at 60, TE arrives at 60, and the host transmits on EVERY TE.
 	 *
-	 * *** SEPARATOR PROBE — this build is a DELIBERATELY MIXED STATE. ***
-	 * Running 120 Hz (mode + 0xDD=0x00 together) took the artifact from 47/47
-	 * transmitted frames to 0/46, p=1.2e-27. But that changed TWO things at once:
-	 * the host transfer duty (43% -> 86% of the frame period) and the DDIC's
-	 * emission rate. This build changes back ONLY the mode, keeping 0xDD = 0x00:
+	 * The vendor's own DT carries the two regimes as separate timing nodes with
+	 * IDENTICAL host timing: wqxga60hs and wqxga60phs are both vtotal 2368 and
+	 * hblank 767, differing only by one line moved between vfp and vbp (60HS is
+	 * 127/256/137, 60PHS is 128/256/136). The 60HS<->60PHS distinction is
+	 * therefore carried ENTIRELY by the three DDIC bytes above, which is what
+	 * makes this a single-variable test against the instrumented 60 Hz control
+	 * (47/47 transmitted frames):
 	 *
-	 *     host transmits at 60 Hz   (transfer duty back to 43%, the known-bad value)
-	 *     DDIC emits at 120 Hz      (LFD off, so each GRAM frame is scanned twice)
+	 *     host timing   unchanged from that control (vtotal 2368, 60 Hz)
+	 *     link rate     unchanged, so the ~7.18 ms transfer still occupies 43%
+	 *                   of the frame period -- the known-BAD duty, deliberately HELD
+	 *     DDIC scan     120HS -> 60HS    (THE variable; TE:transfer 2:1 -> 1:1)
 	 *
-	 * It therefore differs from the build that fired 47/47 by EXACTLY ONE BYTE.
-	 *   band RETURNS  => the host-side mode / transfer duty is responsible
-	 *   band STAYS GONE => the DDIC emission rate is responsible
+	 *   band GONE    => the TE:transfer ratio is the mechanism. Because duty is
+	 *                   held at the known-bad 43%, that also makes the 120 Hz
+	 *                   result a FIX rather than a duty-cycle mask, and it means
+	 *                   a flicker-free 60 Hz exists.
+	 *   band PRESENT => the TE-ratio model is wrong; what mattered at 120 Hz was
+	 *                   the frame period or the transfer duty, not TE alignment.
 	 *
-	 * Note this pairing is not one the vendor ships: its table pairs 0xDD=0x00
-	 * either with a 120 Hz host rate (VRR_120HS) or with 0x60=0x10 + 0xB9=0xAA*4
-	 * (VRR_60HS, a native 60 Hz scan). Neither of those isolates the variable, so
-	 * this is a probe state, chosen for attribution rather than for shipping.
+	 * 0xDD does not move: the table gives 0x00 for 120HS and 60HS alike, it is
+	 * already 0x00 here, and a 60 Hz build with 0xDD forced to 0x00 was already
+	 * shown to keep the band. The DDIC's emission rate is not the variable.
 	 *
-	 * WHY 120: read off the running device. Stock idles in the DT's 30 Hz timing
-	 * node and switches to the 120 Hz node under load -- it never selected 60 Hz
-	 * in either sampled state, though 60 Hz nodes exist in its DT. Since the DSI
-	 * link rate is a mode-independent constant on stock (a 4x framerate change
-	 * moved it 0.003%), the framerate alone sets the transfer's share of the
-	 * frame period: 86% at 120 Hz, 43% at 60, 21% at 30. 60 Hz put us at a duty
-	 * cycle the panel is never driven at on stock.
-	 *
-	 * 0x60 and 0xB9 are unchanged: 0x00 covers 120HS as well as 60PHS, and the
-	 * 0xB9 ELSE branch already carries the 120HS value. vrr_base stays
-	 * VRR_120HS either way, so the GLUT selection below is unaffected.
+	 * GLUT NOTE: ss_get_vrr_mode_base() maps 60 Hz + !phs to VRR_60HS, so the
+	 * 60HS gamma-offset table this driver already sends becomes the CORRECT one
+	 * for this regime. Under 60PHS the base was VRR_120HS, whose table OneUI
+	 * emits as all zeros -- i.e. the GLUT selection moves from mismatched to
+	 * matched here. Any appearance change is that correction and is NOT evidence
+	 * about the band; glut_zero=1 still forces OneUI's 120HS-base all-zero GLUT.
 	 */
 	ana38407_unlock_lvl0(&dsi_ctx);
 	ana38407_unlock_lvl1(&dsi_ctx);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x10);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x13, 0xdd);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdd, 0x00);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x10, 0xb9);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x80, 0x00, 0x00, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0xaa, 0xaa, 0xaa, 0xaa);
 	ana38407_lock_lvl0(&dsi_ctx);
 	ana38407_lock_lvl1(&dsi_ctx);
 
@@ -692,44 +698,46 @@ static int ana38407_unprepare(struct drm_panel *panel)
  * of it -- which is what stock runs at 120 Hz.
  */
 /*
- * SEPARATOR PROBE #2 -- vtotal against frame period.
+ * NATIVE 60HS -- the host timing is returned to the instrumented 60 Hz control.
  *
- * Probe #1 (60 Hz host, LFD off) brought the band back, proving the DDIC's
- * emission rate is irrelevant and the cause is host-side. But going 60 -> 120 Hz
- * had moved TWO host-side quantities together:
+ * The DDIC now scans at 60 Hz (VRR_SETTING above selects the vendor's 60HS byte
+ * set), so this build restores the control's host timing exactly. That makes the
+ * comparison run against the only arm with published control statistics
+ * (141/721 frames, 47/47 epochs, row 146.27 sd 0.44), with the DDIC's scan mode
+ * as the sole difference from it.
  *
- *   (1) the frame period 16.67 -> 8.33 ms, hence the transfer's SHARE of it
- *       43% -> 86% (link rate and payload are fixed, so the ~7.18 ms transfer
- *       itself never changes -- only what fraction of the frame it occupies);
- *   (2) vtotal 2368 -> 1928, which IS hardware-visible in command mode: it sets
- *       the tear-check vsync_count and sync_cfg_height.
+ * The VERTICAL timing here is the vendor's wqxga60hs node verbatim: vfp 127,
+ * vpulse 256, vbp 137 -> vtotal 2368. (wqxga60phs is 128/256/136 -- the same
+ * total with one line moved.) vtotal IS hardware-visible in command mode, since
+ * it sets the tear-check vsync_count and sync_cfg_height, and for the first time
+ * it describes a panel that is genuinely scanning at that rate.
  *
- * This build keeps the 120 Hz node's vtotal 1928 but runs the host at 60 Hz, so
- * it differs from the VERIFIED-CLEAN 120 Hz build by the framerate alone:
+ * hblank 801 is NOT the vendor's porch -- the 60hs node's own blanking is 767.
+ * In command mode the porches never reach hardware, so hblank is a pure clock
+ * dial and the vendor's real declared hardware value is the link rate itself:
+ * qcom,mdss-dsi-panel-clockrate = <0x5ad66500> = 1,524,000,000 Hz, which stock
+ * programs directly in every mode. msm instead DERIVES the rate from timings:
  *
- *     vtotal       1928           (held -- the "good" value)
- *     0xDD         0x00           (held -- shown irrelevant by probe #1)
- *     bit clock    1,524,199,680  (held; hblank 1209 is purely the clock dial,
- *                                  pclk = 1928 * 60 * (1209+987) = 254,033,280)
- *     framerate    60             (THE variable; transfer duty back to 43%)
+ *     pclk = vtotal * 60 * (hblank + 987) ;  bit clock = 6 * pclk
+ *     hblank 801 -> 1,524,234,240   (0.015% from the device's declared constant)
+ *     hblank 767 -> 1,495,249,920   (1.9% low)
  *
- *   band RETURNS  => the frame period / transfer duty is the cause, vtotal is not
- *   band STAYS GONE => vtotal, and the tear-check programming derived from it, is
- *
- * hblank is a pure clock dial in command mode (the porches never reach hardware),
- * so 1209 carries no timing meaning -- it exists only to hold the link rate equal
- * to the clean build's so the framerate is genuinely the single variable.
+ * So 801 is the value that honours the vendor's declared rate, and it also holds
+ * the link rate equal to the control's. That second property is required: the
+ * link rate is known to move the artifact's ROW POSITION, so letting it drift
+ * would add a second variable to a test whose entire purpose is to isolate the
+ * TE ratio.
  */
 static const struct drm_display_mode ana38407_mode = {
-	.clock = (2960 + 1143 + 36 + 30) * (1848 + 16 + 32 + 32) * 60 / 1000,
+	.clock = (2960 + 267 + 267 + 267) * (1848 + 127 + 256 + 137) * 60 / 1000,
 	.hdisplay = 2960,
-	.hsync_start = 2960 + 1143,
-	.hsync_end = 2960 + 1143 + 36,
-	.htotal = 2960 + 1143 + 36 + 30,
+	.hsync_start = 2960 + 267,
+	.hsync_end = 2960 + 267 + 267,
+	.htotal = 2960 + 267 + 267 + 267,
 	.vdisplay = 1848,
-	.vsync_start = 1848 + 16,
-	.vsync_end = 1848 + 16 + 32,
-	.vtotal = 1848 + 16 + 32 + 32,
+	.vsync_start = 1848 + 127,
+	.vsync_end = 1848 + 127 + 256,
+	.vtotal = 1848 + 127 + 256 + 137,
 	.width_mm = 313,
 	.height_mm = 196,
 	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
