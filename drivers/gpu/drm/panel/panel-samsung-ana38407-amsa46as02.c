@@ -366,21 +366,40 @@ static int ana38407_on(struct ana38407 *ctx)
 	mipi_dsi_msleep(&dsi_ctx, 50);
 
 	/*
-	 * VRR_SETTING (rev D), transcribed from this device's own stock capture
-	 * (sess-133 live ss_print_cmd_desc): stock runs 120HS scan + Low-
-	 * Frequency-Driving at every refresh rate, programming 0x60=0x00 (120HS
-	 * scan select), 0xDD[0x13]=0x01 (LFD divisor = 60PHS: stock drives the
-	 * 120HS-scan DDIC at 60 fps via low-frequency-driving -- observed in the
-	 * forced-60 capture -- coherent with our fixed-60 command-mode delivery),
-	 * and 0xB9[0x10]=0x80 0x00 0x00 0x00 (the rev-D/"CtoZ" 120HS frame-control
-	 * value -- NOT the rev-A 0x88 x4 nor the 60HS 0xAA x4). The rev-A/B
-	 * 0xF7 0x07 latch is not sent on rev D.
+	 * VRR_SETTING (rev D), transcribed from this device's own runtime-parsed
+	 * panel_data_file/GTS9U_ANA38407_AMSA46AS02.dat (the VRR_SETTING table),
+	 * cross-checked against the sess-133 live ss_print_cmd_desc capture. The
+	 * DDIC always SCANS at 120HS; the refresh rate the host actually delivers
+	 * is selected by the Low-Frequency-Driving divisor, not by the scan mode:
+	 *
+	 *     W 0x60 0xXX   120HS | 60PHS | 30PHS -> 0x00 ;  60HS | 30HS -> 0x10
+	 *     W 0xB0 0x13 0xDD
+	 *     W 0xDD 0xXX   120HS | 60HS  -> 0x00 ;  60PHS | 30HS -> 0x01
+	 *                   30PHS -> 0x03 ; 24PHS -> 0x04 ; 10PHS -> 0x0B
+	 *     W 0xB9 0xXX*4 60HS | 30HS -> 0xAA x4 ; ELSE -> 0x80 0x00 0x00 0x00
+	 *                   (the rev-D/"CtoZ" branch; rev-A/B's 0xF7 0x07 latch is
+	 *                   not sent on rev D)
+	 *
+	 * We run VRR_120HS, so 0xDD = 0x00. It was 0x01 (= 60PHS, the LFD divisor
+	 * that drives the 120HS-scan DDIC at 60 fps) while the mode below was 60 Hz.
+	 *
+	 * WHY 120: read off the running device. Stock idles in the DT's 30 Hz timing
+	 * node and switches to the 120 Hz node under load -- it never selected 60 Hz
+	 * in either sampled state, though 60 Hz nodes exist in its DT. Since the DSI
+	 * link rate is a mode-independent constant on stock (a 4x framerate change
+	 * moved it 0.003%), the framerate alone sets the transfer's share of the
+	 * frame period: 86% at 120 Hz, 43% at 60, 21% at 30. 60 Hz put us at a duty
+	 * cycle the panel is never driven at on stock.
+	 *
+	 * 0x60 and 0xB9 are unchanged: 0x00 covers 120HS as well as 60PHS, and the
+	 * 0xB9 ELSE branch already carries the 120HS value. vrr_base stays
+	 * VRR_120HS either way, so the GLUT selection below is unaffected.
 	 */
 	ana38407_unlock_lvl0(&dsi_ctx);
 	ana38407_unlock_lvl1(&dsi_ctx);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x00);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x13, 0xdd);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdd, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdd, 0x00);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x10, 0xb9);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x80, 0x00, 0x00, 0x00);
 	ana38407_lock_lvl0(&dsi_ctx);
@@ -613,34 +632,57 @@ static int ana38407_unprepare(struct drm_panel *panel)
  * grid index are two separate knobs onto the same quantity.
  *
  * DO NOT slow the link below ~1 Gbps/lane. hblank 6 (846.5 Mbps, 78% transfer)
- * made the display unusably slow -- that starves real bandwidth, which is NOT
- * what the vendor does. Stock runs a FAST link and paces the DPU's output on
- * top of it; qcom,mdss-mdp-transfer-time-us is an MDP pacing target, not a link
- * rate. Lengthening the transfer by slowing the link is the wrong mechanism.
+ * made the display unusably slow -- that starves real bandwidth.
  *
- * This value is THE DEVICE'S OWN. The stock panel node declares
- * qcom,mdss-dsi-panel-clockrate = <0x5ad66500> = 1,524,000,000 Hz, identical
- * across all five of its modes. hblank 801 is the closest an integer blanking
- * value reaches it:
+ * CORRECTION: an earlier revision of this comment claimed
+ * qcom,mdss-mdp-transfer-time-us is "an MDP pacing target" and that stock
+ * "paces the DPU's output". Read in the device's own downstream driver, that
+ * property has exactly two consumers -- the MDP core-clock vote
+ * (_sde_crtc_reserve_resource) and the plane QoS watermark
+ * (sde_crtc_update_line_time) -- both fetch-side. It does not pace output.
+ * Measured on live stock it is simply how long the transfer TAKES: one
+ * 2960x1848 8bpp-DSC frame over 4 lanes at the declared rate is 7.178 ms,
+ * against the DT's 7533 us.
  *
- *     pclk = 2368 * 60 * (801 + 987) = 254,039,040 Hz
- *     bit clock = 1,524,234,240 Hz   -- 0.0154% above the declared value
+ * THE LINK RATE IS A DECLARED CONSTANT, NOT A DERIVED ONE. Measured on live
+ * stock across a 4x framerate change: 1,524,097,904 Hz at 30 fps and
+ * 1,524,052,192 Hz at 120 fps -- 0.003% apart, and both equal to the panel
+ * node's qcom,mdss-dsi-panel-clockrate = <0x5ad66500> = 1,524,000,000 Hz.
+ * Stock programs the PLL from that constant regardless of mode. msm instead
+ * DERIVES it from the timings, so hblank has to be chosen to land on it, and
+ * has to be re-chosen whenever vtotal or the framerate changes.
  *
- * Frame transfer ~7.2 ms = ~43% of the period, matching the vendor's 7533 us
- * 60 Hz mode. Everything derived here previously ran at 1,495,249,365 Hz, which
- * is 2% low: a value that fell out of our own htotal arithmetic rather than one
- * the device specifies.
+ * THE MODE IS 120 Hz -- the one stock actually runs. Live capture of OneUI:
+ * idle it sits in the DT's 30 Hz node, under load it selects the 120 Hz node
+ * (2960(30|16|36|0)x1848(32|16|32|0)@120fps, measured 118.7). It never chose
+ * 60 Hz. The vertical timing below is that node's, exactly: vfp 16, vpulse 32,
+ * vbp 32 -> vtotal 1928. vtotal is hardware-visible in command mode (it sets
+ * the tear-check vsync_count and sync_cfg_height), so it must be the real one.
+ *
+ * hblank is NOT hardware-visible in command mode, so it stays a pure clock
+ * dial, and it is set to hold the link rate where it already was -- 111 rather
+ * than the node's own 82 -- so that framerate is the ONLY variable changing
+ * against the sess-269 rate sweep:
+ *
+ *     pclk = 1928 * 120 * (111 + 987) = 254,033,280 Hz
+ *     bit clock = 1,524,199,680 Hz  -- 0.0023% from the previous 60 Hz build,
+ *                                     0.013% from the device's declared value
+ *
+ * The node's own hblank 82 would give 1,483,943,040 Hz (2.6% low) and would
+ * confound a framerate change with a rate change. Frame transfer is unchanged
+ * at ~7.18 ms, but the frame period halves, so the transfer now occupies ~86%
+ * of it -- which is what stock runs at 120 Hz.
  */
 static const struct drm_display_mode ana38407_mode = {
-	.clock = (2960 + 267 + 267 + 267) * (1848 + 127 + 256 + 137) * 60 / 1000,
+	.clock = (2960 + 45 + 36 + 30) * (1848 + 16 + 32 + 32) * 120 / 1000,
 	.hdisplay = 2960,
-	.hsync_start = 2960 + 267,
-	.hsync_end = 2960 + 267 + 267,
-	.htotal = 2960 + 267 + 267 + 267,
+	.hsync_start = 2960 + 45,
+	.hsync_end = 2960 + 45 + 36,
+	.htotal = 2960 + 45 + 36 + 30,
 	.vdisplay = 1848,
-	.vsync_start = 1848 + 127,
-	.vsync_end = 1848 + 127 + 256,
-	.vtotal = 1848 + 127 + 256 + 137,
+	.vsync_start = 1848 + 16,
+	.vsync_end = 1848 + 16 + 32,
+	.vtotal = 1848 + 16 + 32 + 32,
 	.width_mm = 313,
 	.height_mm = 196,
 	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
