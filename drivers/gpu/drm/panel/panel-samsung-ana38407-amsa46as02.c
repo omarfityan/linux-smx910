@@ -612,18 +612,31 @@ static int ana38407_unprepare(struct drm_panel *panel)
  * 2*slice_height -- N stayed at 2 while the grid rescaled. Grid spacing and
  * grid index are two separate knobs onto the same quantity.
  *
- * hblank 6 asks whether there is an N=0, which would put the band at row ~0 --
- * off the visible area entirely. pclk 141.1 MHz, bit clock ~846.5 Mbps/lane,
- * frame transfer ~12.9 ms = ~78% of the period. This is the SLOWEST the
- * blanking knob can reach: the compressed active data contributes a fixed 987
- * to (hblank + 987) that cannot be removed.
+ * DO NOT slow the link below ~1 Gbps/lane. hblank 6 (846.5 Mbps, 78% transfer)
+ * made the display unusably slow -- that starves real bandwidth, which is NOT
+ * what the vendor does. Stock runs a FAST link and paces the DPU's output on
+ * top of it; qcom,mdss-mdp-transfer-time-us is an MDP pacing target, not a link
+ * rate. Lengthening the transfer by slowing the link is the wrong mechanism.
+ *
+ * This value is THE DEVICE'S OWN. The stock panel node declares
+ * qcom,mdss-dsi-panel-clockrate = <0x5ad66500> = 1,524,000,000 Hz, identical
+ * across all five of its modes. hblank 801 is the closest an integer blanking
+ * value reaches it:
+ *
+ *     pclk = 2368 * 60 * (801 + 987) = 254,039,040 Hz
+ *     bit clock = 1,524,234,240 Hz   -- 0.0154% above the declared value
+ *
+ * Frame transfer ~7.2 ms = ~43% of the period, matching the vendor's 7533 us
+ * 60 Hz mode. Everything derived here previously ran at 1,495,249,365 Hz, which
+ * is 2% low: a value that fell out of our own htotal arithmetic rather than one
+ * the device specifies.
  */
 static const struct drm_display_mode ana38407_mode = {
-	.clock = (2960 + 2 + 2 + 2) * (1848 + 127 + 256 + 137) * 60 / 1000,
+	.clock = (2960 + 267 + 267 + 267) * (1848 + 127 + 256 + 137) * 60 / 1000,
 	.hdisplay = 2960,
-	.hsync_start = 2960 + 2,
-	.hsync_end = 2960 + 2 + 2,
-	.htotal = 2960 + 2 + 2 + 2,
+	.hsync_start = 2960 + 267,
+	.hsync_end = 2960 + 267 + 267,
+	.htotal = 2960 + 267 + 267 + 267,
 	.vdisplay = 1848,
 	.vsync_start = 1848 + 127,
 	.vsync_end = 1848 + 127 + 256,
