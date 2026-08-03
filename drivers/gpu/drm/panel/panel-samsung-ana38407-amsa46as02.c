@@ -380,8 +380,26 @@ static int ana38407_on(struct ana38407 *ctx)
 	 *                   (the rev-D/"CtoZ" branch; rev-A/B's 0xF7 0x07 latch is
 	 *                   not sent on rev D)
 	 *
-	 * We run VRR_120HS, so 0xDD = 0x00. It was 0x01 (= 60PHS, the LFD divisor
-	 * that drives the 120HS-scan DDIC at 60 fps) while the mode below was 60 Hz.
+	 * 0xDD = 0x00 disables the LFD division, so the DDIC emits at its full 120HS
+	 * scan rate. It was 0x01 (= 60PHS, ÷2) for as long as the mode below was 60 Hz.
+	 *
+	 * *** SEPARATOR PROBE — this build is a DELIBERATELY MIXED STATE. ***
+	 * Running 120 Hz (mode + 0xDD=0x00 together) took the artifact from 47/47
+	 * transmitted frames to 0/46, p=1.2e-27. But that changed TWO things at once:
+	 * the host transfer duty (43% -> 86% of the frame period) and the DDIC's
+	 * emission rate. This build changes back ONLY the mode, keeping 0xDD = 0x00:
+	 *
+	 *     host transmits at 60 Hz   (transfer duty back to 43%, the known-bad value)
+	 *     DDIC emits at 120 Hz      (LFD off, so each GRAM frame is scanned twice)
+	 *
+	 * It therefore differs from the build that fired 47/47 by EXACTLY ONE BYTE.
+	 *   band RETURNS  => the host-side mode / transfer duty is responsible
+	 *   band STAYS GONE => the DDIC emission rate is responsible
+	 *
+	 * Note this pairing is not one the vendor ships: its table pairs 0xDD=0x00
+	 * either with a 120 Hz host rate (VRR_120HS) or with 0x60=0x10 + 0xB9=0xAA*4
+	 * (VRR_60HS, a native 60 Hz scan). Neither of those isolates the variable, so
+	 * this is a probe state, chosen for attribution rather than for shipping.
 	 *
 	 * WHY 120: read off the running device. Stock idles in the DT's 30 Hz timing
 	 * node and switches to the 120 Hz node under load -- it never selected 60 Hz
@@ -673,16 +691,23 @@ static int ana38407_unprepare(struct drm_panel *panel)
  * at ~7.18 ms, but the frame period halves, so the transfer now occupies ~86%
  * of it -- which is what stock runs at 120 Hz.
  */
+/*
+ * SEPARATOR PROBE: the mode is back to the 60 Hz timing EXACTLY as the build that
+ * fired on 47/47 transmitted frames -- same vtotal 2368, same hblank 801, so the
+ * derived DSI rate returns to 1,524,234,240 Hz and the transfer occupies 43% of
+ * the frame period again. The ONLY difference from that build is the DDIC LFD
+ * divisor above (0xDD = 0x00 instead of 0x01). See the VRR_SETTING comment.
+ */
 static const struct drm_display_mode ana38407_mode = {
-	.clock = (2960 + 45 + 36 + 30) * (1848 + 16 + 32 + 32) * 120 / 1000,
+	.clock = (2960 + 267 + 267 + 267) * (1848 + 127 + 256 + 137) * 60 / 1000,
 	.hdisplay = 2960,
-	.hsync_start = 2960 + 45,
-	.hsync_end = 2960 + 45 + 36,
-	.htotal = 2960 + 45 + 36 + 30,
+	.hsync_start = 2960 + 267,
+	.hsync_end = 2960 + 267 + 267,
+	.htotal = 2960 + 267 + 267 + 267,
 	.vdisplay = 1848,
-	.vsync_start = 1848 + 16,
-	.vsync_end = 1848 + 16 + 32,
-	.vtotal = 1848 + 16 + 32 + 32,
+	.vsync_start = 1848 + 127,
+	.vsync_end = 1848 + 127 + 256,
+	.vtotal = 1848 + 127 + 256 + 137,
 	.width_mm = 313,
 	.height_mm = 196,
 	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
