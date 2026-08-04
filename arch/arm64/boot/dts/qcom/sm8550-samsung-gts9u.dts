@@ -1622,6 +1622,52 @@
 };
 
 /*
+ * IRIS video decoder -- the SM8550 hardware codec. Without this node enabled no
+ * /dev/video* exists at all and every frame is decoded on the CPU.
+ *
+ * Upstream ships this node status = "disabled" in sm8550.dtsi with the comment
+ * "IRIS firmware is signed by vendors, only enable on boards where the proper
+ * signed firmware is available", and flips it to "okay" only on Qualcomm's own
+ * reference boards (sm8550-qrd/hdk/mtp). That is a firmware-provenance decision,
+ * not a technical limitation -- everything else in the node is already correct
+ * for this silicon.
+ *
+ * WHY firmware-name IS MANDATORY HERE, not merely preferred. The driver's
+ * compiled-in default is "qcom/vpu/vpu30_p4.mbn", which linux-firmware resolves
+ * (via a WHENCE Link: directive, at install time) to vpu30_p4_s7.mbn. That file's
+ * certificate chain reads:
+ *     O = QUALCOMM, OU = General Use Test Key (for testing only),
+ *     CN = SECTOOLS SECP384R1 CURVE TEST ROOT
+ * It is Qualcomm's public TEST key, so it cannot authenticate against any retail
+ * device's fused root of trust. Samsung's own vpu30_4v.mbn instead chains to
+ *     Samsung Electronics Co., Ltd. / ECDSA384 ROOT 77 -> CA 77 -> ATTEST 77
+ * which is byte-identical to the chain on adsp.mdt -- the blob that already
+ * authenticates on this device. Both chains were read directly from the images.
+ * The device-specific path also stops a stock linux-firmware-qcom install from
+ * shadowing it, the same reasoning as a740_zap.mbn above.
+ *
+ * SIZE: the mainline video_mem carveout is 0x700000 (7 MiB) and matches Samsung's
+ * own kalama.dtsi exactly (same base 0x9bb00000, same size, same no-map), so no
+ * carveout override is needed. readelf on the blobs confirms the pairing rather
+ * than assuming it: vpu30_4v.mbn's final LOAD sits at 0x006ff000 (7 MiB span)
+ * while vpu30_4v_16mb.mbn's sits at 0x00fff000 (16 MiB) -- "_16mb" denotes the
+ * carveout the image was built for, and that larger variant would not fit here.
+ *
+ * FAILURE MODE: iris_probe() does not load firmware. It registers two V4L2 nodes
+ * and returns; iris_core_init() -- which calls iris_fw_load() and then
+ * qcom_scm_pas_auth_and_reset() -- runs from iris_open() only. So a firmware or
+ * signature problem surfaces as an open() failure, not a boot failure, and the
+ * wait is bounded by HW_RESPONSE_TIMEOUT_VALUE (1000 ms). Note the first open is
+ * unlikely to be a deliberate one: WirePlumber's V4L2 monitor enumerates
+ * /dev/video* on udev events, so the first PAS attempt fires at session start and
+ * its log line is the authoritative one.
+ */
+&iris {
+	status = "okay";
+	firmware-name = "qcom/sm8550/samsung/gts9u/vpu30_4v.mbn";
+};
+
+/*
  * PMIC GLINK -- the OS-side interface to the PMIC firmware service that runs on
  * the ADSP. A bare node (no USB-C connector graph yet) is sufficient for the
  * battery client (qcom_battmgr -> /sys/class/power_supply). The Type-C
