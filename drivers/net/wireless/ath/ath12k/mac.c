@@ -3970,9 +3970,40 @@ static void ath12k_bss_assoc(struct ath12k *ar,
 		ath12k_warn(ar->ab, "failed to set vdev %i OBSS PD parameters: %d\n",
 			    arvif->vdev_id, ret);
 
+	/*
+	 * Do not stop the 11d scan before it has actually learned a country.
+	 *
+	 * 11d exists solely to discover the regulatory domain from beacons, and
+	 * association is normally a fine moment to stop it -- but only if it has
+	 * already succeeded. On a platform with no other country source it is the
+	 * ONLY source, and stopping it early is unrecoverable within a boot:
+	 *
+	 *   STA vdev created / unassign_vif_chanctx  ->  state_11d = PREPARING
+	 *   first hw_scan                            ->  11d scan started
+	 *   association (here)                       ->  11d stopped
+	 *   next periodic attempt                    ->  ATH12K_SCAN_11D_INTERVAL
+	 *                                                (600 s) away, but it has
+	 *                                                been stopped, so never
+	 *
+	 * On this device NetworkManager associates about five seconds after boot,
+	 * which is less than the ~10 s an 11d scan needs here, so the country was
+	 * a per-boot coin flip: measured phy#0 country 00 with zero 5 GHz BSSes
+	 * across a 12 h uptime, then US with six 5 GHz BSSes within 10 s once 11d
+	 * was given an uninterrupted window.
+	 *
+	 * ab->new_alpha2 is set only by the SMBIOS reader and by the 11d country
+	 * event, and is never cleared -- so this condition self-disarms after the
+	 * first successful learn and behaviour returns to stock. Reading byte 0
+	 * unlocked matches the existing test in ath12k_mac_hw_register().
+	 *
+	 * Platforms that supply a country another way (an x86/UEFI machine's DMI
+	 * record populates new_alpha2 before any association) are unaffected: the
+	 * condition is already true for them on the first pass.
+	 */
 	if (test_bit(WMI_TLV_SERVICE_11D_OFFLOAD, ar->ab->wmi_ab.svc_map) &&
 	    ahvif->vdev_type == WMI_VDEV_TYPE_STA &&
-	    ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE)
+	    ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE &&
+	    ar->ab->new_alpha2[0])
 		ath12k_mac_11d_scan_stop_all(ar->ab);
 }
 
