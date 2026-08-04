@@ -161,10 +161,15 @@ MODULE_PARM_DESC(mdnie, "send OneUI mDNIe at panel-on: 0=off (default), 1=UI_DYN
  * probe and left at its "off" control value.
  *
  * The register was confirmed to actually latch here, which had never been
- * established: at maximum brightness on a white field, acl=2 draws 216.6 mA
- * less than acl=0 (3.33 sigma, against a 0.48 sigma panel-cycle control), or
- * 9.3% of total system current. That is a trim rather than a protective
- * clamp, and it is free.
+ * established: at maximum brightness, acl=2 draws 216.6 mA less than acl=0
+ * (3.33 sigma, against a 0.48 sigma panel-cycle control), or 9.3% of total
+ * system current. That is a trim rather than a protective clamp, and it is
+ * free.
+ *
+ * The magnitude is content-conditional -- ACL trims by average picture level,
+ * so that is the one quantity that necessarily varies with what is on screen.
+ * It was measured against a mostly-white test field, not a full-screen white,
+ * and should not be quoted as a fixed figure.
  *
  * The reason it was previously 0 has expired. ACL was a candidate suppressor
  * for the row-154 dark-seam flicker and the A/B came back ambiguous -- but
