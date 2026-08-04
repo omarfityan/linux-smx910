@@ -34,6 +34,43 @@ module_param_named(ftm_mode, ath12k_ftm_mode, bool, 0444);
 MODULE_PARM_DESC(ftm_mode, "Boots up in factory test mode");
 EXPORT_SYMBOL(ath12k_ftm_mode);
 
+/*
+ * Regulatory country for platforms that supply none.
+ *
+ * ath12k is a self-managed regulatory wiphy: with no country it stays at WORLD,
+ * where every 5 GHz channel is NO_IR and the firmware returns no 5 GHz scan
+ * results at all, so the band is simply absent. It has three possible sources:
+ *
+ *   - an SMBIOS/DMI record, read just below. This is what x86 and UEFI/ACPI
+ *     machines use, and why the problem never appears there;
+ *   - 802.11d beacon learning, which only runs while NOT associated and is
+ *     stopped on association -- on a device that associates a few seconds after
+ *     boot it never gets a usable window;
+ *   - a user hint via cfg80211, which ath12k_reg_notifier() discards unless
+ *     CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS is enabled (that in turn needs
+ *     CFG80211_CERTIFICATION_ONUS and EXPERT), and which also latches
+ *     regdom_set_by_user, permanently disabling 802.11d for the boot even when
+ *     the push fails.
+ *
+ * A device-tree platform such as an Android-derived tablet has no DMI at all --
+ * dmi_walk() returns -ENXIO -- so the first source is structurally unavailable
+ * and the country never gets set by any route.
+ *
+ * This parameter supplies it directly, feeding the same new_alpha2 the SMBIOS
+ * reader feeds, so the country is applied by the driver's existing init-time
+ * push in ath12k_mac_hw_register(), before anything associates. No Kconfig
+ * option, no user hint, and regdom_set_by_user is untouched, so 802.11d remains
+ * available afterwards.
+ *
+ * SMBIOS wins if present: this only fills a country nothing else provided.
+ *
+ * Set it to the country the device is actually IN. It selects permitted
+ * frequencies, channel widths and transmit powers.
+ */
+static char *ath12k_country;
+module_param_named(country, ath12k_country, charp, 0444);
+MODULE_PARM_DESC(country, "ISO 3166-1 alpha-2 regulatory country (e.g. US), used when the platform supplies none");
+
 /* protected with ath12k_hw_group_mutex */
 static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);
 
@@ -805,6 +842,27 @@ int ath12k_core_check_smbios(struct ath12k_base *ab)
 {
 	ab->qmi.target.bdf_ext[0] = '\0';
 	dmi_walk(ath12k_core_check_cc_code_bdfext, ab);
+
+	/*
+	 * Fall back to the module parameter when the platform supplied no
+	 * country. dmi_walk() returns -ENXIO immediately on a device-tree
+	 * system, so new_alpha2 is still zero here on any non-DMI platform.
+	 * See the ath12k_country definition above for why this matters.
+	 *
+	 * Deliberately after dmi_walk(): a real SMBIOS record describes the
+	 * hardware as shipped and outranks a value passed on the command line.
+	 */
+	if (!ab->new_alpha2[0] && ath12k_country &&
+	    ath12k_country[0] >= 'A' && ath12k_country[0] <= 'Z' &&
+	    ath12k_country[1] >= 'A' && ath12k_country[1] <= 'Z' &&
+	    ath12k_country[2] == '\0') {
+		ab->new_alpha2[0] = ath12k_country[0];
+		ab->new_alpha2[1] = ath12k_country[1];
+		ath12k_info(ab, "regulatory country %c%c from module parameter\n",
+			    ab->new_alpha2[0], ab->new_alpha2[1]);
+	} else if (!ab->new_alpha2[0] && ath12k_country) {
+		ath12k_warn(ab, "ignoring malformed country parameter, expected two uppercase letters\n");
+	}
 
 	if (ab->qmi.target.bdf_ext[0] == '\0')
 		return -ENODATA;
