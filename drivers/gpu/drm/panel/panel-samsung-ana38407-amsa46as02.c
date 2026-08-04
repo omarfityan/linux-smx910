@@ -257,11 +257,19 @@ MODULE_PARM_DESC(mdnie, "send OneUI mDNIe at panel-on: 0=off (default), 1=UI_DYN
  * by eye at both refresh rates rather than assumed harmless.
  *
  * 0 = off, 1 = 8%, 2 = 15%, 3 = 20% (the levels named in the panel's own
- * data file). Settable at runtime, but read only during panel-on.
+ * data file). Settable at runtime; re-read on every brightness update, so a
+ * change takes effect at the next one rather than only at panel-on.
+ *
+ * THIS IS THE NORMAL-MODE LEVEL ONLY. High-brightness mode uses 8% regardless,
+ * which is what the vendor selects there -- see ana38407_send_brightness().
+ * Setting this to 0 turns the limiter off in both modes, because that reads as
+ * a deliberate instruction rather than a level choice.
  */
+#define ANA38407_ACL_HBM	0x01	/* 8% -- the vendor's HBM level */
+
 static int acl = 2;
 module_param(acl, int, 0644);
-MODULE_PARM_DESC(acl, "ACL level at panel-on via WRACL 0x55: 0=off, 1=8%, 2=15% (default, matches stock), 3=20%");
+MODULE_PARM_DESC(acl, "ACL level in NORMAL mode via WRACL 0x55: 0=off (both modes), 1=8%, 2=15% (default, matches stock), 3=20%. HBM always uses 8% unless acl=0");
 
 struct ana38407 {
 	struct drm_panel panel;
@@ -349,7 +357,7 @@ static inline struct ana38407 *to_ana38407(struct drm_panel *panel)
 static void ana38407_send_brightness(struct mipi_dsi_multi_context *dsi_ctx,
 				     unsigned int level)
 {
-	u8 wrctrld;
+	u8 wrctrld, wracl;
 	u16 wrdisbv;
 	u8 wrdisbv_cmd[3];
 
@@ -358,9 +366,23 @@ static void ana38407_send_brightness(struct mipi_dsi_multi_context *dsi_ctx,
 	if (level >= ANA38407_BL_HBM_FIRST_LEVEL) {
 		wrdisbv = ana38407_wrdisbv_hbm[level - ANA38407_BL_HBM_FIRST_LEVEL];
 		wrctrld = 0xe8;
+		/*
+		 * ACL eases off in HBM. The limiter exists to hold emission
+		 * current down, and holding it down is the opposite of what
+		 * high-brightness mode is for -- so the vendor trims less here,
+		 * not more. Leaving the normal-mode level in place was measured
+		 * doing exactly that: RDACL read 0x02 at level 300, i.e. 15%
+		 * where the factory uses 8%, throttling the panel at the one
+		 * moment it is being asked for everything it has.
+		 *
+		 * acl == 0 means the knob was deliberately turned off, and that
+		 * choice is honoured in both modes rather than overridden here.
+		 */
+		wracl = acl ? ANA38407_ACL_HBM : 0;
 	} else {
 		wrdisbv = ana38407_wrdisbv[level];
 		wrctrld = 0x28;
+		wracl = acl;
 	}
 
 	/*
@@ -390,6 +412,16 @@ static void ana38407_send_brightness(struct mipi_dsi_multi_context *dsi_ctx,
 	ana38407_unlock_lvl0(dsi_ctx);
 	mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
 					 wrctrld);
+	/*
+	 * WRACL travels with the mode, which is why it is here and not only in
+	 * the panel-on sequence. The data file puts ${ACL} inside the same
+	 * BRIGHTNESS_SETTING block as the brightness command, so stock
+	 * re-evaluates the limiter on every brightness change; sending it once
+	 * at panel-on leaves whatever level was chosen then stuck across every
+	 * later mode transition. The panel-on block still carries the static
+	 * 0xC9 tuning writes that accompany it there.
+	 */
+	mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, 0x55, wracl);
 	mipi_dsi_dcs_write_buffer_multi(dsi_ctx, wrdisbv_cmd,
 					sizeof(wrdisbv_cmd));
 	ana38407_lock_lvl0(dsi_ctx);
@@ -810,7 +842,11 @@ static int ana38407_on(struct ana38407 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x93, 0x20);
 	ana38407_lock_lvl0(&dsi_ctx);
 
-	/* ACL (WRACL 0x55 = `acl` module_param, default 0 = OFF; + static C9 tuning). */
+	/*
+	 * ACL: the static 0xC9 tuning that accompanies the limiter here, plus a
+	 * baseline WRACL. The level itself is owned by ana38407_send_brightness()
+	 * below, which runs last in this sequence and selects it by mode.
+	 */
 	ana38407_unlock_lvl0(&dsi_ctx);
 	{
 		u8 wracl[2] = { 0x55, (u8)acl };
