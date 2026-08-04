@@ -1159,14 +1159,31 @@ static int ana38407_backlight_init(struct ana38407 *ctx)
 		.scale = BACKLIGHT_SCALE_NON_LINEAR,
 		/*
 		 * The range runs past the normal table's 420 cd/m2 into
-		 * high-brightness mode, so the slider reaches the panel's full
-		 * 900 cd/m2. Note this exceeds stock's own arrangement, which
-		 * keeps HBM behind an "Extra brightness" toggle and, under
-		 * auto-brightness, gates it on the ambient light sensor and
-		 * thermal state. There is no ambient gate, thermal governor or
-		 * duration limit here: the top of this slider parks the panel at
-		 * peak indefinitely. That is a deliberate choice by the owner of
-		 * this device, who manages it directly.
+		 * high-brightness mode, so the slider reaches the top of the
+		 * vendor's HBM table, whose last entry is labelled 900 cd/m2.
+		 *
+		 * That 900 is the DATA FILE'S figure, not a measured delivered
+		 * luminance, and OLED peak specifications are usually quoted for
+		 * a small window at low average picture level rather than a full
+		 * white screen. What has actually been established here is that
+		 * the top of the range is much brighter than the old 420 cd/m2
+		 * maximum; whether the panel sustains 900 at 100% APL is open.
+		 * The luminance-versus-power calibration that validated the
+		 * normal curve does not settle it either -- it was measured
+		 * entirely below this range, and the transfer curve visibly
+		 * changes slope at the 650 cd/m2 inflection noted above.
+		 *
+		 * This arrangement also exceeds stock, which keeps HBM behind an
+		 * "Extra brightness" toggle and, under auto-brightness, gates it
+		 * on the ambient light sensor and thermal state. There is no
+		 * ambient gate, thermal governor or duration limit here: the top
+		 * of this slider parks the panel at peak indefinitely. Measured
+		 * at the top of the range, battery temperature rose from 37.1 to
+		 * 46.5 degrees C within minutes and the charger throttled itself
+		 * from 2022 to 1334 mA, recovering immediately when brightness
+		 * came down -- so the thermal cost is real and nothing in this
+		 * driver will act on it. That is a deliberate choice by the owner
+		 * of this device, who manages it directly.
 		 */
 		.max_brightness = ANA38407_BL_MAX_LEVEL,
 		.brightness = ANA38407_BL_DEFAULT_LEVEL,
