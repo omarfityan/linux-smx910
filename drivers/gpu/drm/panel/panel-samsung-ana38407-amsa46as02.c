@@ -290,10 +290,28 @@ struct ana38407 {
 	struct drm_connector *connector;
 	int cur_mode;
 
-	/* Selected by the dcs_read sysfs attribute; see ana38407_dcs_read_*(). */
+	/*
+	 * Serialises DDIC command SEQUENCES against each other. The DSI host
+	 * already serialises individual transfers (msm's cmd_mutex), but a
+	 * Samsung level-key window is several transfers long -- unlock, work,
+	 * lock -- and nothing below us keeps two of those from interleaving.
+	 * A sysfs read landing inside a brightness update's window would close
+	 * the keys under it, and the remaining writes would be issued to a
+	 * locked register space.
+	 *
+	 * ddic_ready is this driver's own view of "the link is up and the DDIC
+	 * will answer", set and cleared under the same lock. drm_panel's
+	 * ->enabled cannot serve: drm_panel_disable() clears it AFTER
+	 * funcs->disable() returns, so it still reads true throughout shutdown,
+	 * and a reader that checked it could still be waiting for the lock when
+	 * unprepare cuts the regulators -- then transfer to a dead link.
+	 */
+	struct mutex cmd_lock;
+	bool ddic_ready;
+
+	/* Selected by the dcs_read sysfs attribute; guarded by cmd_lock. */
 	u8 read_addr;
 	u8 read_len;
-	struct mutex read_lock;
 };
 
 /*
@@ -1081,7 +1099,19 @@ static int ana38407_prepare(struct drm_panel *panel)
 
 	ana38407_reset(ctx);
 
+	/*
+	 * cmd_lock is taken here, at the outermost caller, and NOT inside
+	 * ana38407_send_brightness() -- which this path reaches through
+	 * ana38407_on(). Locking there instead would deadlock against exactly
+	 * this call. Every entry point that opens a level-key window takes it
+	 * once, at the top.
+	 */
+	mutex_lock(&ctx->cmd_lock);
 	ret = ana38407_on(ctx);
+	if (ret == 0)
+		ctx->ddic_ready = true;
+	mutex_unlock(&ctx->cmd_lock);
+
 	if (ret < 0) {
 		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 		regulator_bulk_disable(ARRAY_SIZE(ana38407_supplies),
@@ -1098,9 +1128,11 @@ static int ana38407_enable(struct drm_panel *panel)
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
 
 	/* POWER_ON_POST_SETTING: display-on behind the level-2 key. */
+	mutex_lock(&ctx->cmd_lock);
 	ana38407_unlock_lvl0(&dsi_ctx);
 	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
 	ana38407_lock_lvl0(&dsi_ctx);
+	mutex_unlock(&ctx->cmd_lock);
 
 	return dsi_ctx.accum_err;
 }
@@ -1110,8 +1142,10 @@ static int ana38407_disable(struct drm_panel *panel)
 	struct ana38407 *ctx = to_ana38407(panel);
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
 
+	mutex_lock(&ctx->cmd_lock);
 	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
 	mipi_dsi_msleep(&dsi_ctx, 20);
+	mutex_unlock(&ctx->cmd_lock);
 
 	return dsi_ctx.accum_err;
 }
@@ -1121,11 +1155,22 @@ static int ana38407_unprepare(struct drm_panel *panel)
 	struct ana38407 *ctx = to_ana38407(panel);
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
 
+	/*
+	 * ddic_ready is cleared BEFORE the link is torn down and while the lock
+	 * is held, so a reader is either already finished or will find the flag
+	 * false. Clearing it afterwards would leave a window in which a reader
+	 * that had passed its check was still waiting for the lock, and would
+	 * then transfer into an unpowered panel.
+	 */
+	mutex_lock(&ctx->cmd_lock);
+	ctx->ddic_ready = false;
+
 	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
 	mipi_dsi_msleep(&dsi_ctx, 120);
 
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 	regulator_bulk_disable(ARRAY_SIZE(ana38407_supplies), ctx->supplies);
+	mutex_unlock(&ctx->cmd_lock);
 
 	return dsi_ctx.accum_err;
 }
@@ -1179,7 +1224,20 @@ static int ana38407_bl_update_status(struct backlight_device *bl)
 	if (backlight_is_blank(bl) || !ctx->panel.enabled)
 		return 0;
 
+	/*
+	 * Held across the whole update: this opens a level-key window, and a
+	 * concurrent dcs_read would otherwise close the keys partway through and
+	 * leave the remaining writes addressing locked registers. ddic_ready is
+	 * re-checked inside the lock because the test above can go stale while
+	 * waiting for it.
+	 */
+	mutex_lock(&ctx->cmd_lock);
+	if (!ctx->ddic_ready) {
+		mutex_unlock(&ctx->cmd_lock);
+		return 0;
+	}
 	ana38407_send_brightness(&dsi_ctx, backlight_get_brightness(bl));
+	mutex_unlock(&ctx->cmd_lock);
 
 	return dsi_ctx.accum_err;
 }
@@ -1231,10 +1289,10 @@ static ssize_t dcs_read_store(struct device *dev, struct device_attribute *attr,
 	if (addr > 0xff || len == 0 || len > ANA38407_DCS_READ_MAX)
 		return -EINVAL;
 
-	mutex_lock(&ctx->read_lock);
+	mutex_lock(&ctx->cmd_lock);
 	ctx->read_addr = addr;
 	ctx->read_len = len;
-	mutex_unlock(&ctx->read_lock);
+	mutex_unlock(&ctx->cmd_lock);
 
 	return count;
 }
@@ -1248,7 +1306,7 @@ static ssize_t dcs_read_show(struct device *dev, struct device_attribute *attr,
 	ssize_t ret;
 	int i, n;
 
-	mutex_lock(&ctx->read_lock);
+	mutex_lock(&ctx->cmd_lock);
 
 	if (!ctx->read_len) {
 		ret = sysfs_emit(buf,
@@ -1257,11 +1315,13 @@ static ssize_t dcs_read_show(struct device *dev, struct device_attribute *attr,
 	}
 
 	/*
-	 * DCS over a powered-down link goes nowhere. drm_panel's enable/disable
-	 * ordering covers the driver's own paths; a sysfs read can arrive at any
-	 * time, so it needs its own guard.
+	 * ddic_ready, not drm_panel's ->enabled: that flag is cleared only after
+	 * funcs->disable() returns, so it still reads true right through
+	 * shutdown. ddic_ready is set and cleared under this same lock, so by the
+	 * time unprepare has powered the panel down no reader can be past this
+	 * check and still holding a transfer.
 	 */
-	if (!ctx->panel.enabled) {
+	if (!ctx->ddic_ready) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -1290,7 +1350,7 @@ static ssize_t dcs_read_show(struct device *dev, struct device_attribute *attr,
 	ret = n;
 
 out:
-	mutex_unlock(&ctx->read_lock);
+	mutex_unlock(&ctx->cmd_lock);
 	return ret;
 }
 
@@ -1394,7 +1454,7 @@ static int ana38407_probe(struct mipi_dsi_device *dsi)
 	ctx->dsi = dsi;
 	mipi_dsi_set_drvdata(dsi, ctx);
 
-	ret = devm_mutex_init(dev, &ctx->read_lock);
+	ret = devm_mutex_init(dev, &ctx->cmd_lock);
 	if (ret)
 		return ret;
 
