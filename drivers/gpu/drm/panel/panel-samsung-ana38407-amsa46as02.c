@@ -19,6 +19,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/regulator/consumer.h>
 
 #include <drm/display/drm_dsc.h>
@@ -280,6 +281,11 @@ struct ana38407 {
 	 */
 	struct drm_connector *connector;
 	int cur_mode;
+
+	/* Selected by the dcs_read sysfs attribute; see ana38407_dcs_read_*(). */
+	u8 read_addr;
+	u8 read_len;
+	struct mutex read_lock;
 };
 
 /*
@@ -1146,6 +1152,120 @@ static const struct backlight_ops ana38407_bl_ops = {
 	.update_status = ana38407_bl_update_status,
 };
 
+/*
+ * ===========================================================================
+ * DDIC register read-back
+ * ===========================================================================
+ *
+ * Reads a register out of the display driver IC over DSI and reports what it
+ * actually contains. Everything this driver sends is write-only otherwise, so
+ * without this the DDIC's state can only be inferred from the bytes we believe
+ * we sent -- and "we wrote it once at panel-on and nothing else touches it" is
+ * an argument, not a measurement. The vendor stack has an equivalent
+ * (/sys/class/lcd/panel/read_mtp) but it exists only under the downstream
+ * kernel, so on mainline there has been no way to ask the panel anything.
+ *
+ * Two-step, matching the interface the vendor's node uses:
+ *
+ *	echo "56 1" > dcs_read     # register 0x56, one byte
+ *	cat dcs_read               # addr[56] len[1] : 02
+ *
+ * Useful registers: 0x56 RDACL (the ACL level actually in force), 0x0A RDDPM
+ * (power mode), 0x0E RDDSM, 0x52 the brightness the DDIC believes it has, and
+ * 0xDA/0xDB/0xDC the panel ID.
+ *
+ * The level keys are opened around the read because Samsung gates most of the
+ * register space behind them for reads as well as writes; the vendor's node
+ * does the same unconditionally.
+ *
+ * A failed read reports the error. It never reports a value, because a read
+ * that quietly returns zero on a dead link is worse than no read at all -- zero
+ * is a plausible register value and would be believed.
+ */
+#define ANA38407_DCS_READ_MAX	16
+
+static ssize_t dcs_read_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct ana38407 *ctx = dev_get_drvdata(dev);
+	unsigned int addr, len;
+
+	if (sscanf(buf, "%x %u", &addr, &len) != 2)
+		return -EINVAL;
+	if (addr > 0xff || len == 0 || len > ANA38407_DCS_READ_MAX)
+		return -EINVAL;
+
+	mutex_lock(&ctx->read_lock);
+	ctx->read_addr = addr;
+	ctx->read_len = len;
+	mutex_unlock(&ctx->read_lock);
+
+	return count;
+}
+
+static ssize_t dcs_read_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct ana38407 *ctx = dev_get_drvdata(dev);
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+	u8 val[ANA38407_DCS_READ_MAX];
+	ssize_t ret;
+	int i, n;
+
+	mutex_lock(&ctx->read_lock);
+
+	if (!ctx->read_len) {
+		ret = sysfs_emit(buf,
+				 "nothing selected -- write \"<addr-hex> <len>\" here first\n");
+		goto out;
+	}
+
+	/*
+	 * DCS over a powered-down link goes nowhere. drm_panel's enable/disable
+	 * ordering covers the driver's own paths; a sysfs read can arrive at any
+	 * time, so it needs its own guard.
+	 */
+	if (!ctx->panel.enabled) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	ana38407_unlock_lvl0(&dsi_ctx);
+	ret = mipi_dsi_dcs_read(ctx->dsi, ctx->read_addr, val, ctx->read_len);
+	ana38407_lock_lvl0(&dsi_ctx);
+
+	if (ret < 0) {
+		dev_err(dev, "DCS read of 0x%02x failed: %zd\n",
+			ctx->read_addr, ret);
+		goto out;
+	}
+	if (ret != ctx->read_len) {
+		dev_err(dev, "DCS read of 0x%02x returned %zd bytes, wanted %u\n",
+			ctx->read_addr, ret, ctx->read_len);
+		ret = -EIO;
+		goto out;
+	}
+
+	n = sysfs_emit(buf, "addr[%02x] len[%u] :", ctx->read_addr,
+		       ctx->read_len);
+	for (i = 0; i < ctx->read_len; i++)
+		n += sysfs_emit_at(buf, n, " %02x", val[i]);
+	n += sysfs_emit_at(buf, n, "\n");
+	ret = n;
+
+out:
+	mutex_unlock(&ctx->read_lock);
+	return ret;
+}
+
+static DEVICE_ATTR_RW(dcs_read);
+
+static struct attribute *ana38407_attrs[] = {
+	&dev_attr_dcs_read.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(ana38407);
+
 static int ana38407_backlight_init(struct ana38407 *ctx)
 {
 	struct device *dev = &ctx->dsi->dev;
@@ -1238,6 +1358,10 @@ static int ana38407_probe(struct mipi_dsi_device *dsi)
 	ctx->dsi = dsi;
 	mipi_dsi_set_drvdata(dsi, ctx);
 
+	ret = devm_mutex_init(dev, &ctx->read_lock);
+	if (ret)
+		return ret;
+
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;
 	dsi->mode_flags = MIPI_DSI_MODE_NO_EOT_PACKET |
@@ -1299,6 +1423,7 @@ static struct mipi_dsi_driver ana38407_driver = {
 	.driver = {
 		.name = "panel-samsung-ana38407-amsa46as02",
 		.of_match_table = ana38407_of_match,
+		.dev_groups = ana38407_groups,
 	},
 };
 module_mipi_dsi_driver(ana38407_driver);
