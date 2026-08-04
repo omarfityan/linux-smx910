@@ -46,11 +46,8 @@
  * ramp would sit at 50%), which is why the backlight below advertises a
  * non-linear scale.
  *
- * The .dat carries a second table, HBM_CANDELA_MAP (levels 256..547, up to
- * 900 cd/m2). It is deliberately NOT used here: high-brightness mode is a
- * different DDIC state (WRCTRLD 0xE8, not 0x28) that reinterprets the same
- * WRDISBV range against a higher peak, so it is a separate feature rather than
- * a continuation of this table.
+ * Levels 256 and up continue into high-brightness mode; see
+ * ana38407_wrdisbv_hbm[] below.
  */
 static const u16 ana38407_wrdisbv[256] = {
 	  10,   12,   14,   16,   19,   22,   26,   29,
@@ -87,7 +84,87 @@ static const u16 ana38407_wrdisbv[256] = {
 	1975, 1985, 1995, 2006, 2016, 2026, 2037, 2047,
 };
 
-#define ANA38407_BL_MAX_LEVEL	(ARRAY_SIZE(ana38407_wrdisbv) - 1)
+/*
+ * High-brightness mode: platform level 256..547 -> WRDISBV, transcribed from
+ * the HBM_CANDELA_MAP table in the same data file. Level 256 is 5 -> 422 cd/m2
+ * and level 547 is 2047 -> 900 cd/m2.
+ *
+ * WRDISBV RESTARTS at 5 here rather than continuing from the 2047 that ends the
+ * normal table. That is not a transcription error: HBM is a different DDIC
+ * state (WRCTRLD 0xE8 instead of 0x28) which reinterprets the same 0..2047
+ * register range against a higher peak. Luminance is what stays continuous
+ * across the boundary -- 420 cd/m2 at level 255, 422 at level 256 -- so the
+ * combined ramp is smooth to the eye while the register value is not.
+ *
+ * The slope changes at level 395 (650 cd/m2): below it WRDISBV climbs ~12.5 per
+ * level, above it ~2. That is where the panel's own rev-A variant stops -- the
+ * device tree's ss_hbm_candela_map_table_revA pins 2047/650 for every level from
+ * 395 to 547 -- so 650 cd/m2 is a real inflection in the DDIC's transfer curve
+ * rather than an arbitrary cap, and rev B onwards simply keeps going past it.
+ *
+ * Which of the two tables applies is selected by panel revision. The device tree
+ * declares only revA and revB; the vendor's parser falls back to the previous
+ * revision for any letter it does not find (ss_wrapper_common.c: "If there is no
+ * data for the panel rev, copy previous panel rev data pointer"), so revC and
+ * revD both resolve to revB. This unit is revision D -- its own stock boot
+ * cmdline records msm_drm.lcd_id=800004, and id2 0x04 maps to 'D' -- which makes
+ * this 900 cd/m2 table the correct one. Anything other than rev A lands here.
+ */
+static const u16 ana38407_wrdisbv_hbm[292] = {
+	   5,   17,   30,   43,   55,   68,   80,   93,
+	 105,  118,  130,  143,  155,  168,  181,  193,
+	 206,  218,  231,  243,  256,  268,  281,  293,
+	 306,  319,  331,  344,  356,  369,  381,  394,
+	 406,  419,  431,  444,  456,  469,  482,  494,
+	 507,  519,  532,  544,  557,  569,  582,  594,
+	 607,  620,  632,  645,  657,  670,  682,  695,
+	 707,  720,  732,  745,  758,  770,  783,  795,
+	 808,  820,  833,  845,  858,  870,  883,  896,
+	 908,  921,  933,  946,  958,  971,  983,  996,
+	1008, 1021, 1033, 1046, 1059, 1071, 1084, 1096,
+	1109, 1121, 1134, 1146, 1159, 1171, 1184, 1197,
+	1209, 1222, 1234, 1247, 1259, 1272, 1284, 1297,
+	1309, 1322, 1335, 1347, 1360, 1372, 1385, 1397,
+	1410, 1422, 1435, 1447, 1460, 1473, 1485, 1498,
+	1510, 1523, 1535, 1548, 1560, 1573, 1585, 1598,
+	1611, 1623, 1636, 1648, 1661, 1673, 1686, 1698,
+	1711, 1723, 1736, 1744, 1747, 1749, 1751, 1753,
+	1755, 1757, 1759, 1761, 1763, 1765, 1767, 1769,
+	1771, 1773, 1775, 1777, 1779, 1781, 1783, 1785,
+	1787, 1789, 1791, 1793, 1795, 1797, 1799, 1801,
+	1803, 1805, 1807, 1809, 1811, 1813, 1815, 1817,
+	1819, 1821, 1823, 1825, 1827, 1829, 1831, 1833,
+	1835, 1837, 1839, 1841, 1843, 1845, 1847, 1849,
+	1851, 1853, 1855, 1857, 1858, 1860, 1862, 1864,
+	1866, 1868, 1870, 1872, 1874, 1876, 1878, 1880,
+	1882, 1884, 1886, 1888, 1890, 1892, 1894, 1896,
+	1898, 1900, 1902, 1904, 1906, 1908, 1910, 1912,
+	1914, 1916, 1918, 1920, 1922, 1924, 1926, 1928,
+	1930, 1932, 1934, 1936, 1938, 1940, 1942, 1944,
+	1946, 1948, 1950, 1952, 1954, 1956, 1958, 1960,
+	1962, 1964, 1966, 1968, 1970, 1972, 1974, 1976,
+	1978, 1980, 1982, 1984, 1986, 1988, 1990, 1992,
+	1994, 1996, 1998, 2000, 2002, 2004, 2006, 2008,
+	2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024,
+	2026, 2028, 2030, 2032, 2034, 2036, 2038, 2040,
+	2042, 2044, 2046, 2047,
+};
+
+/* First platform level served by the HBM table rather than the normal one. */
+#define ANA38407_BL_HBM_FIRST_LEVEL	ARRAY_SIZE(ana38407_wrdisbv)
+
+#define ANA38407_BL_MAX_LEVEL		(ANA38407_BL_HBM_FIRST_LEVEL + \
+					 ARRAY_SIZE(ana38407_wrdisbv_hbm) - 1)
+
+/*
+ * Where the backlight starts. Deliberately the top of the NORMAL range and not
+ * ANA38407_BL_MAX_LEVEL: WRDISBV then works out to 2047 in normal mode, which is
+ * what the panel-on sequence sent before a backlight device existed, so a boot
+ * that never touches sysfs still produces the identical DSI byte stream it
+ * always did. Following the maximum instead would silently boot the panel into
+ * HBM at 900 cd/m2 and hold it there.
+ */
+#define ANA38407_BL_DEFAULT_LEVEL	(ARRAY_SIZE(ana38407_wrdisbv) - 1)
 
 /*
  * SESS-142 TCON pre-emphasis probe. The device's own downstream source
@@ -234,9 +311,27 @@ static inline struct ana38407 *to_ana38407(struct drm_panel *panel)
  * BRIGHTNESS_DIMMING_SETTING, from this device's own downstream data file
  * (GTS9U_ANA38407_AMSA46AS02.dat:93):
  *
- *	W 0x53 0x28			WRCTRLD: normal mode, smooth dimming on
- *	W 0x51 0xXX 0xXX		WRDISBV = NORMAL_CANDELA_MAP[level]
+ *	W 0x53 0xXX			WRCTRLD: 0x28 normal, 0xE8 HBM
+ *	W 0x51 0xXX 0xXX		WRDISBV from the matching candela map
  *	${HBM_FlatZ_SETTING}		"IF REVISION BtoZ" -- our rev D qualifies
+ *
+ * Those two bytes are the WHOLE of high-brightness mode on this board. The
+ * data file carries no HBM command block at all, and the vendor's common driver
+ * couples HBM to more machinery -- ACL backup/restore, a vsync-gated entry,
+ * separate ELVSS/IRC flash offsets -- none of which applies here: the ACL dance
+ * sits inside "if (vdd->support_optical_fingerprint)" and this tablet reads
+ * fingerprints from the power button, while gamma_mode2_hbm_tx_cmds,
+ * hbm_irc_tx_cmds, flash_table_hbm_elvss_offset, flash_table_hbm_irc_offset and
+ * panel_hbm_entry_delay are declared by zero files across the entire vendor
+ * device tree. HBM_FlatZ is gated on revision rather than on mode, so it is sent
+ * in both and needs no branch.
+ *
+ * The WRCTRLD encoding corroborates that 0xE8 is complete rather than merely
+ * what stock happens to send. Across the data file's four branches -- 0x20 and
+ * 0x28 normal, 0xE0 and 0xE8 HBM -- bit 3 is the standard DCS display-dimming
+ * bit (cleared only for the fingerprint-flash cases, which need an instant
+ * transition) and bit 5 is the brightness-control block. Normal to HBM changes
+ * the top two bits and nothing else.
  *
  * Both the panel-on sequence and every runtime backlight update emit this one
  * block, so the DDIC only ever has a single writer telling it the level.
@@ -248,9 +343,26 @@ static inline struct ana38407 *to_ana38407(struct drm_panel *panel)
 static void ana38407_send_brightness(struct mipi_dsi_multi_context *dsi_ctx,
 				     unsigned int level)
 {
-	u16 wrdisbv = ana38407_wrdisbv[min_t(unsigned int, level,
-					     ANA38407_BL_MAX_LEVEL)];
+	u8 wrctrld;
+	u16 wrdisbv;
+	u8 wrdisbv_cmd[3];
+
+	level = min_t(unsigned int, level, ANA38407_BL_MAX_LEVEL);
+
+	if (level >= ANA38407_BL_HBM_FIRST_LEVEL) {
+		wrdisbv = ana38407_wrdisbv_hbm[level - ANA38407_BL_HBM_FIRST_LEVEL];
+		wrctrld = 0xe8;
+	} else {
+		wrdisbv = ana38407_wrdisbv[level];
+		wrctrld = 0x28;
+	}
+
 	/*
+	 * The two must agree: each table's values are only meaningful under its
+	 * own WRCTRLD. Sending an HBM WRDISBV in normal mode would land the
+	 * bottom of the HBM table (5) below the dimmest normal level (10), i.e.
+	 * a near-black panel where peak brightness was asked for.
+	 *
 	 * WRDISBV takes its high byte FIRST. That is what
 	 * mipi_dsi_dcs_set_display_brightness_large() does; the plain
 	 * mipi_dsi_dcs_set_display_brightness() and its _multi wrapper pack the
@@ -258,12 +370,20 @@ static void ana38407_send_brightness(struct mipi_dsi_multi_context *dsi_ctx,
 	 * There is no _large_multi, so the buffer is packed by hand here rather
 	 * than through a helper that could silently reorder it.
 	 */
-	u8 wrdisbv_cmd[3] = { MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
-			      (wrdisbv >> 8) & 0xff, wrdisbv & 0xff };
+	wrdisbv_cmd[0] = MIPI_DCS_SET_DISPLAY_BRIGHTNESS;
+	wrdisbv_cmd[1] = (wrdisbv >> 8) & 0xff;
+	wrdisbv_cmd[2] = wrdisbv & 0xff;
 
+	/*
+	 * _var_seq_ and not _seq_: the latter builds a "static const" array, so
+	 * it takes compile-time constants only and will not accept a WRCTRLD
+	 * chosen at runtime. The two macros are otherwise the same and pack
+	 * their arguments in the order given -- unlike the DCS brightness
+	 * helpers noted above, neither reorders anything.
+	 */
 	ana38407_unlock_lvl0(dsi_ctx);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
-				     0x28);
+	mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
+					 wrctrld);
 	mipi_dsi_dcs_write_buffer_multi(dsi_ctx, wrdisbv_cmd,
 					sizeof(wrdisbv_cmd));
 	ana38407_lock_lvl0(dsi_ctx);
@@ -1037,14 +1157,19 @@ static int ana38407_backlight_init(struct ana38407 *ctx)
 		 * to apply a perceptual correction of its own on top.
 		 */
 		.scale = BACKLIGHT_SCALE_NON_LINEAR,
-		.max_brightness = ANA38407_BL_MAX_LEVEL,
 		/*
-		 * Start at the top of the range. WRDISBV then works out to
-		 * 2047, which is what the panel-on sequence sent before a
-		 * backlight device existed -- so a boot that never touches
-		 * sysfs produces the identical DSI byte stream it always did.
+		 * The range runs past the normal table's 420 cd/m2 into
+		 * high-brightness mode, so the slider reaches the panel's full
+		 * 900 cd/m2. Note this exceeds stock's own arrangement, which
+		 * keeps HBM behind an "Extra brightness" toggle and, under
+		 * auto-brightness, gates it on the ambient light sensor and
+		 * thermal state. There is no ambient gate, thermal governor or
+		 * duration limit here: the top of this slider parks the panel at
+		 * peak indefinitely. That is a deliberate choice by the owner of
+		 * this device, who manages it directly.
 		 */
-		.brightness = ANA38407_BL_MAX_LEVEL,
+		.max_brightness = ANA38407_BL_MAX_LEVEL,
+		.brightness = ANA38407_BL_DEFAULT_LEVEL,
 	};
 
 	ctx->bl = devm_backlight_device_register(dev, dev_name(dev), dev, ctx,
