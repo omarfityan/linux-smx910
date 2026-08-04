@@ -1398,8 +1398,14 @@ static int ana38407_backlight_init(struct ana38407 *ctx)
 		 * 46.5 degrees C within minutes and the charger throttled itself
 		 * from 2022 to 1334 mA, recovering immediately when brightness
 		 * came down -- so the thermal cost is real and nothing in this
-		 * driver will act on it. That is a deliberate choice by the owner
-		 * of this device, who manages it directly.
+		 * driver will act on it.
+		 *
+		 * WHAT TO DO ABOUT THAT IS AN OPEN QUESTION, NOT A SETTLED ONE.
+		 * No thermal policy has been decided for this panel. Do not read
+		 * the absence of a governor as a considered decision to omit one;
+		 * it is simply the state the range extension left behind, and it
+		 * is the first thing to revisit if peak brightness is going to be
+		 * used for more than a measurement.
 		 */
 		.max_brightness = ANA38407_BL_MAX_LEVEL,
 		.brightness = ANA38407_BL_DEFAULT_LEVEL,
