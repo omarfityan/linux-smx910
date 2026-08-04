@@ -14,6 +14,7 @@
  * Copyright (c) 2026, ubuntu-tab project.
  */
 
+#include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/mod_devicetable.h>
@@ -32,16 +33,61 @@
 #include <video/mipi_display.h>
 
 /*
- * SESS-141 brightness-sweep probe: WRDISBV override (DDIC display brightness,
- * 0..2047). Default 0x07ff = bl_lvl 255 (panel-on max, the original behaviour).
- * Lowering it engages the DDIC's low-brightness analog dimming (AID/ELVSS) —
- * the hypothesis being that OneUI's low-brightness dark-region tuning is what
- * suppresses the row-154 dark-seam flicker that mainline (fixed max) shows.
- * Set at module load:  insmod panel.ko bl_override=320
+ * Platform brightness level (0..255) -> WRDISBV (the DDIC's own display
+ * brightness register, 0..2047), transcribed column-for-column from this
+ * device's own downstream Panel Data File: the NORMAL_CANDELA_MAP table in
+ * GTS9U_ANA38407_AMSA46AS02.dat, whose header reads
+ *
+ *	<Platform_Level> <WRDISBV> <Candela>
+ *
+ * Level 0 is 10 -> 2 cd/m2 (the panel's dimmest, NOT off) and level 255 is
+ * 2047 -> 420 cd/m2. The curve is the vendor's own: its steps are finer at the
+ * bottom (level 127 lands at 171 cd/m2, 41% of peak, where a luminance-linear
+ * ramp would sit at 50%), which is why the backlight below advertises a
+ * non-linear scale.
+ *
+ * The .dat carries a second table, HBM_CANDELA_MAP (levels 256..547, up to
+ * 900 cd/m2). It is deliberately NOT used here: high-brightness mode is a
+ * different DDIC state (WRCTRLD 0xE8, not 0x28) that reinterprets the same
+ * WRDISBV range against a higher peak, so it is a separate feature rather than
+ * a continuation of this table.
  */
-static unsigned short bl_override = 0x07ff;
-module_param(bl_override, ushort, 0644);
-MODULE_PARM_DESC(bl_override, "WRDISBV display brightness 0..2047 (default 2047=max)");
+static const u16 ana38407_wrdisbv[256] = {
+	  10,   12,   14,   16,   19,   22,   26,   29,
+	  33,   36,   40,   44,   48,   53,   57,   61,
+	  66,   70,   75,   80,   84,   89,   94,   99,
+	 104,  110,  115,  120,  125,  131,  136,  142,
+	 147,  153,  158,  164,  170,  176,  182,  187,
+	 193,  199,  205,  211,  218,  224,  230,  236,
+	 242,  249,  255,  261,  268,  274,  281,  287,
+	 294,  301,  307,  314,  321,  327,  334,  341,
+	 348,  355,  362,  369,  376,  383,  390,  397,
+	 404,  411,  418,  425,  432,  440,  447,  454,
+	 462,  469,  476,  484,  491,  499,  506,  514,
+	 521,  529,  536,  544,  551,  559,  567,  575,
+	 582,  590,  598,  606,  613,  621,  629,  637,
+	 645,  653,  661,  669,  677,  685,  693,  701,
+	 709,  717,  726,  734,  742,  750,  758,  767,
+	 775,  783,  791,  800,  808,  817,  825,  833,
+	 842,  850,  859,  867,  876,  884,  893,  901,
+	 910,  919,  927,  936,  944,  953,  962,  971,
+	 979,  988,  997, 1006, 1014, 1023, 1032, 1041,
+	1050, 1059, 1068, 1077, 1086, 1095, 1104, 1113,
+	1122, 1131, 1140, 1149, 1158, 1167, 1176, 1185,
+	1194, 1203, 1213, 1222, 1231, 1240, 1250, 1259,
+	1268, 1277, 1287, 1296, 1305, 1315, 1324, 1334,
+	1343, 1352, 1362, 1371, 1381, 1390, 1400, 1409,
+	1419, 1428, 1438, 1447, 1457, 1467, 1476, 1486,
+	1495, 1505, 1515, 1524, 1534, 1544, 1554, 1563,
+	1573, 1583, 1593, 1603, 1612, 1622, 1632, 1642,
+	1652, 1662, 1672, 1681, 1691, 1701, 1711, 1721,
+	1731, 1741, 1751, 1761, 1771, 1781, 1791, 1801,
+	1812, 1822, 1832, 1842, 1852, 1862, 1872, 1882,
+	1893, 1903, 1913, 1923, 1934, 1944, 1954, 1964,
+	1975, 1985, 1995, 2006, 2016, 2026, 2037, 2047,
+};
+
+#define ANA38407_BL_MAX_LEVEL	(ARRAY_SIZE(ana38407_wrdisbv) - 1)
 
 /*
  * SESS-142 TCON pre-emphasis probe. The device's own downstream source
@@ -123,6 +169,7 @@ struct ana38407 {
 	struct drm_dsc_config dsc;
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data *supplies;
+	struct backlight_device *bl;
 
 	/*
 	 * drm_panel_funcs hands the panel no mode: prepare/enable/disable/
@@ -160,6 +207,60 @@ static inline struct ana38407 *to_ana38407(struct drm_panel *panel)
 	mipi_dsi_dcs_write_seq_multi((ctx), 0xf1, 0x5a, 0x5a)
 #define ana38407_lock_lvl1(ctx) \
 	mipi_dsi_dcs_write_seq_multi((ctx), 0xf1, 0xa5, 0xa5)
+
+/*
+ * BRIGHTNESS_DIMMING_SETTING, from this device's own downstream data file
+ * (GTS9U_ANA38407_AMSA46AS02.dat:93):
+ *
+ *	W 0x53 0x28			WRCTRLD: normal mode, smooth dimming on
+ *	W 0x51 0xXX 0xXX		WRDISBV = NORMAL_CANDELA_MAP[level]
+ *	${HBM_FlatZ_SETTING}		"IF REVISION BtoZ" -- our rev D qualifies
+ *
+ * Both the panel-on sequence and every runtime backlight update emit this one
+ * block, so the DDIC only ever has a single writer telling it the level.
+ *
+ * The .dat nests HBM_FlatZ inside the outer level-key window; we keep it as its
+ * own unlock/lock pair, which is the byte stream already validated on this
+ * hardware. The register writes land identically either way.
+ */
+static void ana38407_send_brightness(struct mipi_dsi_multi_context *dsi_ctx,
+				     unsigned int level)
+{
+	u16 wrdisbv = ana38407_wrdisbv[min_t(unsigned int, level,
+					     ANA38407_BL_MAX_LEVEL)];
+	/*
+	 * WRDISBV takes its high byte FIRST. That is what
+	 * mipi_dsi_dcs_set_display_brightness_large() does; the plain
+	 * mipi_dsi_dcs_set_display_brightness() and its _multi wrapper pack the
+	 * payload the other way round and would send the two bytes swapped.
+	 * There is no _large_multi, so the buffer is packed by hand here rather
+	 * than through a helper that could silently reorder it.
+	 */
+	u8 wrdisbv_cmd[3] = { MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
+			      (wrdisbv >> 8) & 0xff, wrdisbv & 0xff };
+
+	ana38407_unlock_lvl0(dsi_ctx);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
+				     0x28);
+	mipi_dsi_dcs_write_buffer_multi(dsi_ctx, wrdisbv_cmd,
+					sizeof(wrdisbv_cmd));
+	ana38407_lock_lvl0(dsi_ctx);
+
+	/*
+	 * HBM_FlatZ_SETTING (IRC / "Flat Gamma Z"), transcribed byte-exact from
+	 * this device's own downstream data file
+	 * (GTS9U_ANA38407_AMSA46AS02.dat:140-141). The .dat applies it inside
+	 * BRIGHTNESS_DIMMING_SETTING under "IF REVISION BtoZ" (.dat:106-107);
+	 * our panel is rev D (id 0x04 -> index 3, within B..Z), so stock sends
+	 * this on every brightness update. IRC is a DDIC low-gray gamma /
+	 * luminance correction.
+	 */
+	ana38407_unlock_lvl0(dsi_ctx);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb0, 0x0a, 0xe0);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xe0,
+		0x3c, 0xfd, 0xff, 0x15, 0x00, 0x00, 0x66, 0xcc, 0x00, 0xff, 0x12);
+	ana38407_lock_lvl0(dsi_ctx);
+}
 
 static void ana38407_reset(struct ana38407 *ctx)
 {
@@ -584,34 +685,16 @@ static int ana38407_on(struct ana38407 *ctx)
 		0x0f, 0x00, 0x00, 0x00, 0x06, 0xb1, 0x81);
 	ana38407_lock_lvl0(&dsi_ctx);
 
-	/* BRIGHTNESS_DIMMING_SETTING (smooth-dim ON + WRDISBV). bl_override
-	 * (default 0x07ff = bl255 max) is a sess-141 sweep knob — see the
-	 * module_param note at the top. */
-	ana38407_unlock_lvl0(&dsi_ctx);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
-				     0x28);
-	{
-		u8 wrdisbv[3] = { MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
-				  (bl_override >> 8) & 0xff, bl_override & 0xff };
-		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, wrdisbv, sizeof(wrdisbv));
-	}
-	ana38407_lock_lvl0(&dsi_ctx);
-
 	/*
-	 * HBM_FlatZ_SETTING (IRC / "Flat Gamma Z"), transcribed byte-exact from
-	 * this device's own downstream data file
-	 * (GTS9U_ANA38407_AMSA46AS02.dat:140-141). The .dat applies it inside
-	 * BRIGHTNESS_DIMMING_SETTING under "IF REVISION BtoZ" (.dat:106-107);
-	 * our panel is rev D (id 0x04 -> index 3, within B..Z), so stock sends
-	 * this on every normal panel-on. Our driver omitted it; it is the sole
-	 * register-level DCS command in the stock normal power-on path that we
-	 * were not sending. IRC is a DDIC low-gray gamma/luminance correction.
+	 * BRIGHTNESS_DIMMING_SETTING + HBM_FlatZ (see ana38407_send_brightness).
+	 *
+	 * The level comes from props.brightness, NOT backlight_get_brightness():
+	 * this runs from prepare(), before drm_panel_enable() has called
+	 * backlight_enable(), so the backlight device is still blanked and the
+	 * helper would report 0 -- lighting the panel at its 2 cd/m2 minimum for
+	 * one transaction before the real level arrived.
 	 */
-	ana38407_unlock_lvl0(&dsi_ctx);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0a, 0xe0);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xe0,
-		0x3c, 0xfd, 0xff, 0x15, 0x00, 0x00, 0x66, 0xcc, 0x00, 0xff, 0x12);
-	ana38407_lock_lvl0(&dsi_ctx);
+	ana38407_send_brightness(&dsi_ctx, ctx->bl->props.brightness);
 
 	/* SP_SETTING */
 	ana38407_unlock_lvl0(&dsi_ctx);
@@ -894,6 +977,70 @@ static int ana38407_get_modes(struct drm_panel *panel,
 	return ANA38407_NUM_MODES;
 }
 
+static int ana38407_bl_update_status(struct backlight_device *bl)
+{
+	struct ana38407 *ctx = bl_get_data(bl);
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+
+	/*
+	 * A sysfs write can arrive at any time, including with the panel
+	 * powered down, where DCS would go out over a dead link. drm_panel's
+	 * enable/disable ordering covers the normal paths; this covers the rest.
+	 *
+	 * The blank check matters separately: drm_panel_disable() calls
+	 * backlight_disable() BEFORE funcs->disable(), so without it every
+	 * screen-off would first ramp the panel down to its 2 cd/m2 minimum --
+	 * with smooth dimming enabled, a visible fade -- and only then blank.
+	 */
+	if (backlight_is_blank(bl) || !ctx->panel.enabled)
+		return 0;
+
+	ana38407_send_brightness(&dsi_ctx, backlight_get_brightness(bl));
+
+	return dsi_ctx.accum_err;
+}
+
+static const struct backlight_ops ana38407_bl_ops = {
+	.update_status = ana38407_bl_update_status,
+};
+
+static int ana38407_backlight_init(struct ana38407 *ctx)
+{
+	struct device *dev = &ctx->dsi->dev;
+	const struct backlight_properties props = {
+		.type = BACKLIGHT_RAW,
+		/*
+		 * The vendor curve puts its finer steps at the bottom (level
+		 * 127 = 41% of peak luminance, not 50%), so tell userspace not
+		 * to apply a perceptual correction of its own on top.
+		 */
+		.scale = BACKLIGHT_SCALE_NON_LINEAR,
+		.max_brightness = ANA38407_BL_MAX_LEVEL,
+		/*
+		 * Start at the top of the range. WRDISBV then works out to
+		 * 2047, which is what the panel-on sequence sent before a
+		 * backlight device existed -- so a boot that never touches
+		 * sysfs produces the identical DSI byte stream it always did.
+		 */
+		.brightness = ANA38407_BL_MAX_LEVEL,
+	};
+
+	ctx->bl = devm_backlight_device_register(dev, dev_name(dev), dev, ctx,
+						 &ana38407_bl_ops, &props);
+	if (IS_ERR(ctx->bl))
+		return dev_err_probe(dev, PTR_ERR(ctx->bl),
+				     "Failed to register backlight\n");
+
+	/*
+	 * Hand it to drm_panel, which enables the backlight after the panel and
+	 * disables it before -- the ordering this driver would otherwise have to
+	 * open-code.
+	 */
+	ctx->panel.backlight = ctx->bl;
+
+	return 0;
+}
+
 static const struct drm_panel_funcs ana38407_panel_funcs = {
 	.prepare = ana38407_prepare,
 	.enable = ana38407_enable,
@@ -933,6 +1080,14 @@ static int ana38407_probe(struct mipi_dsi_device *dsi)
 			  MIPI_DSI_CLOCK_NON_CONTINUOUS;
 
 	ctx->panel.prepare_prev_first = true;
+
+	/*
+	 * Before drm_panel_add(): that call publishes the panel, after which a
+	 * consumer may prepare it, and the panel-on sequence reads ctx->bl.
+	 */
+	ret = ana38407_backlight_init(ctx);
+	if (ret < 0)
+		return ret;
 
 	drm_panel_add(&ctx->panel);
 
