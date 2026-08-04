@@ -151,17 +151,34 @@ MODULE_PARM_DESC(mdnie, "send OneUI mDNIe at panel-on: 0=off (default), 1=UI_DYN
 
 /*
  * acl -- ACL (Automatic Current Limiting) level written to WRACL (0x55) at
- * panel-on. default 0 = ACL OFF (original behaviour, the flickering control).
- * The sess-156 DDIC-internal capture (OneUI-clean vs bare-TWRP read_mtp diff)
- * found RDACL (0x56) reads 0x02 on the no-flicker OneUI stack but 0x01 (bare
- * TWRP) / 0x00 (mainline, ACL-off) on the two flickering stacks -- ACL is per-
- * frame and content-adaptive (modulates emission current/ELVSS), so ACL>=2 is
- * the candidate seam-flicker suppressor. Set at module load:  insmod panel.ko
- * acl=2   (sweep acl=1/2/3 to bracket the level).
+ * panel-on. This is the DDIC's own emission-current limiter: per-frame and
+ * content-adaptive, it trims drive as average picture level rises.
+ *
+ * DEFAULT 2, WHICH IS WHAT THE FACTORY SHIPS. A DDIC-internal read of RDACL
+ * (0x56) across three live stacks gave OneUI = 0x02, bare TWRP = 0x01,
+ * mainline = 0x00 -- so mainline was the only one of the three running with
+ * the limiter switched off, purely because this knob was added as a flicker
+ * probe and left at its "off" control value.
+ *
+ * The register was confirmed to actually latch here, which had never been
+ * established: at maximum brightness on a white field, acl=2 draws 216.6 mA
+ * less than acl=0 (3.33 sigma, against a 0.48 sigma panel-cycle control), or
+ * 9.3% of total system current. That is a trim rather than a protective
+ * clamp, and it is free.
+ *
+ * The reason it was previously 0 has expired. ACL was a candidate suppressor
+ * for the row-154 dark-seam flicker and the A/B came back ambiguous -- but
+ * that flicker is now fixed by the panel's mode configuration, so the old
+ * verdict is uninformative in both directions. Because ACL is per-frame and
+ * content-adaptive, changing it is a display-path change and is re-verified
+ * by eye at both refresh rates rather than assumed harmless.
+ *
+ * 0 = off, 1 = 8%, 2 = 15%, 3 = 20% (the levels named in the panel's own
+ * data file). Settable at runtime, but read only during panel-on.
  */
-static int acl;
+static int acl = 2;
 module_param(acl, int, 0644);
-MODULE_PARM_DESC(acl, "ACL level at panel-on via WRACL 0x55: 0=off (default/flickering control), 1/2/3=ACL levels (>=2 = the candidate suppressor)");
+MODULE_PARM_DESC(acl, "ACL level at panel-on via WRACL 0x55: 0=off, 1=8%, 2=15% (default, matches stock), 3=20%");
 
 struct ana38407 {
 	struct drm_panel panel;
