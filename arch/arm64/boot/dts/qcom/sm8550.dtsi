@@ -6562,6 +6562,33 @@
 					type = "passive";
 				};
 			};
+
+			/*
+			 * Throttle the gold and gold-plus CPUs off the DDR sensor.
+			 *
+			 * This is a transcription of the vendor's own configuration
+			 * rather than a policy invented here: kalama-thermal.dtsi
+			 * binds CPU3, CPU4, CPU5 and CPU6 (gold_cdev0..3) plus CPU7
+			 * (gold_plus_cdev) to this same ddr_config0 trip, and the trip
+			 * above is byte-identical to the vendor's -- 90000 m degC,
+			 * 5000 hysteresis, passive, on the same <&tsens1 9>.
+			 *
+			 * The silver cluster is deliberately NOT bound, because the
+			 * vendor does not bind it either.
+			 */
+			cooling-maps {
+				map0 {
+					trip = <&ddr_config0>;
+					cooling-device = <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+				map1 {
+					trip = <&ddr_config0>;
+					cooling-device = <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
 		};
 
 		modem0-thermal {
