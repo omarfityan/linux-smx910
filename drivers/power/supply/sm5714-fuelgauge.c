@@ -78,10 +78,15 @@
 #define SM5714_FG_SRAM_VBAT		0x03	/* terminal voltage */
 #define SM5714_FG_SRAM_CURRENT		0x05	/* instantaneous current */
 #define SM5714_FG_SRAM_TEMPERATURE	0x07	/* die/battery temperature */
+#define SM5714_FG_SRAM_AGING_RATE_FILT	0x46	/* hardware aging estimate */
+#define SM5714_FG_SRAM_USER_RESERV_2	0x8b	/* vendor's persisted SoH ratchet */
+#define SM5714_FG_SOH_MASK		0x7f	/* bit 7 is the cycle flag */
 
 struct sm5714_fg {
 	struct i2c_client *client;
 	struct power_supply *psy;
+	int charge_full_design_uah;	/* from monitored-battery; <=0 if absent */
+	int soh_pct;			/* 1..100, or 100 if unavailable */
 };
 
 /* Indirect SRAM read: point RADDR at the target, then read RDATA. */
@@ -170,12 +175,60 @@ static int sm5714_fg_get_temp(struct sm5714_fg *fg, int *decidegc)
 	return 0;
 }
 
+/*
+ * State of health, in whole percent.
+ *
+ * 🔴 THE VENDOR DOES NOT REPORT THE HARDWARE AGING REGISTER, SO NEITHER DO WE.
+ * It is tempting to read AGING_RATE_FILT (0x46) and scale it -- downstream
+ * sm5714_fuelgauge.c:483-514 does exactly that, `soh = soh * 100 / 2048` -- but
+ * the very next lines throw the result away and the function ends with
+ *
+ *	soh = pre_soh;
+ *
+ * `pre_soh` is a SOFTWARE ratchet persisted in USER_RESERV_2 (0x8b, bits 0..6).
+ * The hardware estimate is used only as a trigger to decrement it, by one, and
+ * only when a cycle-count flag has toggled AND the cell is at or above a
+ * reference temperature. So the vendor's health figure is deliberately
+ * monotonic and temperature-gated; the raw register wanders with temperature
+ * and is a number stock never displays.
+ *
+ * We therefore read the persisted value. It lives in cell-powered SRAM and
+ * survives reboots -- the same property that lets this device keep its
+ * vendor-programmed model table across a reflash -- so on hardware that has run
+ * stock it holds stock's own figure.
+ *
+ * We deliberately do NOT maintain the ratchet. That needs SRAM writes and this
+ * driver is read-only by design; a health figure that only decays while Linux
+ * is running would also diverge from the vendor's across dual-boot.
+ */
+static int sm5714_fg_read_soh(struct sm5714_fg *fg)
+{
+	int raw = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_USER_RESERV_2);
+	int soh;
+
+	if (raw < 0)
+		return raw;
+
+	soh = raw & SM5714_FG_SOH_MASK;
+
+	/*
+	 * Guard the range rather than trust it. An uninitialised or
+	 * never-written scratch word reads as 0 or 0x7f, and either would be
+	 * published as a confident, wrong Battery Health. Out of range means
+	 * "no usable figure", NOT "a bad battery".
+	 */
+	if (soh < 1 || soh > 100)
+		return -ERANGE;
+
+	return soh;
+}
+
 static int sm5714_fg_get_property(struct power_supply *psy,
 				  enum power_supply_property psp,
 				  union power_supply_propval *val)
 {
 	struct sm5714_fg *fg = power_supply_get_drvdata(psy);
-	int ret, ua;
+	int ret, ua, pct, full_uah;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_PRESENT:
@@ -210,6 +263,38 @@ static int sm5714_fg_get_property(struct power_supply *psy,
 		else
 			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 		return 0;
+
+	/*
+	 * The three capacity properties below are what upower needs to produce a
+	 * Battery Health figure (energy-full / energy-full-design) and a
+	 * time-to-empty estimate (energy / energy-rate). Without them it reports
+	 * "energy-full-design: 0 Wh", health 0 %, and "Estimating..." forever,
+	 * even though percentage and charge rate are perfectly good -- which is
+	 * what made this look like a desktop bug for several sessions.
+	 *
+	 * They are reported only when the design capacity is actually known.
+	 * -ENODATA leaves the sysfs attribute failing, which upower reads as
+	 * absent; publishing a zero instead would look like a dead battery.
+	 */
+	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+		if (fg->charge_full_design_uah <= 0)
+			return -ENODATA;
+		val->intval = fg->charge_full_design_uah;
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_FULL:
+		if (fg->charge_full_design_uah <= 0)
+			return -ENODATA;
+		val->intval = fg->charge_full_design_uah / 100 * fg->soh_pct;
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_NOW:
+		if (fg->charge_full_design_uah <= 0)
+			return -ENODATA;
+		ret = sm5714_fg_get_capacity(fg, &pct);
+		if (ret)
+			return ret;
+		full_uah = fg->charge_full_design_uah / 100 * fg->soh_pct;
+		val->intval = full_uah / 100 * pct;
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -225,6 +310,9 @@ static enum power_supply_property sm5714_fg_props[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_OCV,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_CHARGE_NOW,
 };
 
 static const struct power_supply_desc sm5714_fg_desc = {
@@ -237,9 +325,10 @@ static const struct power_supply_desc sm5714_fg_desc = {
 
 static int sm5714_fg_probe(struct i2c_client *client)
 {
+	struct power_supply_battery_info *info;
 	struct power_supply_config cfg = { };
 	struct sm5714_fg *fg;
-	int id, status, try;
+	int id, status, try, soh, aging, reserv;
 
 	fg = devm_kzalloc(&client->dev, sizeof(*fg), GFP_KERNEL);
 	if (!fg)
@@ -280,6 +369,50 @@ static int sm5714_fg_probe(struct i2c_client *client)
 	if (IS_ERR(fg->psy))
 		return dev_err_probe(&client->dev, PTR_ERR(fg->psy),
 				     "failed to register power supply\n");
+
+	/*
+	 * Design capacity comes from the board's monitored-battery node, not
+	 * from a constant here: the SM5714 ships in several Samsung devices with
+	 * different packs, so the pack value belongs to the board DT. If the
+	 * node is missing, the three capacity properties simply report -ENODATA
+	 * and everything else keeps working.
+	 */
+	fg->charge_full_design_uah = 0;
+	fg->soh_pct = 100;
+	if (!power_supply_get_battery_info(fg->psy, &info)) {
+		if (info->charge_full_design_uah > 0)
+			fg->charge_full_design_uah = info->charge_full_design_uah;
+		power_supply_put_battery_info(fg->psy, info);
+	}
+	if (!fg->charge_full_design_uah)
+		dev_info(&client->dev,
+			 "no design capacity in DT; charge/health properties disabled\n");
+
+	/*
+	 * Read the vendor's persisted state-of-health once. It only changes over
+	 * months, so re-reading it per sysfs poll would buy nothing and cost an
+	 * i2c round trip on every desktop refresh.
+	 *
+	 * Both raw words are logged deliberately. This is the first time this
+	 * project has looked at either, and a later session refining the health
+	 * model should be able to see what the hardware estimate and the vendor's
+	 * ratchet actually said on a known-good boot -- rather than re-deriving
+	 * it from a device whose values have since moved.
+	 */
+	soh = sm5714_fg_read_soh(fg);
+	aging = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_AGING_RATE_FILT);
+	reserv = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_USER_RESERV_2);
+	if (soh > 0) {
+		fg->soh_pct = soh;
+	} else {
+		dev_info(&client->dev,
+			 "no usable stored state-of-health (%pe); reporting full health\n",
+			 ERR_PTR(soh));
+	}
+	dev_info(&client->dev,
+		 "state-of-health %d%% (stored 0x%04x, hw aging estimate 0x%04x -> %d%%)\n",
+		 fg->soh_pct, reserv, aging,
+		 aging >= 0 ? aging * 100 / 2048 : -1);
 
 	i2c_set_clientdata(client, fg);
 	dev_info(&client->dev,

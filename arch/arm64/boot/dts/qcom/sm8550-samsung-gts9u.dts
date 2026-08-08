@@ -442,6 +442,43 @@
 			reg = <0x8 0x80c00000 0x0 0xad00000>;
 		};
 	};
+
+	/*
+	 * The pack fitted to this device, referenced by the fuel gauge through
+	 * monitored-battery.
+	 *
+	 * WHY THIS NODE EXISTS. Without a design capacity the fuel gauge can
+	 * publish CAPACITY (percent) but not CHARGE_FULL_DESIGN / CHARGE_FULL /
+	 * CHARGE_NOW. upower derives BOTH its health figure
+	 * (energy-full / energy-full-design) and its time-to-empty estimate
+	 * (energy / energy-rate) from those, so with them absent it reports
+	 * "energy-full-design: 0 Wh", a Battery Health of 0 %, and a Remaining
+	 * Time stuck on "Estimating..." forever. Percentage and charge rate
+	 * worked all along, which is precisely what made this look like a
+	 * desktop bug rather than a missing kernel property.
+	 *
+	 * 🔴 BOTH VALUES ARE THIS DEVICE'S OWN, transcribed from its downstream
+	 * device tree -- not a datasheet, not marketing, not a sister device:
+	 *
+	 *   gts9uwifi_eur_open_w00_r03.dts:227
+	 *       battery,battery_full_capacity = <0x2648>;   // 9800 mAh
+	 *   gts9uwifi_eur_open_w00_r03.dts:179
+	 *       battery,chg_float_voltage    = <0x1158>;    // 4440 mV
+	 *
+	 * sec_battery.c:6367-6369 returns battery_full_capacity * 1000 (uAh) for
+	 * CHARGE_FULL_DESIGN. The widely quoted 11200 mAh is marketing and
+	 * appears NOWHERE in the vendor tree -- do not "correct" this to it.
+	 *
+	 * voltage-min-design-microvolt is deliberately ABSENT: this pack uses
+	 * hardware empty detection (fuelgauge,using_hw_vempty in the same file)
+	 * and the vendor tree carries no design-minimum in millivolts. Inventing
+	 * one would put a fabricated number where a measured one belongs.
+	 */
+	battery: battery {
+		compatible = "simple-battery";
+		charge-full-design-microamp-hours = <9800000>;
+		voltage-max-design-microvolt = <4440000>;
+	};
 };
 
 /*
@@ -1518,6 +1555,7 @@
 	fuelgauge: fuelgauge@71 {
 		compatible = "siliconmitus,sm5714-fuelgauge";
 		reg = <0x71>;
+		monitored-battery = <&battery>;
 	};
 };
 
