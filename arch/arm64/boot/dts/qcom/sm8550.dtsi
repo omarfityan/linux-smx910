@@ -5825,6 +5825,8 @@
 		};
 
 		cpu3-top-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 5>;
 
 			trips {
@@ -5866,6 +5868,8 @@
 		};
 
 		cpu3-bottom-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 6>;
 
 			trips {
@@ -5907,6 +5911,8 @@
 		};
 
 		cpu4-top-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 7>;
 
 			trips {
@@ -5948,6 +5954,8 @@
 		};
 
 		cpu4-bottom-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 8>;
 
 			trips {
@@ -5989,6 +5997,8 @@
 		};
 
 		cpu5-top-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 9>;
 
 			trips {
@@ -6030,6 +6040,8 @@
 		};
 
 		cpu5-bottom-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 10>;
 
 			trips {
@@ -6071,6 +6083,8 @@
 		};
 
 		cpu6-top-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 11>;
 
 			trips {
@@ -6112,6 +6126,8 @@
 		};
 
 		cpu6-bottom-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 12>;
 
 			trips {
@@ -6153,6 +6169,8 @@
 		};
 
 		cpu7-top-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 13>;
 
 			trips {
@@ -6188,6 +6206,8 @@
 		};
 
 		cpu7-middle-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 14>;
 
 			trips {
@@ -6223,6 +6243,8 @@
 		};
 
 		cpu7-bottom-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens0 15>;
 
 			trips {
@@ -6276,6 +6298,8 @@
 		};
 
 		cpu0-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens1 1>;
 
 			trips {
@@ -6315,6 +6339,8 @@
 		};
 
 		cpu1-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens1 2>;
 
 			trips {
@@ -6354,6 +6380,8 @@
 		};
 
 		cpu2-thermal {
+			polling-delay-passive = <250>;
+
 			thermal-sensors = <&tsens1 3>;
 
 			trips {
