@@ -256,12 +256,40 @@ static int sm5714_fg_get_property(struct power_supply *psy,
 		ret = sm5714_fg_get_current(fg, &ua);
 		if (ret)
 			return ret;
-		if (ua > 30000)
+		if (ua > 30000) {
 			val->intval = POWER_SUPPLY_STATUS_CHARGING;
-		else if (ua < -30000)
+			return 0;
+		}
+		if (ua < -30000) {
 			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
-		else
-			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+			return 0;
+		}
+		/*
+		 * Current has settled near zero, which means two different
+		 * things: charge TERMINATION when external power is present --
+		 * the charger holds the pack at float and stops pushing current
+		 * -- or simply an idle pack when it is not.
+		 *
+		 * power_supply_am_i_supplied() is what separates them, and it
+		 * only works because the charger names this gauge in its
+		 * supplied_to list. Reporting NOT_CHARGING for both is why a
+		 * full pack never showed as "Fully charged".
+		 *
+		 * Fail safe: NOT_CHARGING unless there is positive evidence of
+		 * both external power and a pack near the top of its range. A
+		 * charge paused mid-range (thermal, for instance) also settles
+		 * near zero current and must not be reported as full.
+		 *
+		 * Order matters: the capacity read is a local SRAM access, while
+		 * power_supply_am_i_supplied() reaches into the charger, which
+		 * takes its mutex and does an i2c transaction. Test the cheap
+		 * local condition first so the cross-driver read only happens
+		 * for a pack that is actually near the top of its range.
+		 */
+		val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+		if (!sm5714_fg_get_capacity(fg, &pct) && pct >= 95 &&
+		    power_supply_am_i_supplied(fg->psy) > 0)
+			val->intval = POWER_SUPPLY_STATUS_FULL;
 		return 0;
 
 	/*

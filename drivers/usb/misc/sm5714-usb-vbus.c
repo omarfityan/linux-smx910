@@ -926,6 +926,17 @@ static enum power_supply_property sm5714_chg_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 };
 
+/*
+ * Naming the fuel gauge here is what lets it answer
+ * power_supply_am_i_supplied(): the core walks the registered supplies and
+ * matches this list against the battery's name. Without it the gauge has no way
+ * to tell charge termination (external power present, current settled at float)
+ * from an idle pack, so a full battery reports NOT_CHARGING and never FULL.
+ */
+static char *sm5714_chg_supplied_to[] = {
+	"sm5714-fuelgauge",
+};
+
 static const struct power_supply_desc sm5714_chg_desc = {
 	.name		= "sm5714-charger",
 	.type		= POWER_SUPPLY_TYPE_USB,
@@ -973,6 +984,8 @@ static int sm5714_vbus_probe(struct i2c_client *client)
 
 		cfg.drv_data = sv;
 		cfg.fwnode = dev_fwnode(&client->dev);
+		cfg.supplied_to = sm5714_chg_supplied_to;
+		cfg.num_supplicants = ARRAY_SIZE(sm5714_chg_supplied_to);
 		sv->psy = devm_power_supply_register(&client->dev,
 						     &sm5714_chg_desc, &cfg);
 		if (IS_ERR(sv->psy))
