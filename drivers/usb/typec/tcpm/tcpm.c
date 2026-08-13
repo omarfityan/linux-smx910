@@ -1183,12 +1183,23 @@ static u32 tcpm_get_current_limit(struct tcpm_port *port)
 static int tcpm_set_current_limit(struct tcpm_port *port, u32 max_ma, u32 mv)
 {
 	int ret = -EOPNOTSUPP;
+	bool changed;
 
 	tcpm_log(port, "Setting voltage/current limit %u mV %u mA", mv, max_ma);
 
+	/*
+	 * A PPS contract is re-requested periodically to keep the source's
+	 * timer alive, and most of those requests carry the operating point
+	 * that is already in force. Emitting a change notification for a value
+	 * that did not change wakes every power-supply consumer for nothing --
+	 * upower re-walks sysfs on each one -- so notify only on a real change.
+	 */
+	changed = port->supply_voltage != mv || port->current_limit != max_ma;
+
 	port->supply_voltage = mv;
 	port->current_limit = max_ma;
-	power_supply_changed(port->psy);
+	if (changed)
+		power_supply_changed(port->psy);
 
 	if (port->tcpc->set_current_limit)
 		ret = port->tcpc->set_current_limit(port->tcpc, max_ma, mv);

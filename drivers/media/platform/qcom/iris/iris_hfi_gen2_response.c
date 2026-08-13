@@ -913,6 +913,7 @@ static int iris_hfi_gen2_handle_session_response(struct iris_core *core,
 	struct iris_hfi_packet *packet;
 	struct iris_inst *inst;
 	bool dequeue = false;
+	u32 nr_buffer_pkts = 0;
 	int ret = 0;
 	u32 i, j;
 	static const struct iris_hfi_gen2_inst_hfi_range range[] = {
@@ -954,7 +955,10 @@ static int iris_hfi_gen2_handle_session_response(struct iris_core *core,
 				iris_hfi_gen2_handle_session_error(inst, packet);
 
 			if (packet->type > range[i].begin && packet->type < range[i].end) {
-				dequeue |= (packet->type == HFI_CMD_BUFFER);
+				if (packet->type == HFI_CMD_BUFFER) {
+					dequeue = true;
+					nr_buffer_pkts++;
+				}
 				ret = range[i].handle(inst, packet);
 				if (ret)
 					iris_inst_change_state(inst, IRIS_INST_ERROR);
@@ -962,6 +966,19 @@ static int iris_hfi_gen2_handle_session_response(struct iris_core *core,
 			pkt += packet->size;
 		}
 	}
+
+	/*
+	 * hfi_frame_info is cleared once per RESPONSE HEADER, but a header may
+	 * carry several HFI_CMD_BUFFER packets. Any picture_type property in
+	 * the header therefore applies to every buffer in it -- so a hidden
+	 * (no-show) frame sharing a header with a displayable one taints both.
+	 * Log the composition so that pairing can be established from a real
+	 * stream before any code acts on picture_type per buffer.
+	 */
+	dev_dbg(core->dev, "hfi hdr: packets=%u buffer_pkts=%u picture_type=%#x no_output=%u\n",
+		hdr->num_packets, nr_buffer_pkts,
+		inst_hfi_gen2->hfi_frame_info.picture_type,
+		inst_hfi_gen2->hfi_frame_info.no_output);
 
 	if (dequeue)
 		iris_hfi_gen2_handle_dequeue_buffers(inst);
