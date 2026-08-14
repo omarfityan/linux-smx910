@@ -33,7 +33,9 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
+#include <linux/power/sm5714-battery-age.h>
 #include <linux/power_supply.h>
+#include <linux/workqueue.h>
 
 /*
  * Early-boot probe retry.
@@ -79,14 +81,79 @@
 #define SM5714_FG_SRAM_CURRENT		0x05	/* instantaneous current */
 #define SM5714_FG_SRAM_TEMPERATURE	0x07	/* die/battery temperature */
 #define SM5714_FG_SRAM_AGING_RATE_FILT	0x46	/* hardware aging estimate */
+#define SM5714_FG_SRAM_SOC_CYCLE	0x87	/* charge cycles, low byte */
 #define SM5714_FG_SRAM_USER_RESERV_2	0x8b	/* vendor's persisted SoH ratchet */
 #define SM5714_FG_SOH_MASK		0x7f	/* bit 7 is the cycle flag */
+#define SM5714_FG_CYCLE_MASK		0x00ff	/* sm5714_fuelgauge.c:476 */
+
+/*
+ * Full-charge detection, transcribed from the vendor's supervisor.
+ *
+ * The vendor puts this in sec_battery, a supervisor mainline does not have, so
+ * it lands here: this driver owns the power_supply node userspace reads, which
+ * is the same role sec_battery plays downstream.  The mechanism is taken from
+ * the device's own configuration and code, not chosen:
+ *
+ *   full_check_type = full_check_type_2nd = 2 = SEC_BATTERY_FULLCHARGED_FG_CURRENT
+ *       -> the test is on fuel-gauge CURRENT           (dts:131-132)
+ *   cable-info/full_check_current_1st = 0x44c = 1100 mA
+ *       -> the threshold in force from probe onwards   (sec_battery.c:8571)
+ *   full_check_count = 1                               (dts:133)
+ *       -> one qualifying sample is enough, and any failing sample resets
+ *   full_condition_type = 0x09 = NOTIMEFULL | VCELL
+ *       -> 🔴 SOC (bit 2) is NOT set, so the vendor's full_condition_soc is
+ *          never consulted on this device.  The gate is VOLTAGE.  (dts:171)
+ *
+ * The vendor's current test (sec_battery.c:2603-2605) requires the current to
+ * be strictly POSITIVE and below the threshold -- the pack must still be taking
+ * charge.  That is what makes this a taper test rather than a termination test,
+ * and it is transcribed as-is: a terminated pack reads about -3 mA here and
+ * deliberately does not qualify.
+ *
+ * The vendor's second stage only lowers the top-off target to
+ * full_check_current_2nd and repeats the same test.  It is not transcribed
+ * because this port does not drive the top-off vote: the SM5714 terminates in
+ * hardware at its own 350 mA top-off, which is already below the vendor's
+ * 550 mA software second stage.  What matters for what userspace sees is that
+ * the vendor sets POWER_SUPPLY_STATUS_FULL at :2804 -- BEFORE the first/second
+ * stage branch -- so the vendor also reports full at the 1100 mA first stage.
+ */
+#define SM5714_FG_FULL_CHECK_CURRENT_UA	1100000
+#define SM5714_FG_FULL_CHECK_COUNT	1
+
+/*
+ * Poll interval while a charger is attached.  The vendor polls at 30 s in the
+ * charging state (dts:95, battery,polling_time = <10 30 30 30 3600>, indexed by
+ * charging state).  Matching it keeps the i2c cost of this check at the vendor's
+ * own cadence rather than a number picked here.
+ */
+#define SM5714_FG_MONITOR_MS		30000
 
 struct sm5714_fg {
 	struct i2c_client *client;
 	struct power_supply *psy;
 	int charge_full_design_uah;	/* from monitored-battery; <=0 if absent */
 	int soh_pct;			/* 1..100, or 100 if unavailable */
+	struct delayed_work monitor_work;
+
+	/*
+	 * Full-charge latch.
+	 *
+	 * 🔴 Deliberately NOT protected by a mutex, and that is a correctness
+	 * decision rather than an omission.  Clearing the latch requires
+	 * power_supply_am_i_supplied(), which calls into the charger driver and
+	 * takes its sv->lock; the charger's own poll worker reads this gauge's
+	 * cycle count.  A lock here that were held across am_i_supplied() would
+	 * complete an AB-BA cycle between the two drivers.
+	 *
+	 * The state is safe without one: full_check_cnt is touched only by the
+	 * monitor work (a single-threaded delayed work), and full_latched is a
+	 * bool whose only concurrent transitions are "worker sets it while
+	 * supplied" and "reader clears it while not supplied" -- conditions that
+	 * cannot both hold, so the two writers cannot fight.
+	 */
+	bool full_latched;
+	int full_check_cnt;
 };
 
 /* Indirect SRAM read: point RADDR at the target, then read RDATA. */
@@ -223,6 +290,113 @@ static int sm5714_fg_read_soh(struct sm5714_fg *fg)
 	return soh;
 }
 
+/*
+ * Charge cycles, as the vendor counts them (sm5714_fuelgauge.c:466-480: read
+ * SOC_CYCLE and keep the low byte).  This is the input that selects the aging
+ * row, so it decides the charge ceiling the charger programs as well as the
+ * voltages this driver calls full.
+ */
+static int sm5714_fg_get_cycle_count(struct sm5714_fg *fg, int *cycles)
+{
+	int raw = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_SOC_CYCLE);
+
+	if (raw < 0)
+		return raw;
+
+	*cycles = raw & SM5714_FG_CYCLE_MASK;
+	return 0;
+}
+
+/*
+ * Is the full-charge latch currently in force?
+ *
+ * Entering the latch is the monitor work's job.  LEAVING it is done here, on
+ * the read path, so that unplugging is reflected immediately rather than up to
+ * one poll interval later -- a stale "Fully charged" on a pack that is visibly
+ * draining is exactly the kind of confidently wrong reading this driver exists
+ * to avoid.
+ *
+ * Loss of external power is the ONLY exit, which is the vendor's behaviour and
+ * the whole point of the latch.  The vendor's recharge path (sec_battery.c:2182-2189)
+ * sets charging_mode and is_recharging and pointedly does NOT clear
+ * battery->status, so a vendor device holds POWER_SUPPLY_STATUS_FULL -- and
+ * therefore a displayed 100% -- across the whole terminate -> relax -> recharge
+ * cycle this pack performs near the top of its range.
+ */
+static bool sm5714_fg_full_active(struct sm5714_fg *fg)
+{
+	if (!READ_ONCE(fg->full_latched))
+		return false;
+
+	if (power_supply_am_i_supplied(fg->psy) > 0)
+		return true;
+
+	WRITE_ONCE(fg->full_latched, false);
+	return false;
+}
+
+/*
+ * The vendor's full-charge check, on the vendor's cadence.
+ *
+ * This exists as a poll rather than as logic inside get_property because the
+ * check is stateful: it counts qualifying samples and then latches.  Driving
+ * that from the read path would tie the state machine to however often
+ * userspace happens to look, so a burst of reads could satisfy the count in
+ * milliseconds and a quiet desktop could miss the taper window entirely.
+ */
+static void sm5714_fg_monitor_work(struct work_struct *work)
+{
+	struct sm5714_fg *fg = container_of(work, struct sm5714_fg,
+					    monitor_work.work);
+	const struct sm5714_age_step *age;
+	int uv, ua, cycles = 0;
+
+	/* No external power: the latch cannot be entered and must not persist. */
+	if (power_supply_am_i_supplied(fg->psy) <= 0) {
+		if (READ_ONCE(fg->full_latched)) {
+			WRITE_ONCE(fg->full_latched, false);
+			power_supply_changed(fg->psy);
+		}
+		fg->full_check_cnt = 0;
+		goto resched;
+	}
+
+	if (READ_ONCE(fg->full_latched))
+		goto resched;		/* already full; nothing left to decide */
+
+	if (sm5714_fg_get_voltage(fg, SM5714_FG_SRAM_VBAT, &uv) ||
+	    sm5714_fg_get_current(fg, &ua))
+		goto resched;		/* a bad read is not evidence of anything */
+
+	/*
+	 * An unreadable cycle count leaves `cycles` at 0, which selects the
+	 * new-pack row -- the highest full threshold in the table.  That is the
+	 * safe direction for this test: it can only make the pack harder to call
+	 * full, never easier.
+	 */
+	sm5714_fg_get_cycle_count(fg, &cycles);
+	age = sm5714_age_step_for(cycles);
+
+	if (uv >= age->full_mv * 1000 &&
+	    ua > 0 && ua < SM5714_FG_FULL_CHECK_CURRENT_UA)
+		fg->full_check_cnt++;
+	else
+		fg->full_check_cnt = 0;
+
+	if (fg->full_check_cnt >= SM5714_FG_FULL_CHECK_COUNT) {
+		fg->full_check_cnt = 0;
+		WRITE_ONCE(fg->full_latched, true);
+		dev_info(&fg->client->dev,
+			 "battery full: %d mV >= %d mV, %d mA taper (cycles %d)\n",
+			 uv / 1000, age->full_mv, ua / 1000, cycles);
+		power_supply_changed(fg->psy);
+	}
+
+resched:
+	schedule_delayed_work(&fg->monitor_work,
+			      msecs_to_jiffies(SM5714_FG_MONITOR_MS));
+}
+
 static int sm5714_fg_get_property(struct power_supply *psy,
 				  enum power_supply_property psp,
 				  union power_supply_propval *val)
@@ -241,7 +415,26 @@ static int sm5714_fg_get_property(struct power_supply *psy,
 		val->intval = POWER_SUPPLY_HEALTH_GOOD;
 		return 0;
 	case POWER_SUPPLY_PROP_CAPACITY:
+		/*
+		 * While the full latch is in force the vendor reports 100 and
+		 * nothing else: sec_battery.c:6381-6386 overwrites the gauge's
+		 * value whenever status is FULL, with the sole exception of an
+		 * EU eco-recharge mode this device does not configure
+		 * (`eu_eco_rechg` is absent from its device tree).
+		 *
+		 * This is what the raw SoC cannot do on its own.  The gauge's
+		 * number keeps moving as the pack relaxes and recharges near the
+		 * top of its range, so a device that publishes it directly walks
+		 * back down from 100 while sitting on the charger.  The vendor
+		 * holds the displayed value because the vendor holds the STATE.
+		 */
+		if (sm5714_fg_full_active(fg)) {
+			val->intval = 100;
+			return 0;
+		}
 		return sm5714_fg_get_capacity(fg, &val->intval);
+	case POWER_SUPPLY_PROP_CYCLE_COUNT:
+		return sm5714_fg_get_cycle_count(fg, &val->intval);
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
 		return sm5714_fg_get_voltage(fg, SM5714_FG_SRAM_VBAT,
 					     &val->intval);
@@ -253,6 +446,20 @@ static int sm5714_fg_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_TEMP:
 		return sm5714_fg_get_temp(fg, &val->intval);
 	case POWER_SUPPLY_PROP_STATUS:
+		/*
+		 * The latch outranks the current reading, which is the whole
+		 * mechanism: the vendor keeps reporting FULL while the pack
+		 * relaxes and takes recharge current near the top of its range,
+		 * because it never clears the state (sec_battery.c:2182-2189).
+		 * Testing the current first would report CHARGING every time the
+		 * hardware topped the pack back up, and the desktop would
+		 * oscillate between "Fully charged" and "Charging" for as long as
+		 * it stayed plugged in.
+		 */
+		if (sm5714_fg_full_active(fg)) {
+			val->intval = POWER_SUPPLY_STATUS_FULL;
+			return 0;
+		}
 		ret = sm5714_fg_get_current(fg, &ua);
 		if (ret)
 			return ret;
@@ -265,31 +472,19 @@ static int sm5714_fg_get_property(struct power_supply *psy,
 			return 0;
 		}
 		/*
-		 * Current has settled near zero, which means two different
-		 * things: charge TERMINATION when external power is present --
-		 * the charger holds the pack at float and stops pushing current
-		 * -- or simply an idle pack when it is not.
+		 * Current has settled near zero with no full latch in force.
+		 * That is either a pack the charger has stopped pushing into
+		 * before the latch was earned, or simply an idle pack.
 		 *
-		 * power_supply_am_i_supplied() is what separates them, and it
-		 * only works because the charger names this gauge in its
-		 * supplied_to list. Reporting NOT_CHARGING for both is why a
-		 * full pack never showed as "Fully charged".
-		 *
-		 * Fail safe: NOT_CHARGING unless there is positive evidence of
-		 * both external power and a pack near the top of its range. A
-		 * charge paused mid-range (thermal, for instance) also settles
-		 * near zero current and must not be reported as full.
-		 *
-		 * Order matters: the capacity read is a local SRAM access, while
-		 * power_supply_am_i_supplied() reaches into the charger, which
-		 * takes its mutex and does an i2c transaction. Test the cheap
-		 * local condition first so the cross-driver read only happens
-		 * for a pack that is actually near the top of its range.
+		 * 🔴 This branch used to declare FULL here on a hard-coded
+		 * `pct >= 95`.  That constant was invented rather than extracted,
+		 * and it was wrong twice over: the pack terminated at SoC 94 so
+		 * it could not fire, and the termination SoC is not even stable
+		 * (94 one cycle, 97-98 the one before).  Full is now decided by
+		 * the vendor's own voltage-and-taper test in the monitor work,
+		 * and this branch reports what it can actually justify.
 		 */
 		val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
-		if (!sm5714_fg_get_capacity(fg, &pct) && pct >= 95 &&
-		    power_supply_am_i_supplied(fg->psy) > 0)
-			val->intval = POWER_SUPPLY_STATUS_FULL;
 		return 0;
 
 	/*
@@ -317,9 +512,20 @@ static int sm5714_fg_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_NOW:
 		if (fg->charge_full_design_uah <= 0)
 			return -ENODATA;
-		ret = sm5714_fg_get_capacity(fg, &pct);
-		if (ret)
-			return ret;
+		/*
+		 * Derived from the same percentage the CAPACITY property reports,
+		 * latch included.  upower publishes both -- percentage from
+		 * CAPACITY, energy from CHARGE_NOW -- and a desktop showing
+		 * "100%" beside an energy figure that says 96% of full is the
+		 * kind of internal disagreement that reads as a broken gauge.
+		 */
+		if (sm5714_fg_full_active(fg)) {
+			pct = 100;
+		} else {
+			ret = sm5714_fg_get_capacity(fg, &pct);
+			if (ret)
+				return ret;
+		}
 		full_uah = fg->charge_full_design_uah / 100 * fg->soh_pct;
 		val->intval = full_uah / 100 * pct;
 		return 0;
@@ -334,6 +540,7 @@ static enum power_supply_property sm5714_fg_props[] = {
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_OCV,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
@@ -443,10 +650,41 @@ static int sm5714_fg_probe(struct i2c_client *client)
 		 aging >= 0 ? aging * 100 / 2048 : -1);
 
 	i2c_set_clientdata(client, fg);
+
+	/*
+	 * Start the full-charge monitor.  Scheduled immediately rather than after
+	 * one interval so a device that boots already plugged in and tapering
+	 * gets its first look at the charge state now, not 30 s later.
+	 *
+	 * ⚠️ A pack that boots already TERMINATED will not latch on this first
+	 * look, and that is the vendor's behaviour rather than a gap being
+	 * papered over: the test requires positive taper current, which a
+	 * terminated pack does not have.  The latch is earned on the next
+	 * recharge, which this pack performs on its own near the top of its
+	 * range -- the hardware tops it back up whenever the cell falls to the
+	 * charger's recharge threshold, so the taper window recurs without any
+	 * user action.  Until then the reported capacity is the gauge's own,
+	 * which at the vendor's charge ceiling already sits at or near 100.
+	 */
+	INIT_DELAYED_WORK(&fg->monitor_work, sm5714_fg_monitor_work);
+	schedule_delayed_work(&fg->monitor_work, 0);
+
 	dev_info(&client->dev,
 		 "SM5714 fuel-gauge ready (id=0x%04x, status=0x%04x)\n",
 		 id, status);
 	return 0;
+}
+
+static void sm5714_fg_remove(struct i2c_client *client)
+{
+	struct sm5714_fg *fg = i2c_get_clientdata(client);
+
+	/*
+	 * Before devm unwinds the power_supply the work dereferences. A remove
+	 * callback runs ahead of devm cleanup, which is why this is not itself
+	 * a devm action.
+	 */
+	cancel_delayed_work_sync(&fg->monitor_work);
 }
 
 static const struct of_device_id sm5714_fg_of_match[] = {
@@ -461,6 +699,7 @@ static struct i2c_driver sm5714_fg_driver = {
 		.of_match_table = sm5714_fg_of_match,
 	},
 	.probe = sm5714_fg_probe,
+	.remove = sm5714_fg_remove,
 };
 module_i2c_driver(sm5714_fg_driver);
 
