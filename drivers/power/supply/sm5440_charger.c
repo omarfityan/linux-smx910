@@ -1356,6 +1356,8 @@ static void sm5440_pump_monitor_work(struct work_struct *work)
 	int vbus_uv = 0, ibus_ua = 0, dietemp = 0, vout_mv = 0, vbat_mv = 0;
 	int fg_uv = 0, fg_ua = 0, opmode;
 	union power_supply_propval pv;
+	unsigned int raw;
+	int die_raw = -1;
 	bool fault;
 	u8 st[4] = { };
 
@@ -1368,6 +1370,17 @@ static void sm5440_pump_monitor_work(struct work_struct *work)
 	sm5440_get_vbus_uv(chip, &vbus_uv);
 	sm5440_get_ibus_ua(chip, &ibus_ua);
 	sm5440_get_dietemp_dc(chip, &dietemp);
+	/*
+	 * Log the die-temp ADC RAW alongside the converted value.  The
+	 * conversion is "deci-C = 225 + raw * 5", so its scale bottoms out at
+	 * a wholly plausible 22.5 C and a stuck raw 0 is indistinguishable
+	 * from a genuinely cool die -- the same shape as the VBUS 4096 offset.
+	 * A pump switching tens of watts cannot sit at the bottom of that
+	 * scale, so this line settles it.  -1 = the read itself failed, which
+	 * is NOT the same as a real zero.
+	 */
+	if (!regmap_read(chip->regmap, SM5440_REG_ADC_DIETEMP, &raw))
+		die_raw = raw;
 	sm5440_get_vout_mv(chip, &vout_mv);
 	sm5440_get_vbat_mv(chip, &vbat_mv);
 	opmode = sm5440_get_op_mode(chip);
@@ -1388,9 +1401,9 @@ static void sm5440_pump_monitor_work(struct work_struct *work)
 	}
 
 	dev_info(chip->dev,
-		 "pump[%2d]: opmode=%d VBUS=%dmV 2xVOUT=%dmV IBUS=%dmA die=%d.%dC | cell SM5440-VBAT=%dmV FG-V=%dmV FG-I=%dmA | STATUS=%02x:%02x:%02x:%02x%s\n",
+		 "pump[%2d]: opmode=%d VBUS=%dmV 2xVOUT=%dmV IBUS=%dmA die=%d.%dC(raw=%d) | cell SM5440-VBAT=%dmV FG-V=%dmV FG-I=%dmA | STATUS=%02x:%02x:%02x:%02x%s\n",
 		 chip->monitor_ticks, opmode, vbus_uv / 1000, vout_mv * 2,
-		 ibus_ua / 1000, dietemp / 10, dietemp % 10, vbat_mv,
+		 ibus_ua / 1000, dietemp / 10, dietemp % 10, die_raw, vbat_mv,
 		 fg_uv / 1000, fg_ua / 1000, st[0], st[1], st[2], st[3],
 		 fault ? "  *** FAULT ***" : "");
 
@@ -1899,6 +1912,8 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 	struct sm5440 *chip = container_of(work, struct sm5440, dc_monitor.work);
 	int state, vbus = 0, ibus = 0, vout = 0, vbat = 0, die = 0, fg_ua = 0, opmode;
 	union power_supply_propval pv;
+	unsigned int raw;
+	int die_raw = -1;
 
 	mutex_lock(&chip->engage_lock);
 	if (!chip->dc_running) {
@@ -1913,14 +1928,26 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 	sm5440_get_vout_mv(chip, &vout);
 	sm5440_get_vbat_mv(chip, &vbat);
 	sm5440_get_dietemp_dc(chip, &die);
+	/*
+	 * Die-temp ADC raw, logged beside the converted value.  See the same
+	 * read in sm5440_pump_monitor_work() for why: "deci-C = 225 + raw * 5"
+	 * bottoms out at a plausible 22.5 C, so a stuck raw 0 is
+	 * indistinguishable from a cool die.  It is logged HERE as well because
+	 * this is the monitor the production auto-engage path runs -- that path
+	 * sets dc_running and schedules dc_monitor, and never sets pump_engaged,
+	 * so the pump_monitor copy alone would stay silent through every
+	 * supervisor-driven run.  -1 = the read failed, which is not a real zero.
+	 */
+	if (!regmap_read(chip->regmap, SM5440_REG_ADC_DIETEMP, &raw))
+		die_raw = raw;
 	if (chip->fg && !power_supply_get_property(chip->fg,
 			POWER_SUPPLY_PROP_CURRENT_NOW, &pv))
 		fg_ua = pv.intval;
 
 	dev_info(chip->dev,
-		 "dc[%3d] st=%d op=%d VBUS=%dmV 2xVOUT=%dmV IBUS=%dmA | cell-VBAT=%dmV FG-I=%dmA | die=%d.%dC\n",
+		 "dc[%3d] st=%d op=%d VBUS=%dmV 2xVOUT=%dmV IBUS=%dmA | cell-VBAT=%dmV FG-I=%dmA | die=%d.%dC(raw=%d)\n",
 		 chip->dc_ticks++, state, opmode, vbus / 1000, vout * 2, ibus / 1000,
-		 vbat, fg_ua / 1000, die / 10, die % 10);
+		 vbat, fg_ua / 1000, die / 10, die % 10, die_raw);
 
 	/* engine left the active states (CHG_OFF/ERR/EOC) -> restore the buck. */
 	if (state < SM_DC_CHECK_VBAT) {
@@ -2818,6 +2845,31 @@ static int sm5440_get_property(struct power_supply *psy,
 		val->intval = !!(reg & SM5440_STATUS3_VBUS_POK);
 		return 0;
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		/*
+		 * The VBUS ADC conversion is "mV = 4096 + raw" (device-own
+		 * sm5440_convert_adc, SM5440_ADC_VBUS) -- a hard offset, so the
+		 * register cannot express zero: with no cable attached the raw 0
+		 * surfaces as an entirely believable 4.1 V.  Gate the published
+		 * voltage on the cable-presence bit the device-own driver itself
+		 * uses for exactly this question -- STATUS3 bit 5, VBUS_POK, as
+		 * read by its psy_chg_get_status() -- and report a plain 0 when
+		 * there is no input rail to measure.
+		 *
+		 * The gate lives HERE, at the psy boundary, and deliberately NOT
+		 * inside sm5440_get_vbus_uv(): that getter has ~10 engine callers
+		 * (DC-enable VBUS floor, stop-TA verify, PPS target verify) whose
+		 * comparisons would change meaning if it started returning 0.
+		 *
+		 * IBUS needs no such gate -- sm5440_get_ibus_ua() is raw * 625
+		 * with no offset, so it already reports 0 A on an absent cable.
+		 */
+		ret = regmap_read(chip->regmap, SM5440_REG_STATUS3, &reg);
+		if (ret)
+			return ret;
+		if (!(reg & SM5440_STATUS3_VBUS_POK)) {
+			val->intval = 0;
+			return 0;
+		}
 		return sm5440_get_vbus_uv(chip, &val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		return sm5440_get_ibus_ua(chip, &val->intval);
