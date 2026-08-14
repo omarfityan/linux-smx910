@@ -32,6 +32,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/power/sm5714-battery-age.h>
 #include <linux/power_supply.h>
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
@@ -131,6 +132,33 @@
 #define SM5714_CHARGE_CURRENT_MIN	500	/* safe floor (hw default) */
 #define SM5714_CHARGE_CURRENT_TA	2100	/* device-own (0x834) */
 #define SM5714_CHGCNTL2_MAX_OFFSET	134	/* register cap == 2100 mA */
+
+/*
+ * Charge ceiling -- the float voltage the charger regulates the cell to
+ * (CHGCNTL4 reg 0x1A, BATREG field bits[5:0]).
+ *
+ * 🔴 Nothing in this port used to program this register, so the cell was held
+ * at whatever the bootloader left behind.  Measured on this device that is
+ * BATREG 0x27 = 4380 mV, while the vendor's own device tree asks for 4440 mV
+ * (battery,chg_float_voltage = <0x1158>) on a pack of this age.  The pack was
+ * therefore being charged 60 mV short of what the vendor charges it to -- which
+ * is most of the reason it never reached a full reading, and is also why the
+ * vendor's own full-charge threshold could not be met: full_condition_vcell is
+ * 4390 mV, ABOVE the ceiling the cell was being held at.
+ *
+ * The ceiling is not a constant.  The vendor de-rates it with pack cycles
+ * (sec_bat_set_aging_info(), sec_battery.c:2230-2236), so the value programmed
+ * here comes from the shared aging table keyed on the gauge's cycle count.
+ *
+ * Encoder transcribed from the device's own downstream driver,
+ * sm5714_charger.c:195-221 chg_set_batreg().  Bit 6 of the same register is the
+ * hardware auto-stop enable and is left exactly as found: it is set by the
+ * bootloader, it is what actually terminates the charge, and this driver has no
+ * business clearing it.
+ */
+#define SM5714_CHG_REG_CHGCNTL4		0x1a
+#define SM5714_CHGCNTL4_BATREG_MASK	0x3f
+#define SM5714_BATREG_MAX_MV		4620	/* chip ceiling; refuse above this */
 
 /*
  * Cell temperature window for the raised charge current (units: 0.1 C from the
@@ -522,6 +550,64 @@ static u8 sm5714_chgcurr_offset(int ma)
 }
 
 /*
+ * CHGCNTL4 BATREG field encoder, transcribed from the device's own downstream
+ * chg_set_batreg() (sm5714_charger.c:195-221).  Three different step sizes:
+ * 50 mV below 3.9 V, 100 mV to 4.05 V, then 10 mV up to the 4.62 V chip cap.
+ * Returns a negative error for a voltage the field cannot express, rather than
+ * the vendor's silent fall back to a 4.2 V default -- a caller here always has a
+ * table value in hand, so an out-of-range request means the table is wrong and
+ * should be loud, not quietly re-aimed at a different cell voltage.
+ */
+static int sm5714_batreg_offset(unsigned int mv)
+{
+	if (mv > SM5714_BATREG_MAX_MV)
+		return -ERANGE;
+	if (mv <= 3700)
+		return 0;
+	if (mv < 3900)
+		return (mv - 3700) / 50;
+	if (mv < 4050)
+		return ((mv - 3900) / 100) + 4;
+	return ((mv - 4050) / 10) + 6;
+}
+
+/*
+ * Pack cycle count, read from the fuel gauge's power_supply node.
+ *
+ * 🔴 Callers MUST NOT hold sv->lock across this.  It reaches into the fuel-gauge
+ * driver, whose own full-charge check calls power_supply_am_i_supplied() and so
+ * reaches back into this driver's get_property, which takes sv->lock.  Reading
+ * cycles under sv->lock would close that cycle into an AB-BA deadlock.
+ *
+ * The gauge is looked up per call rather than cached at probe: the two drivers
+ * bind independently with no ordering guarantee, so at this driver's probe the
+ * gauge may not exist yet.  Doing the lookup from the poll worker turns that
+ * from a permanent failure into a retry three seconds later.
+ *
+ * Returns the cycle count, or a negative error when the gauge is not (yet)
+ * available -- which the caller must treat as "do not program", NOT as zero
+ * cycles, since zero selects the highest ceiling in the table.
+ */
+static int sm5714_read_pack_cycles(void)
+{
+	union power_supply_propval val;
+	struct power_supply *fg_psy;
+	int ret;
+
+	fg_psy = power_supply_get_by_name("sm5714-fuelgauge");
+	if (!fg_psy)
+		return -ENODEV;
+
+	ret = power_supply_get_property(fg_psy, POWER_SUPPLY_PROP_CYCLE_COUNT,
+					&val);
+	power_supply_put(fg_psy);
+	if (ret)
+		return ret;
+
+	return val.intval;
+}
+
+/*
  * Read the cell temperature (0.1 C) from the external battery NTC on the gen3
  * PMIC ADC (PM8550 AMUX1, virtual channel 0x144).  This is the real cell
  * thermistor the device's own battery layer gates charging on (its DT sets
@@ -679,6 +765,14 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 	bool dc_intent = false;		/* publish to the SM5440 supervisor at the
 					 * common exit; false on every early-out */
 	u8 offset;
+	int cycles;
+
+	/*
+	 * Read the pack cycle count BEFORE taking sv->lock -- see
+	 * sm5714_read_pack_cycles() for why holding the lock across it deadlocks
+	 * against the fuel gauge.
+	 */
+	cycles = sm5714_read_pack_cycles();
 
 	mutex_lock(&sv->lock);
 
@@ -830,6 +924,46 @@ static void sm5714_vbus_charger_work(struct work_struct *work)
 					  offset);
 		dev_info(&sv->chg->dev, "cell charge current set to %d mA\n",
 			 charge_ma);
+	}
+
+	/*
+	 * 3) charge ceiling / float voltage (CHGCNTL4 BATREG field).
+	 *
+	 * Only with a source attached: with nothing plugged in the charger is not
+	 * regulating anything, so there is no reason to spend an i2c write, and
+	 * the register is preserved for the next attach either way.
+	 *
+	 * An unreadable cycle count means the value that selects the vendor's
+	 * aging row is unknown, so nothing is programmed at all.  Substituting
+	 * zero would select the NEW-pack row, which carries the HIGHEST ceiling
+	 * in the table -- exactly the wrong way to fail on a pack whose age we
+	 * could not establish.
+	 *
+	 * Only the BATREG field is touched; the rest of the register, including
+	 * the bootloader's auto-stop enable in bit 6, is written back unchanged.
+	 */
+	if (vbus && cycles >= 0) {
+		const struct sm5714_age_step *age = sm5714_age_step_for(cycles);
+		int want = sm5714_batreg_offset(age->float_mv);
+
+		if (want < 0) {
+			dev_warn_once(&sv->chg->dev,
+				      "aging table float voltage %u mV is not representable; leaving charge ceiling alone\n",
+				      age->float_mv);
+		} else {
+			cur = i2c_smbus_read_byte_data(sv->chg,
+						       SM5714_CHG_REG_CHGCNTL4);
+			if (cur >= 0 &&
+			    (cur & SM5714_CHGCNTL4_BATREG_MASK) != want) {
+				i2c_smbus_write_byte_data(sv->chg,
+					SM5714_CHG_REG_CHGCNTL4,
+					(cur & ~SM5714_CHGCNTL4_BATREG_MASK) | want);
+				dev_info(&sv->chg->dev,
+					 "charge ceiling set to %u mV (pack cycles %d, was field 0x%02x)\n",
+					 age->float_mv, cycles,
+					 cur & SM5714_CHGCNTL4_BATREG_MASK);
+			}
+		}
 	}
 
 	/*
