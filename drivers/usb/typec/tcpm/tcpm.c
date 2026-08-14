@@ -3469,6 +3469,7 @@ static void tcpm_pd_ctrl_request(struct tcpm_port *port,
 	enum pd_ctrl_msg_type type = pd_header_type_le(msg->header);
 	enum tcpm_state next_state;
 	unsigned int rev = pd_header_rev_le(msg->header);
+	bool pps_changed;
 
 	/*
 	 * Stop VDM state machine if interrupted by other Messages while NOT_SUPP is allowed in
@@ -3636,13 +3637,34 @@ static void tcpm_pd_ctrl_request(struct tcpm_port *port,
 						   PD_HEADER_ID_MASK;
 				port->pps_nr_tx_failed = false;
 			}
+			/*
+			 * A PPS contract is kept alive by re-Requesting it,
+			 * and the source Accepts every one of those. Most
+			 * carry the operating point already in force, so
+			 * notifying unconditionally here emits a change event
+			 * for no change -- measured at 98 events for 4 real
+			 * operating-point transitions over 180 s of charging,
+			 * each one waking every power-supply consumer
+			 * (upower re-walks sysfs on each).
+			 *
+			 * Entering PPS is itself a change, hence the
+			 * !pps_data.active term.
+			 */
+			pps_changed = !port->pps_data.active ||
+				port->pps_data.min_volt != port->pps_data.req_min_volt ||
+				port->pps_data.max_volt != port->pps_data.req_max_volt ||
+				port->pps_data.max_curr != port->pps_data.req_max_curr ||
+				port->req_supply_voltage != port->pps_data.req_out_volt ||
+				port->req_current_limit != port->pps_data.req_op_curr;
+
 			port->pps_data.active = true;
 			port->pps_data.min_volt = port->pps_data.req_min_volt;
 			port->pps_data.max_volt = port->pps_data.req_max_volt;
 			port->pps_data.max_curr = port->pps_data.req_max_curr;
 			port->req_supply_voltage = port->pps_data.req_out_volt;
 			port->req_current_limit = port->pps_data.req_op_curr;
-			power_supply_changed(port->psy);
+			if (pps_changed)
+				power_supply_changed(port->psy);
 			tcpm_set_state(port, SNK_TRANSITION_SINK, 0);
 			break;
 		case SOFT_RESET_SEND:
