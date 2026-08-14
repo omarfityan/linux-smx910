@@ -217,29 +217,61 @@
 #define SM5440_SIOP_LEV2	1700
 #define SM5440_DC_TOPOFF_MA	1000
 #define SM5440_DC_CHG_FLOAT_MV	4440
-#define SM5440_DC_STEP0_VBAT_MV	4250	/* step-0 (<=62% SoC) cell-V ceiling */
+/* (no SM5440_DC_STEP0_VBAT_MV: the per-step cell-V targets live in
+ * sm5440_dc_step_vbat[] below, indexed by the step the run starts in.  A separate
+ * step-0 constant would be a second home for one of those values and an invitation
+ * to re-pin the engine's seed to step 0.) */
 #define SM5440_VBAT_MIN		3300	/* device-own SM5440_VBAT_MIN / dc_min_vbat */
 
 /*
- * Increment-3b-4 auto-engage supervisor gates + the device-own 3-step
- * direct-charge ladder.  The supervisor engages at SoC < the step-0 ceiling
- * (62 %), starts in step 0, and walks the LIVE engine up through steps 1 and 2
- * by re-targeting vbat/ibus at each boundary (sm_dc_set_target_vbat/ibus -- the
- * engine re-ramps inside the live PD contract, no re-negotiation); the buck owns
- * the final dchg_end_soc -> 100 % tail.  The ongoing N->N+1 transition mirrors the
- * device-own min(step_vol, step_input) with SoC start-only (gts9u DT
- * dc_step_chg_type 0xe9 = SOC_INIT_ONLY|INPUT_CURRENT|FLOAT_VOLTAGE|ONLINE|
- * VOLTAGE): advance when (FG cell-V + v_margin >= cond_vol[N]) AND
- * (IBUS <= cond_iin[N]), debounced iin_check_cnt ticks.  All values transcribed
- * from the device's own DT: cond_vol == val_vfloat 4250/4420/4440 mV; val_iout
- * (CELL current) 9000/8200/4000 -> engine IBUS = val_iout/2 for the 2:1 pump =
- * 4500/4100/2000 mA; cond_iin[N] = val_iout[N+1]/2 = 4100/2000 mA; v_margin 40 mV;
- * iin_check_cnt 3; dchg_end_soc default 95.  This validation ships the ladder from
- * a sub-step-0 plug; start-step-by-SoC + a high-SoC engage are a deferred
- * completeness edge (the buck owns a high-SoC plug for now).
+ * The auto-engage supervisor gates + the device-own 3-step direct-charge ladder.
+ * The supervisor engages whenever the device-own gates pass (see the engage-policy
+ * comment below), starts in the step SoC selects, and walks the LIVE engine up
+ * through the remaining steps by re-targeting vbat/ibus at each boundary
+ * (sm_dc_set_target_vbat/ibus -- the engine re-ramps inside the live PD contract,
+ * no re-negotiation); the buck owns the final dchg_end_soc -> 100 % tail.
+ *
+ * Both halves of the device-own rule are now implemented, per gts9u DT
+ * dc_step_chg_type 0xe9 = SOC_INIT_ONLY|INPUT_CURRENT|FLOAT_VOLTAGE|ONLINE|VOLTAGE:
+ *
+ *   SOC_INIT_ONLY  the START step, chosen once per run from SoC over cond_soc
+ *                  {62, 79, 100} -- sm5440_dc_start_step(), seeded in dc_start.
+ *   the rest       the ongoing N->N+1 transition, min(step_vol, step_input):
+ *                  advance when (FG cell-V + v_margin >= cond_vol[N]) AND
+ *                  (IBUS <= cond_iin[N]), debounced iin_check_cnt ticks.
+ *
+ * All values transcribed from the device's own DT: cond_vol == val_vfloat
+ * 4250/4420/4440 mV; val_iout (CELL current) 9000/8200/4000 -> engine IBUS =
+ * val_iout/2 for the 2:1 pump = 4500/4100/2000 mA; cond_iin[N] = val_iout[N+1]/2 =
+ * 4100/2000 mA; v_margin 40 mV; iin_check_cnt 3; dchg_end_soc default 95;
+ * dchg_min_vbat 3400 mV.
+ *
+ * (The start-step-by-SoC half was previously deferred, which is what made a
+ * high-SoC plug fall to the buck at ~9 W instead of the pump's ~45 W.)
  */
-#define SM5440_AUTO_ENGAGE_SOC		62	/* engage only when SoC < this (device-own step-0 start) */
-#define SM5440_AUTO_DISENGAGE_SOC	95	/* disengage at/above = device-own dchg_end_soc; buck finishes 95->100 */
+/*
+ * The engage policy, transcribed from the device-own
+ * sec_direct_charger.c::sec_direct_charger_check_charging_source().  Stock picks
+ * SEC_CHARGING_SOURCE_DIRECT unless one of its gates fires: no APDO source,
+ * status Full/NotCharging/Discharging, the direct_chg_done latch, temperature,
+ * a blocking current-event, store mode, capacity >= dchg_end_soc, or
+ * voltage_avg < dchg_min_vbat.
+ *
+ * 🔴 There is NO minimum-SoC condition anywhere in it.  Stock engages the pump at
+ * ANY SoC below dchg_end_soc, and the only voltage-shaped gate runs the OPPOSITE
+ * way to a ceiling -- it refuses direct charging when the pack is too LOW.
+ *
+ * SoC 62 was never an engage gate.  It is dc_step_chg_cond_soc[0], which the
+ * device-own driver uses to choose the ladder step a run STARTS in (transcribed
+ * in sm5440_dc_start_step()).  Using it to decide whether to start at all left
+ * every plug-in or reboot above 62 % on the buck at ~9 W instead of ~45 W, until
+ * the pack happened to drain below it.
+ */
+#define SM5440_AUTO_DISENGAGE_SOC	95	/* device-own charger,end_soc default (dchg_end_soc); the SAME
+						 * threshold gates engage and disengage, exactly as stock's
+						 * single "capacity >= dchg_end_soc -> switching" test does */
+#define SM5440_DCHG_MIN_VBAT_MV		3400	/* device-own charger,dchg_min_vbat = <0xd48>; below this the
+						 * pack is too low for direct charging and the buck owns it */
 #define SM5440_AUTO_ENGAGE_CI_GL	4500	/* engage/low-VBAT IBUS goal (mA) = the device-own step-0,
 						 * val_iout[0]/2 (sm5440_dc_step_ibus[0]).  This is the vendor's own
 						 * authority for the input-current goal and is what stock requests.
@@ -322,6 +354,21 @@ static const u32 sm5440_dc_step_vbat[SM5440_DC_STEP_MAX + 1]     = { 4250, 4420,
 static const u32 sm5440_dc_step_ibus[SM5440_DC_STEP_MAX + 1]     = { 4500, 4100, 2000 }; /* val_iout/2 IBUS (mA) */
 static const u32 sm5440_dc_step_cond_vol[SM5440_DC_STEP_MAX + 1] = { 4250, 4420, 4440 }; /* cond_vol (mV) */
 static const u32 sm5440_dc_step_cond_iin[SM5440_DC_STEP_MAX]     = { 4100, 2000 };       /* val_iout[N+1]/2 (mA) */
+static const u32 sm5440_dc_step_cond_soc[SM5440_DC_STEP_MAX + 1] = { 62, 79, 100 };      /* cond_soc (%) */
+
+/*
+ * cond_soc is the device-own battery,dc_step_chg_cond_soc = <0x3e 0x4f 0x64>.
+ *
+ * The device-own driver indexes this as cond_soc[age_step][step] -- a 2-D array
+ * over five age rows (age_data_cycle = <0 300 400 700 1000>).  It is age-INVARIANT
+ * on this device: the DT supplies a single 3-value row, and the vendor's own parser
+ * detects that (dc_step_chg_step * num_age_step != len) and replicates row 0 across
+ * every age row -- its comment reads "if there are only 1 dimentional array of
+ * value, get the same value".  So one flat table is faithful here, not a flattening.
+ *
+ * ⚠ Not to be confused with the age de-rating on the pack CEILING, which comes from
+ * a different property (age_data_chg_float_voltage_offset) and IS age-varying.
+ */
 
 /*
  * VBAT-banded ci_gl (INPUT-current) ceiling.
@@ -894,6 +941,89 @@ static int sm5440_read_soc(struct sm5440 *chip)
 	if (power_supply_get_property(chip->fg, POWER_SUPPLY_PROP_CAPACITY, &v))
 		return -1;
 	return v.intval;
+}
+
+/*
+ * The cell voltage the engage floor (dchg_min_vbat) is judged on, in mV.
+ *
+ * The device-own gate reads POWER_SUPPLY_PROP_VOLTAGE_AVG (battery->voltage_avg).
+ * Our fuel gauge does NOT expose VOLTAGE_AVG -- only VOLTAGE_NOW and VOLTAGE_OCV
+ * -- and the sm5714 gauge is known to lie on single samples (separate reads are
+ * separate i2c transactions).  A single VOLTAGE_NOW is therefore the wrong
+ * instrument for a safety floor: a spuriously HIGH sample would let direct
+ * charging start on a pack that is genuinely too low, which is the unsafe
+ * direction.  Mean a few samples -- the closest honest analogue we have to the
+ * averaged value stock actually tests.
+ *
+ * Returns -1 if the gauge could not be read at all.  A caller MUST treat that as
+ * "do not engage", never as "the floor passed".
+ */
+#define SM5440_CELL_MV_SAMPLES	3
+static int sm5440_read_cell_mv(struct sm5440 *chip)
+{
+	union power_supply_propval v = { };
+	int i, sum = 0, n = 0;
+
+	if (!sm5440_fg(chip))
+		return -1;
+
+	for (i = 0; i < SM5440_CELL_MV_SAMPLES; i++) {
+		if (power_supply_get_property(chip->fg,
+					      POWER_SUPPLY_PROP_VOLTAGE_NOW, &v))
+			continue;
+		sum += v.intval / 1000;
+		n++;
+	}
+
+	return n ? sum / n : -1;
+}
+
+/*
+ * The ladder step a run STARTS in.  Transcribed from the device-own
+ * sec_step_charging.c::sec_bat_check_dc_step_charging(), the
+ * STEP_CHARGING_CONDITION_SOC_INIT_ONLY branch (our dc_step_chg_type 0xe9 sets
+ * that bit):
+ *
+ *	step_soc = i;                                   // 0 on a fresh run
+ *	value = battery->capacity;
+ *	while (step_soc < battery->dc_step_chg_step - 1) {
+ *		soc_condition = dc_step_chg_cond_soc[age_step][step_soc];
+ *		if (value < soc_condition)
+ *			break;
+ *		step_soc++;
+ *	}
+ *	pr_info("set initial step(%d) by soc");
+ *
+ * with i = (step_chg_status < 0 ? 0 : step_chg_status), and a fresh run having
+ * step_chg_status < 0.  A dc_start IS our run boundary, so index 0 is the
+ * faithful starting point.  After the run has started, stock pins SoC to the top
+ * step and lets voltage/current drive advancement -- which is what our existing
+ * N->N+1 walk in the dc_monitor already does.
+ *
+ * With cond_soc = {62, 79, 100}: SoC < 62 -> step 0; 62..78 -> step 1;
+ * >= 79 -> step 2.
+ *
+ * ⭐ SoC < 62 returns step 0, so every run below the OLD engage gate behaves
+ * byte-for-byte as before.  This function can only change behaviour in the band
+ * where nothing engaged at all previously.
+ *
+ * An unreadable SoC returns the LAST step -- the most conservative, lowest-current
+ * one.  An unknown pack state must never select the 4500 mA step.
+ */
+static u32 sm5440_dc_start_step(int soc)
+{
+	u32 step = 0;
+
+	if (soc < 0)
+		return SM5440_DC_STEP_MAX;
+
+	while (step < SM5440_DC_STEP_MAX) {
+		if ((u32)soc < sm5440_dc_step_cond_soc[step])
+			break;
+		step++;
+	}
+
+	return step;
 }
 
 /*
@@ -2239,11 +2369,32 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	struct sm_dc_power_source_info ta = { };
 	int vbat_mv = 0, target_mv, off_mv, vbus_mv, diff, ret, engage_off, i;
 	unsigned int por;
+	u32 start_step;
+	int soc;
 
 	if (!sm5440_pd_source_usable(chip)) {
 		dev_warn(chip->dev, "dc start: no PPS contract -- arm pd_request + plug first\n");
 		return -ENOTCONN;
 	}
+
+	/*
+	 * Choose the ladder step this run STARTS in, exactly as the device-own
+	 * driver does -- once per run, from SoC (SOC_INIT_ONLY) -- and clamp the
+	 * requested input current to that step's own ceiling.  Done here rather than
+	 * at the call sites because a dc_start IS the run boundary, so every entry
+	 * (auto-engage, HRST re-engage, the manual dc_test/dc_probe paths) gets the
+	 * same rule with no caller divergence.
+	 *
+	 * ⭐ Below 62 % this returns step 0, whose ci_gl is the 4500 mA these paths
+	 * already requested -- so low-SoC runs are unchanged in every respect.  The
+	 * clamp can only bite in the band where a run previously could not start.
+	 */
+	soc = sm5440_read_soc(chip);
+	start_step = sm5440_dc_start_step(soc);
+	target_ibus_ma = min_t(u32, target_ibus_ma, sm5440_dc_step_ibus[start_step]);
+	dev_info(chip->dev,
+		 "dc start: initial step %u by soc %d%% -- vbat target %umV, ci_gl %umA\n",
+		 start_step, soc, sm5440_dc_step_vbat[start_step], target_ibus_ma);
 
 	ret = sm5714_charger_inhibit_buck(true);	/* buck OFF before pump ON */
 	if (ret) {
@@ -2342,7 +2493,7 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	ta.c_max = target_ibus_ma;
 	ta.p_max = (SM5440_DC_VBUS_OVP_TH - 500) * ta.c_max;
 
-	sm_dc_set_target_vbat(chip->dc, SM5440_DC_STEP0_VBAT_MV);
+	sm_dc_set_target_vbat(chip->dc, sm5440_dc_step_vbat[start_step]);
 	sm_dc_set_target_ibus(chip->dc, target_ibus_ma);
 
 	sm5440_fg(chip);			/* lazy-cache the persistent FG handle */
@@ -2351,7 +2502,11 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	chip->dc_done = false;		/* Build-2b: a fresh run has not topoff'd */
 	chip->dc_recover_armed = false;	/* Build-2b: a fresh run is not itself in recovery */
 	WRITE_ONCE(chip->dc_inject_hrst, false);	/* TEST: clear any stale injection arming */
-	chip->dc_step = 0;		/* the ladder starts in step 0 (engage gate keeps SoC < 62) */
+	chip->dc_step = start_step;	/* device-own SOC_INIT_ONLY: the run starts in the step SoC selects.
+					 * 🔴 At start_step > 0 the target vbat EQUALS the float (4420/4440 mV),
+					 * so unlike a step-0 run the engine CAN self-DONE.  That is stock's
+					 * behaviour, and it is why the engage gate carries the dc_done latch --
+					 * without it a self-DONE would tear down and immediately re-engage. */
 	chip->dc_step_iin_cnt = 0;
 	chip->dc_ci_applied = target_ibus_ma;	/* ratchet baseline; dc_monitor lowers it as the ladder steps.
 						 * Safe even on a high-VBAT (re-)engage: the engine PRESETs at 50% of target and
@@ -2380,8 +2535,8 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 			 SM5440_PROBE_VMAX_CEIL);
 	} else {
 		dev_info(chip->dev,
-			 "dc ENGINE STARTED (fixed): target_vbat=%dmV target_ibus=%umA -- monitoring\n",
-			 SM5440_DC_STEP0_VBAT_MV, target_ibus_ma);
+			 "dc ENGINE STARTED (fixed): step=%u target_vbat=%umV target_ibus=%umA -- monitoring\n",
+			 start_step, sm5440_dc_step_vbat[start_step], target_ibus_ma);
 	}
 	return 0;
 
@@ -2460,12 +2615,21 @@ static void sm5440_dc_intent_cb(void *ctx, bool intent)
 }
 
 /*
- * The executor.  Engage when the arbiter signals intent AND the pump-side gates
- * pass (a PPS contract is held, SoC below the step-0 ceiling, no fault latch);
- * disengage a SUPERVISOR-OWNED run when intent drops, the contract is lost, or SoC
- * reaches the disengage ceiling.  Step-0's 4250 mV != the 4440 mV float, so the
- * engine never self-DONEs and this SoC ceiling is the SOLE terminator -- an
- * unreadable SoC therefore fails SAFE to disengage (mirrors the buck's temp-read
+ * The executor.  Engage when the arbiter signals intent AND the device-own gates
+ * pass (APDO source held, SoC below dchg_end_soc, cell at or above dchg_min_vbat,
+ * done-latch clear, no fault latch); disengage a SUPERVISOR-OWNED run when intent
+ * drops, the contract is lost, or SoC reaches the same dchg_end_soc ceiling.
+ *
+ * ⚠ TERMINATION IS NO LONGER SINGLE-SOURCED.  While the engine always started in
+ * step 0, its 4250 mV target sat below the 4440 mV float, so it could never
+ * self-DONE and the SoC ceiling was the SOLE terminator.  Now that the run starts
+ * in the step SoC selects (device-own SOC_INIT_ONLY), a step-1/step-2 run targets
+ * 4420/4440 mV -- equal to the float -- and CAN self-DONE.  Both terminators are
+ * therefore live: the SoC ceiling here, and the engine's own done_cb -> dc_done ->
+ * benign-topoff teardown in the dc_monitor.  The dc_done latch in the engage gate
+ * is what keeps the second one from becoming an engage/teardown oscillator.
+ *
+ * An unreadable SoC still fails SAFE to disengage (mirrors the buck's temp-read
  * fail-to-cut).  engage_lock serializes against the manual triggers + the monitors,
  * so a concurrent invocation can never double-engage.  dc_start/dc_stop run WITHOUT
  * engage_lock held across their sync-cancels (dc_stop sync-cancels the monitors,
@@ -2476,7 +2640,7 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 	struct sm5440 *chip = container_of(work, struct sm5440,
 					   auto_engage_work.work);
 	bool intent = READ_ONCE(chip->dc_intent);
-	int soc, ret;
+	int soc, ret, cell_mv;
 
 	mutex_lock(&chip->engage_lock);
 	soc = sm5440_read_soc(chip);
@@ -2515,18 +2679,52 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 		chip->dc_err_latched = false;
 		chip->dc_retry_cnt = 0;
 		chip->dc_recover_armed = false;	/* Build-2b: unplug disarms any pending recovery */
+		WRITE_ONCE(chip->dc_done, false);	/* stock clears direct_chg_done on a cable change;
+							 * this is the ONLY place it clears, because the engage
+							 * gate below refuses to start a run while it is set --
+							 * so dc_start's own clear can never be reached first */
 		mutex_unlock(&chip->engage_lock);
 		return;
 	}
 
 	/*
-	 * Engage gates: not already on the pump, not latched-off after repeated
-	 * failures, a PPS contract is held, and SoC is known and below the step-0
-	 * ceiling (above it a step-0-only engine has nothing to do; the buck owns it).
+	 * Engage gates, transcribed from the device-own
+	 * sec_direct_charger_check_charging_source().  Ours against stock's:
+	 *
+	 *   pump_engaged / dc_err_latched  local: already on the pump, or latched off
+	 *                                  after repeated failures (stock's dc_err)
+	 *   pd_source_usable               stock's has_apdo / is_pd_apdo_wire_type()
+	 *   dc_done                        stock's direct_chg_done latch
+	 *   soc >= SM5440_AUTO_DISENGAGE_SOC   stock's capacity >= dchg_end_soc
+	 *   cell < SM5440_DCHG_MIN_VBAT_MV     stock's voltage_avg < dchg_min_vbat
+	 *
+	 * 🔴 The dc_done term is what stops a step-1/step-2 run -- whose target vbat
+	 * equals the float, so the engine CAN self-DONE -- from tearing down and
+	 * immediately re-engaging in a loop.  It is cleared only when the charger goes
+	 * away (the !intent branch above), mirroring stock, which clears
+	 * direct_chg_done on a cable change.
+	 *
+	 * An unreadable SoC still fails SAFE to "do not engage".
 	 */
 	if (chip->pump_engaged || chip->dc_err_latched ||
 	    !sm5440_pd_source_usable(chip) ||
-	    soc < 0 || soc >= SM5440_AUTO_ENGAGE_SOC) {
+	    READ_ONCE(chip->dc_done) ||
+	    soc < 0 || soc >= SM5440_AUTO_DISENGAGE_SOC) {
+		mutex_unlock(&chip->engage_lock);
+		return;
+	}
+
+	/*
+	 * Stock's low-voltage floor, read LAST so its i2c samples are only spent once
+	 * every cheaper gate has passed.  Note this refuses direct charging when the
+	 * pack is too LOW -- it is not a ceiling, and there is no SoC counterpart to
+	 * it anywhere in the device-own source.
+	 */
+	cell_mv = sm5440_read_cell_mv(chip);
+	if (cell_mv < SM5440_DCHG_MIN_VBAT_MV) {	/* -1 (unreadable) fails here too, by design */
+		dev_info(chip->dev,
+			 "auto-engage: cell %dmV below dchg_min_vbat %dmV -- buck owns it\n",
+			 cell_mv, SM5440_DCHG_MIN_VBAT_MV);
 		mutex_unlock(&chip->engage_lock);
 		return;
 	}
@@ -2559,9 +2757,15 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 	} else {
 		chip->dc_retry_cnt = 0;
 		chip->auto_engaged = true;
+		/*
+		 * Report the APPLIED step and current, read back from chip state --
+		 * not the requested constant.  dc_start clamps ci_gl to the selected
+		 * step's ceiling, so printing SM5440_AUTO_ENGAGE_CI_GL here would
+		 * claim 4500 mA on a step-2 run that actually asked for 2000.
+		 */
 		dev_info(chip->dev,
-			 "auto-engage: pump engaged at SoC %d%% (ci_gl=%u mA) -- no sysfs trigger\n",
-			 soc, SM5440_AUTO_ENGAGE_CI_GL);
+			 "auto-engage: pump engaged at SoC %d%% cell %dmV (step %u, ci_gl=%u mA) -- no sysfs trigger\n",
+			 soc, cell_mv, chip->dc_step, chip->dc_ci_applied);
 	}
 	mutex_unlock(&chip->engage_lock);
 }
@@ -2666,10 +2870,15 @@ static void sm5440_dc_reengage_work(struct work_struct *work)
 		 * the run would start AT the band value and the first dc_monitor tick would
 		 * see eff == dc_ci_applied (no immediate re-preset -> no livelock, since
 		 * dc_retry_cnt resets on each success and would never latch).  That property
-		 * is preserved for free now the band cap is gone: sm5440_dc_start() resets
-		 * dc_step to 0, so the first tick computes eff = sm5440_dc_step_ibus[0],
-		 * which IS this value -- the ratchet (one-directional, eff < dc_ci_applied)
-		 * therefore does not fire.
+		 * is preserved for free now the band cap is gone -- and it SURVIVES the
+		 * SOC_INIT_ONLY start-step selection, which is why this still reads as a flat
+		 * constant.  sm5440_dc_start() picks start_step from SoC, clamps the requested
+		 * ci_gl to sm5440_dc_step_ibus[start_step], and sets chip->dc_step =
+		 * start_step.  The first dc_monitor tick then computes
+		 * eff = sm5440_dc_step_ibus[chip->dc_step] -- the SAME index -- so
+		 * eff == dc_ci_applied exactly as before and the ratchet (one-directional,
+		 * eff < dc_ci_applied) still does not fire.  Passing the unclamped engage goal
+		 * here is therefore correct: dc_start owns the clamping.
 		 *
 		 * Do NOT "improve" this by seeding sm5440_dc_step_ibus[chip->dc_step]: that
 		 * is evaluated BEFORE dc_start resets dc_step, so after a recovery from a
