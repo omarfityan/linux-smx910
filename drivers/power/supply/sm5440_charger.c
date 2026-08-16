@@ -21,6 +21,7 @@
  * Copyright (C) 2026 omar fityan <me@omarfityan.com>
  */
 
+#include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/err.h>
@@ -640,6 +641,13 @@ struct sm5440 {
 	u8 rev_id;
 
 	/*
+	 * Accumulated INT1-4 bits consumed by the diagnostics, so the fault path
+	 * can still name a cause. See sm5440_int_shadow_fold(). Not under
+	 * engage_lock: the fault path does not hold it.
+	 */
+	atomic_t int_shadow;
+
+	/*
 	 * Increment-2: the ported sm_dc CC/CV engine drives the closed-loop ramp.
 	 * dc is the engine instance (its ops are this driver's sm5440_dc_ops);
 	 * ocp_check_work is the device-faithful SW-OCP backstop; dc_monitor is a
@@ -847,6 +855,49 @@ static int sm5440_get_op_mode(struct sm5440 *chip)
 	if (ret)
 		return ret;
 	return (reg >> SM5440_OPMODE_SHIFT) & SM5440_OPMODE_MASK;
+}
+
+/*
+ * INT1-4 shadow -- because INT is CLEAR-ON-READ and now has THREE readers.
+ *
+ * The fault path (sm5440_dc_get_dc_error_status) needs the latched cause. It used
+ * to be the only reader, and said so in a comment. Two diagnostics were then added
+ * that read INT without updating that comment: the per-tick monitor sample and the
+ * enable probe. Both CONSUME the bits, so by the time the fault path looked, the
+ * cause was gone: every "dc err:" line in the session-301 captures reported
+ * INT 00:00:00:00 and synthesised SM_DC_ERR_UNKNOWN, while the probe line one
+ * instant earlier showed the real cause (REVBLK) plainly.
+ *
+ * 🔴 A diagnostic that destroys the evidence the production path depends on. The
+ * device's own driver never has this problem: it decodes these bits in its INT-line
+ * IRQ handler, at the instant of the event. This board has no SM5440 IRQ line, so
+ * the polled path is the only place that decode can live -- which is why it must
+ * not be robbed.
+ *
+ * Every reader folds what it consumed into this shadow; the fault path ORs the
+ * shadow into its own read and takes it, so a cause is reported exactly once and
+ * never lost. Packed big-endian-ish as INT1<<24 | INT2<<16 | INT3<<8 | INT4.
+ *
+ * atomic_t rather than a lock: the monitor holds engage_lock and the fault path
+ * does not, so the two genuinely race. atomic_fetch_or/atomic_xchg make the fold
+ * and the take indivisible without introducing a lock ordering against engage_lock
+ * (which would risk the AB-BA this driver already avoids elsewhere).
+ */
+static void sm5440_int_shadow_fold(struct sm5440 *chip, const u8 in[4])
+{
+	atomic_or((in[0] << 24) | (in[1] << 16) | (in[2] << 8) | in[3],
+		  &chip->int_shadow);
+}
+
+/* Take and clear the shadow, OR-ing it into a freshly-read INT quartet. */
+static void sm5440_int_shadow_take(struct sm5440 *chip, u8 in[4])
+{
+	u32 s = atomic_xchg(&chip->int_shadow, 0);
+
+	in[0] |= (s >> 24) & 0xff;
+	in[1] |= (s >> 16) & 0xff;
+	in[2] |= (s >> 8) & 0xff;
+	in[3] |= s & 0xff;
 }
 
 static int sm5440_set_vbatreg(struct sm5440 *chip, u32 mv)
@@ -1834,6 +1885,32 @@ static int sm5440_dc_set_charging_enable(struct i2c_client *i2c, bool enable)
 		}
 	}
 
+	/*
+	 * Flush the INT latch immediately BEFORE the enable, so that anything the
+	 * shadow reports afterwards is attributable to THIS engage.
+	 *
+	 * 🔴 Without this the fix above would reintroduce the very confound it exists
+	 * to remove.  INT accumulates, and a plug-in leaves real bits behind: the
+	 * session-301 probe read REVBLK|VBUSUVLO|VBUS_POK at +0 ms on runs that then
+	 * engaged perfectly.  Folding those into the shadow would hand the fault path a
+	 * "cause" that predates the enable -- indistinguishable from a fresh trip, which
+	 * is exactly the ambiguity that made the earlier REVBLK attribution unsafe.
+	 *
+	 * Logged rather than silently dropped: a pre-existing latch is not this engage's
+	 * cause, but it is still evidence (a UVLO during the PPS settle would show here),
+	 * and a discard nobody can see is how evidence goes missing.
+	 */
+	if (enable) {
+		u8 pre[4] = { };
+
+		if (!regmap_bulk_read(chip->regmap, SM5440_REG_INT1, pre, 4) &&
+		    (pre[0] | pre[1] | pre[2] | pre[3]))
+			dev_info(chip->dev,
+				 "pre-enable INT flush: %02x:%02x:%02x:%02x (pre-existing, NOT this engage's cause)\n",
+				 pre[0], pre[1], pre[2], pre[3]);
+		atomic_set(&chip->int_shadow, 0);
+	}
+
 	ret = sm5440_set_op_mode(chip, enable ? SM5440_OPMODE_CHG_ON : SM5440_OPMODE_CHG_OFF);
 	if (ret)
 		dev_err(chip->dev, "op-mode %s WRITE FAILED (%d)\n",
@@ -1902,6 +1979,8 @@ static int sm5440_dc_set_charging_enable(struct i2c_client *i2c, bool enable)
 			/* INT1-4 share the STATUS1-4 layout (see the masks above). */
 			if (regmap_bulk_read(chip->regmap, SM5440_REG_INT1, pin, 4))
 				pin[0] = pin[1] = pin[2] = pin[3] = 0;
+			else
+				sm5440_int_shadow_fold(chip, pin);	/* clear-on-read: give it back */
 			dev_info(chip->dev,
 				 "enable probe[+%3dms]: op-mode=%d (%s) VBUS=%dmV 2xVOUT=%dmV INT %02x:%02x:%02x:%02x%s%s%s%s\n",
 				 probe_at_ms[k], opm,
@@ -1973,11 +2052,21 @@ static u32 sm5440_dc_get_dc_error_status(struct i2c_client *i2c)
 		 * device's own driver re-reads INT1-4 in this same branch despite having a
 		 * real irq, because the INT latch is what records the cause.
 		 *
-		 * Clear-on-read: this is the ONLY consumer of INT1-4 in the driver, so the
-		 * single read here neither races another reader nor destroys evidence anyone
-		 * else needs.
+		 * 🔴 This comment used to say "this is the ONLY consumer of INT1-4 in the
+		 * driver, so the single read here neither races another reader nor destroys
+		 * evidence anyone else needs."  That STOPPED BEING TRUE when the per-tick
+		 * monitor sample and the enable probe were added, and neither updated it.
+		 * INT is clear-on-read, so both were consuming the cause before this branch
+		 * could see it: every "dc err:" line in the session-301 captures reported
+		 * INT 00:00:00:00 and fell through to SM_DC_ERR_UNKNOWN, while a probe line
+		 * one instant earlier named REVBLK outright.
+		 *
+		 * Both diagnostics now fold what they consumed into chip->int_shadow, and
+		 * this branch takes it -- so the cause survives whoever happened to read the
+		 * register first.  Taking (not peeking) keeps a cause reported exactly once.
 		 */
 		int_ok = !regmap_bulk_read(chip->regmap, SM5440_REG_INT1, in, 4);
+		sm5440_int_shadow_take(chip, in);
 
 		/*
 		 * Decode from the union of latched (INT) and live (STATUS) bits.  The
@@ -2273,6 +2362,8 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 	 */
 	if (regmap_bulk_read(chip->regmap, SM5440_REG_INT1, ints, 4))
 		ints[0] = ints[1] = ints[2] = ints[3] = 0;
+	else
+		sm5440_int_shadow_fold(chip, ints);	/* clear-on-read: give it back */
 	regmap_read(chip->regmap, SM5440_REG_CNTL1, &cntl1);
 
 	dev_info(chip->dev,
