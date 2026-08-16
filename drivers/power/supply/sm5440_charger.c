@@ -127,8 +127,20 @@
 
 /*
  * Fault / status bits.  The INT1-4 registers are clear-on-read; their STATUS1-4
- * level mirrors carry the SAME bit layout and are re-readable, so a POLLED
- * driver (this board has no SM5440 irq-gpio) MUST read STATUS, never INT.
+ * level mirrors carry the SAME bit layout and are re-readable.
+ *
+ * 🔴 This comment used to conclude "so a POLLED driver MUST read STATUS, never INT."
+ * That is true for LEVEL conditions we re-sample (which loop is active, is VBUS ok)
+ * and FALSE for a latched fault, which is the case that matters: STATUS forgets a
+ * fault the instant the condition passes, while INT holds it until read.  Polling a
+ * level mirror a few hundred ms after a transient trip therefore reads all-zero and
+ * the cause is destroyed -- measured, 130 consecutive teardowns logging
+ * "STATUS 00:00:20:00" (bit 5 = VBUS_POK, a HEALTHY bit) and synthesising
+ * SM_DC_ERR_UNKNOWN because no bit was left to find.
+ *
+ * The device's own driver -- which HAS an irq -- still re-reads INT1-4 inside its
+ * op-mode-CHG_OFF branch for exactly this reason.  So: STATUS for level, INT for
+ * cause, and the CHG_OFF branch below reads both.
  */
 #define SM5440_STATUS1_VOUTOVP	BIT(4)
 #define SM5440_STATUS1_VBATOVP	BIT(3)
@@ -144,6 +156,16 @@
 #define SM5440_STATUS3_CFLY_SHORT	BIT(0)
 #define SM5440_STATUS4_MIDVBUS2VOUT	BIT(5)
 #define SM5440_STATUS4_SW_RDY	BIT(4)
+
+/*
+ * INT1-4 share the STATUS1-4 bit layout exactly (checked against the device-own
+ * sm5440_charger.h SM5440_INT*_ enums, bit for bit), so the masks above apply to an
+ * INT read unchanged.  INT4's two shutdown causes have no STATUS counterpart we
+ * decode, and are precisely the ones a level read can never show after the fact:
+ * a watchdog or charge-timer expiry turns charging off and leaves nothing behind.
+ */
+#define SM5440_INT4_WDTMROFF	BIT(2)	/* watchdog expiry turned charging off */
+#define SM5440_INT4_CHGTMROFF	BIT(1)	/* charge-timer expiry turned charging off */
 
 /* The five forced-cutoff faults to poll for during a pump engage. */
 #define SM5440_FAULT_S1		(SM5440_STATUS1_VOUTOVP)
@@ -296,6 +318,32 @@
 						 * one-directional (it only lowers).  Raising the ratchet's ceiling
 						 * without raising this seed therefore has NO effect. */
 #define SM5440_AUTO_RETRY_MAX		3	/* consecutive engage failures before latching off until replug */
+/*
+ * What a strike COUNTS, and what may clear it.
+ *
+ * dc_retry_cnt was written to count "the source is deaf -- dc_start will not even
+ * begin", and under that reading a successful dc_start really is proof the trouble
+ * passed, so clearing the counter there was right.  A succeed-then-fault loop breaks
+ * the reading: every attempt STARTS and then faults a few hundred ms later, so the
+ * success branch cleared the strike ~300 ms after it was earned and the latch could
+ * never arm.  Measured on-device: 130 consecutive engage->fault->re-engage cycles at
+ * SoC 91 %, ~3 s apart, indefinitely -- and because each cycle arms then disarms the
+ * SM5714 buck FET, the pack charged on NEITHER path.
+ *
+ * So a strike now counts ATTEMPTS, and only two things clear it:
+ *   - the charger going away (auto_engage_work's !intent branch -- stock clears its
+ *     dc_err on a cable change), and
+ *   - a run that DEMONSTRABLY RAN: SM5440_DC_HEALTHY_TICKS consecutive 1 Hz dc_monitor
+ *     ticks with the engine still in an active state.
+ * Merely reaching dc_start no longer clears anything.  A run that dies in PRE_CC never
+ * reaches one healthy tick (the monitor's very first tick already sees SM_DC_ERR), so
+ * three of them latch off and the buck keeps ownership until replug.
+ *
+ * 10 ticks ~= 10 s: comfortably longer than the ~1.3 s a failing cycle survives, and far
+ * shorter than any genuine charge, so a real run always clears its history and a
+ * transient HRST hours apart never accumulates toward a latch.
+ */
+#define SM5440_DC_HEALTHY_TICKS		10
 /*
  * dc_intent false-transition debounce depth (consecutive buck-worker false polls
  * required before committing dc_intent=false).  dc_intent is VBUS-POK keyed
@@ -1756,6 +1804,7 @@ static int sm5440_dc_get_charging_enable(struct i2c_client *i2c)
 static int sm5440_dc_set_charging_enable(struct i2c_client *i2c, bool enable)
 {
 	struct sm5440 *chip = i2c_get_clientdata(i2c);
+	int ret;
 
 	/*
 	 * Bug-1a VBUS-sanity guard (defense-in-depth): the 2:1 pump requires
@@ -1785,8 +1834,56 @@ static int sm5440_dc_set_charging_enable(struct i2c_client *i2c, bool enable)
 		}
 	}
 
-	sm5440_set_op_mode(chip, enable ? SM5440_OPMODE_CHG_ON : SM5440_OPMODE_CHG_OFF);
+	ret = sm5440_set_op_mode(chip, enable ? SM5440_OPMODE_CHG_ON : SM5440_OPMODE_CHG_OFF);
+	if (ret)
+		dev_err(chip->dev, "op-mode %s WRITE FAILED (%d)\n",
+			enable ? "CHG_ON" : "CHG_OFF", ret);
 	sm5440_enable_wdt(chip, enable);
+
+	/*
+	 * Enable-readback probe.  A capture showed the chip reading op-mode CHG_OFF
+	 * ~276 ms after this very enable, with STATUS 00:00:20:00 -- STATUS3 bit 5 is
+	 * VBUS_POK, a HEALTHY bit, and every fault bit clear.  get_dc_error_status()
+	 * cannot describe that: it assumes CHG_OFF means the chip force-cut charging and
+	 * synthesises SM_DC_ERR_UNKNOWN when it finds no cause, so "the pump never
+	 * started" and "the pump tripped" arrive as the same code.  Sampling op-mode at
+	 * +0/+50/+150 ms separates them for good:
+	 *
+	 *   already CHG_OFF at +0ms      the register write did not take (i2c/regmap);
+	 *                                nothing to do with the pump at all
+	 *   CHG_ON then CHG_OFF, no bits the chip accepted the command and aborted
+	 *                                start-up -- a soft refusal
+	 *   CHG_ON, CHG_ON, then off     it genuinely ran and tripped, and a status bit
+	 *                                should be visible at the fault
+	 *
+	 * VBUS and 2xVOUT ride along because the 2:1 pump's start-up window is defined
+	 * against them, so the numbers must be read at the same instants as the verdict.
+	 *
+	 * This costs 150 ms inside preset, before PRE_CC is queued -- deliberately
+	 * accepted, and worth stating plainly: it perturbs the timing of the thing being
+	 * measured.  It cannot change the ORDER of events (the enable still precedes the
+	 * first PRE_CC poll), only widen the gap, so a chip that stays on through +150 ms
+	 * and dies later is still reported as such by the existing poll.
+	 */
+	if (enable) {
+		static const int probe_gap_ms[] = { 0, 50, 100 };
+		int k, opm, vb, vo;
+
+		for (k = 0; k < 3; k++) {
+			if (probe_gap_ms[k])
+				msleep(probe_gap_ms[k]);
+			vb = 0;
+			vo = 0;
+			opm = sm5440_get_op_mode(chip);
+			sm5440_get_vbus_uv(chip, &vb);
+			sm5440_get_vout_mv(chip, &vo);
+			dev_info(chip->dev,
+				 "enable probe[+%dms]: op-mode=%d (%s) VBUS=%dmV 2xVOUT=%dmV\n",
+				 k == 0 ? 0 : (k == 1 ? 50 : 150), opm,
+				 opm == SM5440_OPMODE_CHG_ON ? "CHG_ON" : "not-CHG_ON",
+				 vb / 1000, vo * 2);
+		}
+	}
 	return 0;
 }
 
@@ -1835,17 +1932,46 @@ static u32 sm5440_dc_get_dc_error_status(struct i2c_client *i2c)
 	op_mode = sm5440_get_op_mode(chip);
 
 	if (op_mode == SM5440_OPMODE_CHG_OFF) {
-		/* the chip force-cut charging off: identify which fault latched. */
-		if (st[0] & SM5440_STATUS1_VOUTOVP)	err |= SM_DC_ERR_VOUTOVP;
-		if (st[2] & SM5440_STATUS3_VBUSOVP)	err |= SM_DC_ERR_VBUSOVP;
-		if (st[2] & SM5440_STATUS3_STUP_FAIL)	err |= SM_DC_ERR_STUP_FAIL;
-		if (st[2] & SM5440_STATUS3_REVBLK)	err |= SM_DC_ERR_REVBLK;
-		if (st[2] & SM5440_STATUS3_CFLY_SHORT)	err |= SM_DC_ERR_CFLY_SHORT;
-		if (st[2] & SM5440_STATUS3_VBUSUVLO)	err |= SM_DC_ERR_VBUSUVLO;
+		u8 in[4] = { };
+		bool int_ok;
+
+		/*
+		 * The chip is not in charging mode.  Read the LATCHED causes.  STATUS has
+		 * already forgotten any fault whose condition has passed, which is exactly
+		 * why this branch used to report "00:00:20:00" -- nothing but VBUS_POK, a
+		 * healthy bit -- and synthesise SM_DC_ERR_UNKNOWN 130 times running.  The
+		 * device's own driver re-reads INT1-4 in this same branch despite having a
+		 * real irq, because the INT latch is what records the cause.
+		 *
+		 * Clear-on-read: this is the ONLY consumer of INT1-4 in the driver, so the
+		 * single read here neither races another reader nor destroys evidence anyone
+		 * else needs.
+		 */
+		int_ok = !regmap_bulk_read(chip->regmap, SM5440_REG_INT1, in, 4);
+
+		/*
+		 * Decode from the union of latched (INT) and live (STATUS) bits.  The
+		 * device-own driver tests only INT3_VBUSUVLO here and lumps every other
+		 * cause into UNKNOWN; folding the remaining bits in cannot change BEHAVIOUR
+		 * -- the engine treats every err > SM_DC_ERR_NONE identically, as
+		 * SM_DC_ERR -- it only names the cause instead of discarding it.
+		 */
+		if ((st[0] | in[0]) & SM5440_STATUS1_VOUTOVP)	 err |= SM_DC_ERR_VOUTOVP;
+		if ((st[2] | in[2]) & SM5440_STATUS3_VBUSOVP)	 err |= SM_DC_ERR_VBUSOVP;
+		if ((st[2] | in[2]) & SM5440_STATUS3_STUP_FAIL)	 err |= SM_DC_ERR_STUP_FAIL;
+		if ((st[2] | in[2]) & SM5440_STATUS3_REVBLK)	 err |= SM_DC_ERR_REVBLK;
+		if ((st[2] | in[2]) & SM5440_STATUS3_CFLY_SHORT) err |= SM_DC_ERR_CFLY_SHORT;
+		if ((st[2] | in[2]) & SM5440_STATUS3_VBUSUVLO)	 err |= SM_DC_ERR_VBUSUVLO;
 		if (err == SM_DC_ERR_NONE)
 			err = SM_DC_ERR_UNKNOWN;
-		dev_err(chip->dev, "dc err: op-mode CHG_OFF, STATUS %02x:%02x:%02x:%02x -> 0x%x\n",
-			st[0], st[1], st[2], st[3], err);
+
+		dev_err(chip->dev,
+			"dc err: op-mode CHG_OFF, STATUS %02x:%02x:%02x:%02x INT %02x:%02x:%02x:%02x%s%s%s -> 0x%x\n",
+			st[0], st[1], st[2], st[3], in[0], in[1], in[2], in[3],
+			int_ok ? "" : " (INT READ FAILED)",
+			(in[3] & SM5440_INT4_WDTMROFF) ? " WDT-OFF" : "",
+			(in[3] & SM5440_INT4_CHGTMROFF) ? " CHGTMR-OFF" : "",
+			err);
 		return err;
 	}
 
@@ -2044,6 +2170,7 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 	union power_supply_propval pv;
 	unsigned int raw;
 	int die_raw = -1;
+	int ta_req_mv = 0, pps_applied_mv = -1;
 
 	mutex_lock(&chip->engage_lock);
 	if (!chip->dc_running) {
@@ -2073,11 +2200,28 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 	if (chip->fg && !power_supply_get_property(chip->fg,
 			POWER_SUPPLY_PROP_CURRENT_NOW, &pv))
 		fg_ua = pv.intval;
+	/*
+	 * REQUESTED vs APPLIED PPS voltage, side by side.  The engine's own
+	 * "[send PWR_MSG] v=..." line prints sm_dc->ta.v -- what we ASKED for -- and
+	 * nothing has ever logged what the source actually settled at.  A capture then
+	 * showed ta.v walking 10500 -> 9540 mV while the measured VBUS sat pinned near
+	 * 9128 mV, which admits three incompatible readings (the source is in current
+	 * limit / the cable drops ~0.66 ohm / the request was never applied) and the
+	 * existing logs cannot tell them apart.  tcpm's own voltage_now is the applied
+	 * setpoint, so printing it beside ta.v and VBUS separates all three.
+	 * -1 = unreadable, which is not a real zero.
+	 */
+	if (chip->dc)
+		ta_req_mv = chip->dc->ta.v;
+	if (chip->tcpm_psy && !power_supply_get_property(chip->tcpm_psy,
+			POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv))
+		pps_applied_mv = pv.intval / 1000;
 
 	dev_info(chip->dev,
-		 "dc[%3d] st=%d op=%d VBUS=%dmV 2xVOUT=%dmV IBUS=%dmA | cell-VBAT=%dmV FG-I=%dmA | die=%d.%dC(raw=%d)\n",
+		 "dc[%3d] st=%d op=%d VBUS=%dmV 2xVOUT=%dmV IBUS=%dmA | cell-VBAT=%dmV FG-I=%dmA | die=%d.%dC(raw=%d) | pps req=%dmV applied=%dmV\n",
 		 chip->dc_ticks++, state, opmode, vbus / 1000, vout * 2, ibus / 1000,
-		 vbat, fg_ua / 1000, die / 10, die % 10, die_raw);
+		 vbat, fg_ua / 1000, die / 10, die % 10, die_raw,
+		 ta_req_mv, pps_applied_mv);
 
 	/* engine left the active states (CHG_OFF/ERR/EOC) -> restore the buck. */
 	if (state < SM_DC_CHECK_VBAT) {
@@ -2095,26 +2239,54 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 			      (rsoc >= 0 && rsoc >= SM5440_AUTO_DISENGAGE_SOC);
 
 		WRITE_ONCE(chip->dc_inject_hrst, false);	/* TEST: the injection (if any) has now fired */
-		dev_warn(chip->dev, "dc engine stopped (state=%d, %s) -> restoring buck\n",
-			 state, benign ? "benign topoff" : "HRST/fault");
+		dev_warn(chip->dev, "dc engine stopped (state=%d, err=0x%x, %s, ran %d ticks) -> restoring buck\n",
+			 state, chip->dc ? chip->dc->err : 0,
+			 benign ? "benign topoff" : "HRST/fault", chip->dc_ticks);
 		sm5440_dc_teardown(chip);		/* clears dc_running + auto_engaged */
 
 		/*
 		 * A supervisor-owned run that stopped mid-charge without a topoff = an
-		 * HRST/fault teardown -> arm the recovery worker (re-activate PPS +
-		 * re-engage), bounded by the 3-strike latch.  A benign topoff, a manual
-		 * dc_test run (!was_auto), or an already-latched state is left alone.
+		 * HRST/fault teardown.  This IS the strike site: the fault happens AFTER a
+		 * successful dc_start, so counting only dc_start failures made the loop
+		 * invisible to the latch (see SM5440_DC_HEALTHY_TICKS).  Count the attempt
+		 * here, then either arm the recovery worker or -- on the third strike --
+		 * latch off and leave the buck in undisputed ownership until a replug.
+		 *
+		 * A benign topoff, a manual dc_test run (!was_auto), or an already-latched
+		 * state is left alone and earns no strike.
 		 */
 		if (was_auto && !benign && !chip->dc_err_latched) {
-			chip->dc_recover_armed = true;
-			mod_delayed_work(system_long_wq, &chip->dc_reengage_work,
-					 msecs_to_jiffies(SM5440_REENGAGE_DELAY_MS));
-			dev_info(chip->dev,
-				 "reengage: armed (was_auto=1 soc=%d%%) -- attempting PPS recovery\n",
-				 rsoc);
+			if (++chip->dc_retry_cnt >= SM5440_AUTO_RETRY_MAX) {
+				chip->dc_err_latched = true;
+				chip->dc_recover_armed = false;
+				dev_warn(chip->dev,
+					 "reengage: %d post-start faults -- latching off until charger replug (buck keeps the pack)\n",
+					 chip->dc_retry_cnt);
+			} else {
+				chip->dc_recover_armed = true;
+				mod_delayed_work(system_long_wq, &chip->dc_reengage_work,
+						 msecs_to_jiffies(SM5440_REENGAGE_DELAY_MS));
+				dev_info(chip->dev,
+					 "reengage: armed (was_auto=1 soc=%d%%, strike %d/%d) -- attempting PPS recovery\n",
+					 rsoc, chip->dc_retry_cnt, SM5440_AUTO_RETRY_MAX);
+			}
 		}
 		mutex_unlock(&chip->engage_lock);
 		return;
+	}
+
+	/*
+	 * Past the teardown check, so the engine is ALIVE this tick.  This is the only
+	 * place a strike may be forgiven other than an unplug: a run that has sustained
+	 * SM5440_DC_HEALTHY_TICKS ticks has demonstrably charged, so whatever earned the
+	 * earlier strikes is over.  Deliberately NOT cleared by a successful dc_start --
+	 * that is precisely the reset which let a succeed-then-fault loop run forever.
+	 */
+	if (chip->dc_retry_cnt && chip->dc_ticks >= SM5440_DC_HEALTHY_TICKS) {
+		dev_info(chip->dev,
+			 "dc: %d healthy ticks -- clearing %d strike(s); the run is sound\n",
+			 chip->dc_ticks, chip->dc_retry_cnt);
+		chip->dc_retry_cnt = 0;
 	}
 
 	/*
@@ -2755,9 +2927,13 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 				 ret, chip->dc_retry_cnt, SM5440_AUTO_RETRY_MAX);
 		}
 	} else {
-		chip->dc_retry_cnt = 0;
 		chip->auto_engaged = true;
 		/*
+		 * NOTE: starting is NOT success, so no dc_retry_cnt = 0 here.  Only an
+		 * unplug or SM5440_DC_HEALTHY_TICKS of sustained running clears a strike;
+		 * clearing on dc_start return is what made the succeed-then-fault loop
+		 * unlatched and unbounded.
+		 *
 		 * Report the APPLIED step and current, read back from chip state --
 		 * not the requested constant.  dc_start clamps ci_gl to the selected
 		 * step's ceiling, so printing SM5440_AUTO_ENGAGE_CI_GL here would
@@ -2893,7 +3069,12 @@ static void sm5440_dc_reengage_work(struct work_struct *work)
 
 		ret = sm5440_dc_start(chip, reengage_ci, false);
 		if (!ret) {
-			chip->dc_retry_cnt = 0;
+			/*
+			 * Again: no dc_retry_cnt = 0.  The recovery attempt has STARTED, which
+			 * says nothing about whether it will survive -- in the 130-cycle loop
+			 * every one of these succeeded and then faulted ~300 ms later.  The
+			 * strike stands until the dc_monitor sees the run stay up.
+			 */
 			chip->auto_engaged = true;
 			chip->dc_recover_armed = false;
 			dev_info(chip->dev,
