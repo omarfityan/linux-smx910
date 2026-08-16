@@ -591,6 +591,38 @@ static const u32 sm5440_dc_step_cond_soc[SM5440_DC_STEP_MAX + 1] = { 62, 79, 100
 #define SM5440_PROBE_COLLAPSE_MV 200
 
 /*
+ * PRE-ENGAGE RAIL ACCEPTANCE.  The old test was |VBUS - target| <= target/10, i.e. a
+ * 976 mV window at a 9788 mV target, and it accepted the FIRST read.  Measured, three
+ * separate captures: it passed a 708 mV miss, a 680 mV miss and a 290 mV overshoot, then
+ * handed a rail that had not arrived to the engine.  Its own abort text says "(PPS not
+ * transitioned)", so the gate was named for exactly the condition it was letting through.
+ *
+ * Two things are wrong with a single proportional band, and both are fixed here.
+ *
+ * ASYMMETRY.  The measured distributions are not symmetric about the target:
+ *     healthy runs OVERSHOOT   +282, +290 mV   (the rail is above target, coming down)
+ *     failing runs UNDERSHOOT  -680, -708 mV   (the rail is below target, climbing)
+ * A symmetric 300 mV bound would clear the healthy runs by only 10-18 mV -- one ADC
+ * wobble from aborting a good engage -- so the bound is tight BELOW and generous ABOVE.
+ *
+ * STATIONARITY, which is the part that actually matters.  Proximity alone cannot
+ * distinguish "arrived" from "passing through": every run that later latched REVBLK had
+ * a rail that still had to move at the instant CHG_ON was asserted, while the one run
+ * that survived eleven seconds enabled onto a rail that was going nowhere.  Requiring
+ * two CONSECUTIVE reads that agree with each other, not merely one read that is close
+ * to the target, is what separates them.
+ *
+ * It also disposes of a confound the old gate could not see.  sm5440_get_vbus_uv() reads
+ * the SM5440's own ADC, which LAGS after the sw_reset just above (the reason this loop
+ * re-reads at all), so a single sample cannot tell a moving rail from a stale
+ * conversion.  Both resolve the same way: wait until two successive reads agree.
+ */
+#define SM5440_DC_SETTLE_UNDER_MV	300	/* tight: how far BELOW target is acceptable */
+#define SM5440_DC_SETTLE_OVER_MV	1000	/* loose: how far ABOVE target is acceptable */
+#define SM5440_DC_SETTLE_STABLE_MV	50	/* read N vs read N-1 -> "stationary" */
+#define SM5440_DC_RAIL_MOVING_MV	50	/* pre-enable slope over 100 ms -> "MOVING" */
+
+/*
  * Mainline-tcpm PPS bridge (Increment-3c, upstream-readiness).  The pump steps
  * the PPS contract through tcpm's source power-supply.  ONLINE-write states are
  * private to tcpm.c (no exported header) so they are hand-replicated here.  The
@@ -1964,6 +1996,56 @@ static int sm5440_dc_set_charging_enable(struct i2c_client *i2c, bool enable)
 	if (enable) {
 		u8 pre[4] = { };
 
+		/*
+		 * PRE-ENABLE RAIL-MOTION PROBE.  Is the rail STATIONARY at the instant we
+		 * assert CHG_ON, or still travelling?
+		 *
+		 * Every run that latched REVBLK enabled onto a rail that still had to move
+		 * (two had to fall ~290 mV, three had to climb ~680 mV); the single run that
+		 * survived eleven seconds enabled onto a rail that was going nowhere, because
+		 * PPS was inactive and no request had ever been sent.  A rail slewing under a
+		 * 2:1 converter can put VBUS transiently below 2*VOUT, which is precisely the
+		 * condition reverse-blocking exists to detect.  Nothing has ever measured it.
+		 *
+		 * 🔴 BOTH numbers are logged, and that is the whole point.  The SM5440 ADC
+		 * alone CANNOT answer the question: it lags after sw_reset, so a walking
+		 * reading is equally consistent with a moving rail and with a stale
+		 * conversion catching up.  tcpm's VOLTAGE_NOW is the negotiated CONTRACT --
+		 * it moves only when a PPS Request lands -- so the pair discriminates:
+		 *
+		 *   ADC walks, contract CONSTANT   -> the ADC is catching up (or the source is
+		 *                                     still slewing to an EARLIER request)
+		 *   ADC walks, contract MOVING     -> a request is in flight across the enable
+		 *   ADC flat,  contract constant   -> genuinely stationary; if REVBLK still
+		 *                                     fires here the rail-motion story is DEAD
+		 *
+		 * That last row is the pre-registered falsifier, so it must be observable.
+		 *
+		 * ⚠️ This costs 100 ms of extra settling before the enable, which is itself a
+		 * change: more time for the rail to arrive.  So a run that merely stops
+		 * faulting proves nothing on its own -- the samples below are what decide it.
+		 */
+		int s, vpre[3] = { }, applied[3] = { -1, -1, -1 }, slope;
+		union power_supply_propval apv;
+
+		for (s = 0; s < 3; s++) {
+			if (s)
+				msleep(50);
+			sm5440_get_vbus_uv(chip, &vpre[s]);
+			vpre[s] /= 1000;
+			if (chip->tcpm_psy &&
+			    !power_supply_get_property(chip->tcpm_psy,
+						       POWER_SUPPLY_PROP_VOLTAGE_NOW, &apv))
+				applied[s] = apv.intval / 1000;	/* -1 = unreadable, not a real zero */
+		}
+		slope = vpre[2] - vpre[0];
+		dev_info(chip->dev,
+			 "pre-enable rail: VBUS -100ms=%d -50ms=%d 0ms=%dmV (slope %+dmV/100ms -- %s) | contract %d/%d/%dmV -- %s\n",
+			 vpre[0], vpre[1], vpre[2], slope,
+			 abs(slope) > SM5440_DC_RAIL_MOVING_MV ? "MOVING" : "flat",
+			 applied[0], applied[1], applied[2],
+			 (applied[0] == applied[2]) ? "contract CONSTANT" : "contract MOVING");
+
 		if (!regmap_bulk_read(chip->regmap, SM5440_REG_INT1, pre, 4) &&
 		    (pre[0] | pre[1] | pre[2] | pre[3]))
 			dev_info(chip->dev,
@@ -2751,8 +2833,9 @@ static void sm5440_dc_done_cb(void *ctx)
 static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptive)
 {
 	struct sm_dc_power_source_info ta = { };
-	int vbat_mv = 0, target_mv, off_mv, vbus_mv, diff, ret, engage_off, i;
+	int vbat_mv = 0, target_mv, off_mv, vbus_mv, prev_mv, diff, ret, engage_off, i;
 	unsigned int por;
+	bool settled;
 	u32 start_step;
 	int soc;
 
@@ -2852,33 +2935,56 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 		 vbat_mv, target_mv);
 
 	/*
-	 * Settle + verify VBUS reached the PPS target.  sm5440_get_vbus_uv reads
-	 * the SM5440 ADC, which was sw_reset just above -- its first conversions
-	 * lag the freshly-stepped rail, so a single 300 ms read caught a stale
-	 * pre-step sample (~9 V) and aborted a healthy 10 V engage.  Re-read until
-	 * the ADC tracks the rail (within 10 %) or a generous timeout; the rail
-	 * itself steps fine (confirmed by a userspace PPS sweep).
+	 * Settle + verify VBUS reached the PPS target AND STOPPED MOVING.
+	 *
+	 * sm5440_get_vbus_uv reads the SM5440 ADC, which was sw_reset just above -- its
+	 * first conversions lag the freshly-stepped rail, so a single 300 ms read once
+	 * caught a stale pre-step sample (~9 V) and aborted a healthy 10 V engage.  That
+	 * is why this re-reads rather than sampling once.
+	 *
+	 * The acceptance test is two-part and asymmetric -- see SM5440_DC_SETTLE_*.
+	 * Proximity alone is not arrival: a rail passing THROUGH the band on its way
+	 * somewhere else satisfies a distance test, and handing that to the engine is
+	 * what put CHG_ON into a slewing rail three times.  Requiring two consecutive
+	 * agreeing reads settles both that and the ADC's lag with one condition.
 	 */
 	vbus_mv = 0;
-	diff = target_mv;
+	prev_mv = 0;
+	diff = -target_mv;
+	settled = false;
 	for (i = 0; i < 12; i++) {
 		msleep(150);
+		prev_mv = vbus_mv;
 		sm5440_get_vbus_uv(chip, &vbus_mv);
 		vbus_mv /= 1000;
-		diff = vbus_mv - target_mv;
-		if (diff < 0)
-			diff = -diff;
-		if (diff <= target_mv / 10)
+		diff = vbus_mv - target_mv;		/* SIGNED: the band is asymmetric */
+
+		/*
+		 * i > 0 is load-bearing, not a guard against a bogus prev_mv: the whole
+		 * point is that ONE read can never establish stationarity, so the earliest
+		 * possible acceptance is the second read (300 ms).  The old gate could
+		 * accept at 150 ms on a single sample, and did, three times.
+		 */
+		if (i > 0 &&
+		    diff >= -SM5440_DC_SETTLE_UNDER_MV &&
+		    diff <= SM5440_DC_SETTLE_OVER_MV &&
+		    abs(vbus_mv - prev_mv) <= SM5440_DC_SETTLE_STABLE_MV) {
+			settled = true;
 			break;
+		}
 	}
-	if (diff > target_mv / 10) {
-		dev_warn(chip->dev, "dc start: VBUS=%dmV not within 10%% of %dmV after settle (PPS not transitioned) -- abort\n",
-			 vbus_mv, target_mv);
+	if (!settled) {
+		dev_warn(chip->dev,
+			 "dc start: VBUS=%dmV never settled at %dmV (%+dmV; band -%d/+%d, stability %dmV) after %d reads -- PPS not transitioned or the rail is still slewing -- abort\n",
+			 vbus_mv, target_mv, diff,
+			 SM5440_DC_SETTLE_UNDER_MV, SM5440_DC_SETTLE_OVER_MV,
+			 SM5440_DC_SETTLE_STABLE_MV, i);
 		ret = -EIO;
 		goto err_restore;
 	}
-	dev_info(chip->dev, "dc start: VBUS settled to %dmV (%d reads) -- handing to the engine\n",
-		 vbus_mv, i + 1);
+	dev_info(chip->dev,
+		 "dc start: VBUS settled to %dmV (target %dmV, %+dmV, %d reads, moved %dmV since the previous read) -- handing to the engine\n",
+		 vbus_mv, target_mv, diff, i + 1, abs(vbus_mv - prev_mv));
 
 	/*
 	 * TA descriptor: our 10 V APDO (pos 5); the engine ramps within it.  c_max =
