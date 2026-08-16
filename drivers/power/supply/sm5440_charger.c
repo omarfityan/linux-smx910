@@ -1313,6 +1313,103 @@ static void sm5440_pps_step_err(struct sm5440 *chip, int ret, const char *what, 
 }
 
 /*
+ * Activate PPS (PROG_ONLINE) unless it is already live, and REPORT WHY on failure.
+ *
+ * Split out of sm5440_pps_request() so its two callers can differ on what a failure
+ * MEANS -- which is the entire point of the split:
+ *
+ *   - the engine's in-loop op-8 must ABSORB it (see sm5440_pps_request()'s kerneldoc:
+ *     the engine treats any < 0 from op-8 as a fatal SM_DC_ERR_SEND_PD_MSG and stops
+ *     the pump, and a transient AMS hiccup must not do that), whereas
+ *   - sm5440_dc_start()'s PRE-FLIGHT must REFUSE to start the run.
+ *
+ * Before the split, an activation failure returned 0 from sm5440_pps_request() and was
+ * logged at dev_dbg.  dc_start() tested that return and would have aborted -- but could
+ * never observe a failure, so the check was a gate that cannot fail.  Measured
+ * on-device: a run started with PPS inactive; the early return below precedes the clamp
+ * and the C2 suppression cache, so NOTHING was sent for the whole run.  The source held
+ * its 9 V FIXED PDO while the pump converted 2:1 into a 49-69 mV headroom, then latched
+ * REVBLK + VBUSUVLO and the contract took a Hard Reset.  The engine's "pps req"
+ * telemetry read 9300 -> 10080 mV throughout, because that column is sm_dc's internal
+ * target (ta.v) and has never reflected what reached the wire.
+ *
+ * The dev_warn is the instrument that names the cause: tcpm fast-fails -EOPNOTSUPP when
+ * the source advertises no APDO and -EAGAIN when the port is not SNK_READY, and only
+ * blocks (-ETIMEDOUT) once an AMS has already started.  Which one it is decides whether
+ * a retry can ever succeed, and nothing has ever logged it.  dev_dbg is not an
+ * instrument: this driver already learned that with the STRANDED warning above.
+ *
+ * Returns 0 when PPS is live (already active, or just activated), else the reason it is
+ * not: -ENODEV with no psy handle, -EBUSY while the re-arm floor holds us off, or
+ * tcpm's own errno.
+ */
+static int sm5440_pps_activate(struct sm5440 *chip)
+{
+	union power_supply_propval pv;
+	unsigned long flags;
+	int ret;
+
+	if (!chip->tcpm_psy)
+		return -ENODEV;
+
+	if (READ_ONCE(chip->pps_active))
+		return 0;
+
+	/*
+	 * Rate-limited: tcpm_pps_activate() BLOCKS on wait_for_completion_timeout() for up
+	 * to PD_PPS_CTRL_TIMEOUT (10 s) when the source will not enter PPS, and BOTH the
+	 * engine path (every CC/CV loop, < 3 s) and the keepalive re-arm can land here.  A
+	 * floor keeps a persistently non-PPS contract from stalling the engine workqueue
+	 * ~10 s per step.  Deliberate re-arm sites (auto-engage / re-engage) clear the floor
+	 * so their first attempt is never throttled.
+	 */
+	if (time_before(jiffies, READ_ONCE(chip->pps_rearm_next))) {
+		dev_dbg(chip->dev, "pps: activate rate-limited\n");
+		return -EBUSY;
+	}
+
+	pv.intval = SM5440_TCPM_PSY_PROG_ONLINE;
+	ret = power_supply_set_property(chip->tcpm_psy,
+					POWER_SUPPLY_PROP_ONLINE, &pv);
+	if (ret) {
+		/*
+		 * Arm the floor ONLY on the return that actually cost us the wait.
+		 * tcpm_pps_activate() reaches its wait_for_completion_timeout()
+		 * (PD_PPS_CTRL_TIMEOUT, 10 s) only AFTER tcpm_ams_start() succeeds -- i.e.
+		 * only once the port already IS SNK_READY.  -EAGAIN (state != SNK_READY)
+		 * and -EOPNOTSUPP (PPS unsupported) fast-fail instantly and cost nothing.
+		 *
+		 * This matters: -EAGAIN is EXACTLY the post-Hard-Reset mid-transition state
+		 * that dc_reengage_work's poll re-invokes us to wait out (16 tries x 500 ms).
+		 * Flooring on that free failure would cut the poll to ~2 real attempts and
+		 * straddle the ~1-2 s window in which the port becomes ready -- delaying
+		 * recovery, and at the tail exhausting the poll into a dc_retry_cnt strike
+		 * (3 -> dc_err_latched -> pump off until a physical replug).  Arming after
+		 * the call also removes the check-then-set window on pps_rearm_next between
+		 * the engine and the keepalive: no fast-fail path installs a floor at all.
+		 */
+		if (ret == -ETIMEDOUT)
+			WRITE_ONCE(chip->pps_rearm_next,
+				   jiffies + msecs_to_jiffies(SM5440_PPS_REARM_MIN_MS));
+		dev_warn(chip->dev,
+			 "pps: activate FAILED (%d) -- no PPS contract; setpoints will NOT reach the source\n",
+			 ret);
+		return ret;
+	}
+
+	spin_lock_irqsave(&chip->pps_lock, flags);
+	chip->pps_active = true;
+	chip->pps_sent_mv = 0;
+	chip->pps_sent_ma = 0;
+	spin_unlock_irqrestore(&chip->pps_lock, flags);
+	schedule_delayed_work(&chip->pps_keepalive,
+			      msecs_to_jiffies(SM5440_PPS_KEEPALIVE_MS));
+	dev_info(chip->dev, "pps: activated (PROG_ONLINE)\n");
+
+	return 0;
+}
+
+/*
  * Step the PPS contract to {mv, ma}; activate PPS lazily on first use.
  *
  * RETURNS 0 for every contract-state outcome -- transient -EAGAIN (AMS in
@@ -1348,58 +1445,22 @@ static int sm5440_pps_request(struct sm5440 *chip, u32 mv, u32 ma, bool force)
 		return -ENODEV;
 
 	/*
-	 * Activate PPS once.  -EAGAIN (state != SNK_READY mid-AMS): leave inactive
-	 * and return 0 so the engine is not faulted; the next step (or dc_start's
-	 * VBUS-verify abort + the supervisor's retry) re-attempts.  On success arm
-	 * the keepalive and reset the sent-cache so the first step emits both V + I.
+	 * Activate PPS lazily on first use, and ABSORB every failure -- see this
+	 * function's kerneldoc above and sm5440_pps_activate()'s.  The engine must not
+	 * be faulted by a transient AMS state; the next step (or dc_start's strict
+	 * pre-flight + the supervisor's retry) re-attempts.
 	 *
-	 * Rate-limited: tcpm_pps_activate() BLOCKS on wait_for_completion_timeout() for up
-	 * to PD_PPS_CTRL_TIMEOUT (10 s) when the source will not enter PPS, and BOTH this
-	 * engine path (every CC/CV loop, < 3 s) and the keepalive re-arm can land here.  A
-	 * floor keeps a persistently non-PPS contract from stalling the engine workqueue
-	 * ~10 s per step.  Deliberate re-arm sites (auto-engage / re-engage) clear the floor
-	 * so their first attempt is never throttled.
+	 * Bail WITHOUT stepping rather than falling through.  With PPS inactive tcpm
+	 * discards the setpoint anyway -- and worse, the VOLTAGE_MAX clamp below reads
+	 * the FIXED supply voltage in that state (tcpm_psy_get_voltage_max() returns
+	 * pps_data.max_volt only while pps_data.active), so falling through would floor
+	 * every request to the fixed rail and then cache that floored value in
+	 * pps_sent_mv as though it had been sent -- which would ALSO suppress the next
+	 * genuine step via need_v and silence the STRANDED detector, since a step that
+	 * is never attempted cannot return -EOPNOTSUPP.
 	 */
-	if (!READ_ONCE(chip->pps_active)) {
-		if (time_before(jiffies, READ_ONCE(chip->pps_rearm_next))) {
-			dev_dbg(chip->dev, "pps: activate rate-limited\n");
-			return 0;
-		}
-		pv.intval = SM5440_TCPM_PSY_PROG_ONLINE;
-		ret = power_supply_set_property(chip->tcpm_psy,
-						POWER_SUPPLY_PROP_ONLINE, &pv);
-		if (ret) {
-			/*
-			 * Arm the floor ONLY on the return that actually cost us the wait.
-			 * tcpm_pps_activate() reaches its wait_for_completion_timeout()
-			 * (PD_PPS_CTRL_TIMEOUT, 10 s) only AFTER tcpm_ams_start() succeeds -- i.e.
-			 * only once the port already IS SNK_READY.  -EAGAIN (state != SNK_READY)
-			 * and -EOPNOTSUPP (PPS unsupported) fast-fail instantly and cost nothing.
-			 *
-			 * This matters: -EAGAIN is EXACTLY the post-Hard-Reset mid-transition state
-			 * that dc_reengage_work's poll re-invokes us to wait out (16 tries x 500 ms).
-			 * Flooring on that free failure would cut the poll to ~2 real attempts and
-			 * straddle the ~1-2 s window in which the port becomes ready -- delaying
-			 * recovery, and at the tail exhausting the poll into a dc_retry_cnt strike
-			 * (3 -> dc_err_latched -> pump off until a physical replug).  Arming after
-			 * the call also removes the check-then-set window on pps_rearm_next between
-			 * the engine and the keepalive: no fast-fail path installs a floor at all.
-			 */
-			if (ret == -ETIMEDOUT)
-				WRITE_ONCE(chip->pps_rearm_next,
-					   jiffies + msecs_to_jiffies(SM5440_PPS_REARM_MIN_MS));
-			dev_dbg(chip->dev, "pps: activate deferred (%d)\n", ret);
-			return 0;
-		}
-		spin_lock_irqsave(&chip->pps_lock, flags);
-		chip->pps_active = true;
-		chip->pps_sent_mv = 0;
-		chip->pps_sent_ma = 0;
-		spin_unlock_irqrestore(&chip->pps_lock, flags);
-		schedule_delayed_work(&chip->pps_keepalive,
-				      msecs_to_jiffies(SM5440_PPS_KEEPALIVE_MS));
-		dev_info(chip->dev, "pps: activated (PROG_ONLINE)\n");
-	}
+	if (sm5440_pps_activate(chip))
+		return 0;
 
 	/*
 	 * Clamp to the live APDO window -- the SOURCE max exposed by tcpm (the sink
@@ -2718,6 +2779,30 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	dev_info(chip->dev,
 		 "dc start: initial step %u by soc %d%% -- vbat target %umV, ci_gl %umA\n",
 		 start_step, soc, sm5440_dc_step_vbat[start_step], target_ibus_ma);
+
+	/*
+	 * PRE-FLIGHT: PPS must be LIVE before anything is torn down.  This is the STRICT
+	 * caller of sm5440_pps_activate() -- unlike the engine's in-loop step, a failure
+	 * here is fatal to the run, because starting the pump without a PPS contract is
+	 * precisely the measured failure: the source holds its 9 V FIXED PDO, every
+	 * setpoint is discarded before it reaches the wire, and the pump converts 2:1
+	 * into a headroom of a few tens of mV until it latches REVBLK.
+	 *
+	 * The old code did test the PPS request's return below -- but that return was 0
+	 * for every contract-state outcome, so the check could not fail.  This one can.
+	 *
+	 * Deliberately placed BEFORE the buck inhibit and the sw_reset so that a refusal
+	 * costs nothing: the buck keeps charging the pack and the pump is left untouched,
+	 * where the old path disarmed the buck, drove the pump into a fault, and only
+	 * then restored it.
+	 */
+	ret = sm5440_pps_activate(chip);
+	if (ret) {
+		dev_warn(chip->dev,
+			 "dc start: PPS not active (%d) -- refusing to start on a FIXED contract (buck keeps the pack)\n",
+			 ret);
+		return ret;
+	}
 
 	ret = sm5714_charger_inhibit_buck(true);	/* buck OFF before pump ON */
 	if (ret) {
