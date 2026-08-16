@@ -1859,29 +1859,59 @@ static int sm5440_dc_set_charging_enable(struct i2c_client *i2c, bool enable)
 	 * VBUS and 2xVOUT ride along because the 2:1 pump's start-up window is defined
 	 * against them, so the numbers must be read at the same instants as the verdict.
 	 *
-	 * This costs 150 ms inside preset, before PRE_CC is queued -- deliberately
-	 * accepted, and worth stating plainly: it perturbs the timing of the thing being
-	 * measured.  It cannot change the ORDER of events (the enable still precedes the
-	 * first PRE_CC poll), only widen the gap, so a chip that stays on through +150 ms
-	 * and dies later is still reported as such by the existing poll.
+	 * It perturbs the timing of the thing being measured, which is deliberately
+	 * accepted and worth stating plainly.  It cannot change the ORDER of events (the
+	 * enable still precedes the first PRE_CC poll), only widen the gap.
+	 *
+	 * WHY THE WINDOW REACHES 450 ms, AND WHY INT IS SAMPLED AT EVERY POINT
+	 *
+	 * A capture of three consecutive faults showed the triad reading CHG_ON at every
+	 * one of its points and the chip already reading CHG_OFF at the first monitor
+	 * tick -- which lands ~410 ms after the enable.  So the trip happens between
+	 * ~165 ms and ~410 ms, and the old three points all sat BEFORE that window: they
+	 * proved the chip started, and could say nothing about how it stopped.  The
+	 * monitor tick then reported voltages taken after the pump was already off, where
+	 * an unloaded rail floats back up and the margin reads healthy -- an aftermath
+	 * that is easy to mistake for the trigger.  Sampling to 450 ms brackets the event.
+	 *
+	 * INT1-4 is read at EVERY point, and its clear-on-read behaviour is the mechanism
+	 * rather than an obstacle: each read consumes what it reports, so a latched cause
+	 * appears in exactly ONE line -- the first sample after it fired -- pinning the
+	 * event to a 50 ms interval.  The whole quartet is printed rather than only the
+	 * decoded bits, because a cause that is not in our mask set must still be visible.
+	 *
+	 * 🔴 DIAGNOSTIC COST: this blocks ~450 ms inside every enable, healthy ones
+	 * included.  That is acceptable while the trigger is unknown and should be cut
+	 * back to the three start-up points once it is identified.
 	 */
 	if (enable) {
-		static const int probe_gap_ms[] = { 0, 50, 100 };
-		int k, opm, vb, vo;
+		/* Elapsed ms after the op-mode write, not gaps -- the sleep is the delta. */
+		static const int probe_at_ms[] = { 0, 50, 150, 200, 250, 300, 350, 400, 450 };
+		int k, opm, vb, vo, prev = 0;
+		u8 pin[4];
 
-		for (k = 0; k < 3; k++) {
-			if (probe_gap_ms[k])
-				msleep(probe_gap_ms[k]);
+		for (k = 0; k < (int)ARRAY_SIZE(probe_at_ms); k++) {
+			if (probe_at_ms[k] > prev)
+				msleep(probe_at_ms[k] - prev);
+			prev = probe_at_ms[k];
 			vb = 0;
 			vo = 0;
 			opm = sm5440_get_op_mode(chip);
 			sm5440_get_vbus_uv(chip, &vb);
 			sm5440_get_vout_mv(chip, &vo);
+			/* INT1-4 share the STATUS1-4 layout (see the masks above). */
+			if (regmap_bulk_read(chip->regmap, SM5440_REG_INT1, pin, 4))
+				pin[0] = pin[1] = pin[2] = pin[3] = 0;
 			dev_info(chip->dev,
-				 "enable probe[+%dms]: op-mode=%d (%s) VBUS=%dmV 2xVOUT=%dmV\n",
-				 k == 0 ? 0 : (k == 1 ? 50 : 150), opm,
+				 "enable probe[+%3dms]: op-mode=%d (%s) VBUS=%dmV 2xVOUT=%dmV INT %02x:%02x:%02x:%02x%s%s%s%s\n",
+				 probe_at_ms[k], opm,
 				 opm == SM5440_OPMODE_CHG_ON ? "CHG_ON" : "not-CHG_ON",
-				 vb / 1000, vo * 2);
+				 vb / 1000, vo * 2,
+				 pin[0], pin[1], pin[2], pin[3],
+				 (pin[2] & SM5440_STATUS3_REVBLK) ? " REVBLK" : "",
+				 (pin[2] & SM5440_STATUS3_VBUSUVLO) ? " VBUSUVLO" : "",
+				 (pin[2] & SM5440_STATUS3_STUP_FAIL) ? " STUP_FAIL" : "",
+				 (pin[3] & SM5440_INT4_WDTMROFF) ? " WDT-OFF" : "");
 		}
 	}
 	return 0;
