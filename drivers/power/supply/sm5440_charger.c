@@ -2171,6 +2171,8 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 	unsigned int raw;
 	int die_raw = -1;
 	int ta_req_mv = 0, pps_applied_mv = -1;
+	unsigned int cntl1 = 0;
+	u8 ints[4] = { };
 
 	mutex_lock(&chip->engage_lock);
 	if (!chip->dc_running) {
@@ -2217,11 +2219,39 @@ static void sm5440_dc_monitor_work(struct work_struct *work)
 			POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv))
 		pps_applied_mv = pv.intval / 1000;
 
+	/*
+	 * Per-tick INT1-4 sample, and the CNTL1 mirror that holds the watchdog's
+	 * enable bit and timer field.
+	 *
+	 * The fault handler's INT read named a watchdog shutoff, but INT is
+	 * clear-on-read and ACCUMULATES, and nothing else ever read it -- so that
+	 * quartet was the union of everything latched across a ~15 minute run
+	 * (very nearly every bit was set, including normal operating events).  It
+	 * proved the cause EXISTED without pinning WHEN.  Reading here once a
+	 * second clears as it goes, so each line reports only the preceding second
+	 * and a cause lands in a 1 s window instead of a whole run.
+	 *
+	 * This is also what can answer the open question the fault raised: how a
+	 * 30 s watchdog expired on a run that had already sustained 882 ticks.
+	 * CNTL1 rides along so the timer field and enable bit are visible live
+	 * rather than assumed from what we believe we programmed.
+	 *
+	 * ⚠️ get_dc_error_status() also reads INT, without engage_lock, so the two
+	 * readers can race for a given bit.  No information is lost -- both log
+	 * what they read -- but a bit may appear in either line, so read them
+	 * together when reconstructing a fault.
+	 */
+	if (regmap_bulk_read(chip->regmap, SM5440_REG_INT1, ints, 4))
+		ints[0] = ints[1] = ints[2] = ints[3] = 0;
+	regmap_read(chip->regmap, SM5440_REG_CNTL1, &cntl1);
+
 	dev_info(chip->dev,
-		 "dc[%3d] st=%d op=%d VBUS=%dmV 2xVOUT=%dmV IBUS=%dmA | cell-VBAT=%dmV FG-I=%dmA | die=%d.%dC(raw=%d) | pps req=%dmV applied=%dmV\n",
+		 "dc[%3d] st=%d op=%d VBUS=%dmV 2xVOUT=%dmV IBUS=%dmA | cell-VBAT=%dmV FG-I=%dmA | die=%d.%dC(raw=%d) | pps req=%dmV applied=%dmV | INT %02x:%02x:%02x:%02x CNTL1=%02x%s\n",
 		 chip->dc_ticks++, state, opmode, vbus / 1000, vout * 2, ibus / 1000,
 		 vbat, fg_ua / 1000, die / 10, die % 10, die_raw,
-		 ta_req_mv, pps_applied_mv);
+		 ta_req_mv, pps_applied_mv,
+		 ints[0], ints[1], ints[2], ints[3], cntl1,
+		 (ints[3] & SM5440_INT4_WDTMROFF) ? " WDT-OFF" : "");
 
 	/* engine left the active states (CHG_OFF/ERR/EOC) -> restore the buck. */
 	if (state < SM_DC_CHECK_VBAT) {
