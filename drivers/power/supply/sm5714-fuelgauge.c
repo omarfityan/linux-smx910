@@ -79,6 +79,8 @@
 #define SM5714_FG_SRAM_OCV		0x01	/* open-circuit voltage */
 #define SM5714_FG_SRAM_VBAT		0x03	/* terminal voltage */
 #define SM5714_FG_SRAM_CURRENT		0x05	/* instantaneous current */
+#define SM5714_FG_SRAM_CURRENT_AVG	0x09	/* averaged current (device-own
+						 * SM5714_FG_ADDR_SRAM_CURRENT_AVG) */
 #define SM5714_FG_SRAM_TEMPERATURE	0x07	/* die/battery temperature */
 #define SM5714_FG_SRAM_AGING_RATE_FILT	0x46	/* hardware aging estimate */
 #define SM5714_FG_SRAM_SOC_CYCLE	0x87	/* charge cycles, low byte */
@@ -203,10 +205,16 @@ static int sm5714_fg_get_voltage(struct sm5714_fg *fg, u8 sram_addr, int *uv)
 	return 0;
 }
 
-/* Current in microamps; positive = charging, negative = discharging. */
-static int sm5714_fg_get_current(struct sm5714_fg *fg, int *ua)
+/*
+ * Current in microamps from a given SRAM register; positive = charging.
+ * The gauge exposes two: an INSTANTANEOUS register (0x05) and an AVERAGED one
+ * (0x09).  Both use the identical scaling and sign convention, so they share
+ * this reader -- which is exactly how the device's own sm5714_get_curr() reads
+ * them (one function, both addresses, one set of shunt/sign rules).
+ */
+static int sm5714_fg_read_current_at(struct sm5714_fg *fg, u8 sram_addr, int *ua)
 {
-	int raw = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_CURRENT);
+	int raw = sm5714_fg_read_sram(fg, sram_addr);
 	int aux, ma;
 
 	if (raw < 0)
@@ -223,6 +231,22 @@ static int sm5714_fg_get_current(struct sm5714_fg *fg, int *ua)
 
 	*ua = ma * 1000;
 	return 0;
+}
+
+/* Current in microamps; positive = charging, negative = discharging. */
+static int sm5714_fg_get_current(struct sm5714_fg *fg, int *ua)
+{
+	return sm5714_fg_read_current_at(fg, SM5714_FG_SRAM_CURRENT, ua);
+}
+
+/*
+ * The gauge's own AVERAGED current.  Used ONLY by the full-charge test, which
+ * the device's own sec_bat_check_full() gates on current_now AND current_avg
+ * together -- see the full-charge comment in sm5714_fg_monitor_work().
+ */
+static int sm5714_fg_get_current_avg(struct sm5714_fg *fg, int *ua)
+{
+	return sm5714_fg_read_current_at(fg, SM5714_FG_SRAM_CURRENT_AVG, ua);
 }
 
 /* Temperature in tenths of a degree Celsius (power_supply convention). */
@@ -349,7 +373,7 @@ static void sm5714_fg_monitor_work(struct work_struct *work)
 	struct sm5714_fg *fg = container_of(work, struct sm5714_fg,
 					    monitor_work.work);
 	const struct sm5714_age_step *age;
-	int uv, ua, cycles = 0;
+	int uv, ua, ua_avg, cycles = 0;
 
 	/* No external power: the latch cannot be entered and must not persist. */
 	if (power_supply_am_i_supplied(fg->psy) <= 0) {
@@ -365,7 +389,8 @@ static void sm5714_fg_monitor_work(struct work_struct *work)
 		goto resched;		/* already full; nothing left to decide */
 
 	if (sm5714_fg_get_voltage(fg, SM5714_FG_SRAM_VBAT, &uv) ||
-	    sm5714_fg_get_current(fg, &ua))
+	    sm5714_fg_get_current(fg, &ua) ||
+	    sm5714_fg_get_current_avg(fg, &ua_avg))
 		goto resched;		/* a bad read is not evidence of anything */
 
 	/*
@@ -377,8 +402,34 @@ static void sm5714_fg_monitor_work(struct work_struct *work)
 	sm5714_fg_get_cycle_count(fg, &cycles);
 	age = sm5714_age_step_for(cycles);
 
+	/*
+	 * The taper test needs BOTH the instantaneous and the AVERAGED current
+	 * below the threshold, which is exactly what the device's own
+	 * sec_bat_check_full() requires for SEC_BATTERY_FULLCHARGED_FG_CURRENT:
+	 *
+	 *   if ((battery->current_now > 0 && current_now < topoff_condition) &&
+	 *       (battery->current_avg > 0 && current_avg < topoff_condition))
+	 *
+	 * 🔴 Why the average is load-bearing, and why omitting it was a real defect:
+	 * SM5714_FG_FULL_CHECK_COUNT is 1 -- which is FAITHFUL, the device's own DT
+	 * sets battery,full_check_count = <0x01> -- so a single qualifying sample
+	 * latches.  Stock can afford that only because the averaged register is an
+	 * independent, glitch-immune second witness; the average IS the debounce.
+	 * With the instantaneous reading alone, one bad sample is sufficient.
+	 *
+	 * Measured on-device before this change: the latch fired on a "4 mA taper"
+	 * at an instant when the very same function returned 2505 mA, and when six
+	 * consecutive reads afterwards returned 2031 mA identically.  A raw SRAM
+	 * value of ~8 where ~5000 was expected -- a read landing mid-update.  The
+	 * pack was declared Full at 100 % while absorbing 2 A, and the pump was
+	 * disengaged with its input current still well above the topoff threshold.
+	 *
+	 * So the fix is NOT to raise the count away from the vendor's 1; it is to
+	 * supply the second condition the vendor's test always had.
+	 */
 	if (uv >= age->full_mv * 1000 &&
-	    ua > 0 && ua < SM5714_FG_FULL_CHECK_CURRENT_UA)
+	    ua > 0 && ua < SM5714_FG_FULL_CHECK_CURRENT_UA &&
+	    ua_avg > 0 && ua_avg < SM5714_FG_FULL_CHECK_CURRENT_UA)
 		fg->full_check_cnt++;
 	else
 		fg->full_check_cnt = 0;
@@ -387,8 +438,8 @@ static void sm5714_fg_monitor_work(struct work_struct *work)
 		fg->full_check_cnt = 0;
 		WRITE_ONCE(fg->full_latched, true);
 		dev_info(&fg->client->dev,
-			 "battery full: %d mV >= %d mV, %d mA taper (cycles %d)\n",
-			 uv / 1000, age->full_mv, ua / 1000, cycles);
+			 "battery full: %d mV >= %d mV, %d mA taper (avg %d mA) (cycles %d)\n",
+			 uv / 1000, age->full_mv, ua / 1000, ua_avg / 1000, cycles);
 		power_supply_changed(fg->psy);
 	}
 
