@@ -1801,23 +1801,40 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 	 * turns that into a clean "PPS did not transition" abort instead.
 	 */
 	{
-		int vbus_uv = 0, vbus_mv, diff;
+		int vbus_uv = 0, vbus_mv, prev_mv, diff;
 
+		/*
+		 * SAME acceptance rule as sm5440_dc_start()'s settle loop, deliberately --
+		 * this is the second instance of the identical gate, and it carried the
+		 * identical defect.  A proportional 10 % band is ~976 mV at a 9788 mV target,
+		 * and this path was worse than dc_start's: it took ONE read after a fixed
+		 * sleep, so it could not even notice a rail still in motion.
+		 *
+		 * Proximity is not arrival, and the SM5440 ADC lags, so take a second read and
+		 * require the two to agree.  See the SM5440_DC_SETTLE_* definitions for the
+		 * measured sizing.
+		 */
+		sm5440_get_vbus_uv(chip, &vbus_uv);
+		prev_mv = vbus_uv / 1000;
+		msleep(150);
 		sm5440_get_vbus_uv(chip, &vbus_uv);
 		vbus_mv = vbus_uv / 1000;
-		diff = vbus_mv - target_mv;
-		if (diff < 0)
-			diff = -diff;
-		if (diff > target_mv / 10) {
+		diff = vbus_mv - target_mv;			/* SIGNED: the band is asymmetric */
+
+		if (diff < -SM5440_DC_SETTLE_UNDER_MV ||
+		    diff > SM5440_DC_SETTLE_OVER_MV ||
+		    abs(vbus_mv - prev_mv) > SM5440_DC_SETTLE_STABLE_MV) {
 			dev_warn(chip->dev,
-				 "engage: VBUS=%dmV not within 10%% of target %dmV (PPS did not transition) -- aborting\n",
-				 vbus_mv, target_mv);
+				 "engage: VBUS=%dmV not settled at target %dmV (%+dmV; band -%d/+%d, moved %dmV in 150 ms) -- PPS did not transition or the rail is still slewing -- aborting\n",
+				 vbus_mv, target_mv, diff,
+				 SM5440_DC_SETTLE_UNDER_MV, SM5440_DC_SETTLE_OVER_MV,
+				 abs(vbus_mv - prev_mv));
 			ret = -EIO;
 			goto err_uninhibit;
 		}
 		dev_info(chip->dev,
-			 "engage: VBUS settled to %dmV (target %dmV) -- flipping op-mode\n",
-			 vbus_mv, target_mv);
+			 "engage: VBUS settled to %dmV (target %dmV, %+dmV, moved %dmV in 150 ms) -- flipping op-mode\n",
+			 vbus_mv, target_mv, diff, abs(vbus_mv - prev_mv));
 	}
 
 	ret = sm5440_pump_engage_chip(chip, SM5440_ENGAGE_IBUS_MA, SM5440_ENGAGE_VBAT_MV);
