@@ -191,6 +191,15 @@ extern int sm_dc_report_error_status(struct sm_dc_info *sm_dc, u32 err);
 extern int sm_dc_report_interrupt_event(struct sm_dc_info *sm_dc, u32 interrupt);
 
 extern int sm_dc_get_current_state(struct sm_dc_info *sm_dc);
+/*
+ * The engage setpoint the PRESET step will request -- the single derivation of
+ * "the target", shared by the engine and by any caller that preconditions the
+ * rail before sm_dc_start_charging().  Returns mV; writes the request current to
+ * @req_ma when non-NULL.  See the kerneldoc on the definition.
+ */
+extern u32 sm_dc_calc_preset_request(struct sm_dc_info *sm_dc, int adc_vbat,
+				     u32 ta_c_max, u32 target_ibus, u32 *req_ma);
+
 extern int sm_dc_start_charging(struct sm_dc_info *sm_dc, struct sm_dc_power_source_info *ta);
 extern int sm_dc_stop_charging(struct sm_dc_info *sm_dc);
 extern int sm_dc_set_target_vbat(struct sm_dc_info *sm_dc, u32 target_vbat);

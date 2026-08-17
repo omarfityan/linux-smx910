@@ -616,10 +616,34 @@ static const u32 sm5440_dc_step_cond_soc[SM5440_DC_STEP_MAX + 1] = { 62, 79, 100
  * the SM5440's own ADC, which LAGS after the sw_reset just above (the reason this loop
  * re-reads at all), so a single sample cannot tell a moving rail from a stale
  * conversion.  Both resolve the same way: wait until two successive reads agree.
+ *
+ * THE ASYMMETRY IS NOW GONE, and that is the point.  It was never a property of
+ * "below": it was a property of THE SIDE THE RAIL STARTED ON, because that is the side
+ * a rail which never moved is still sitting on.  Every run measured back then happened
+ * to approach from below, so "below" and "the origin side" coincided and the constant
+ * froze the coincidence.  That is a live trap the moment a target sits BENEATH the
+ * entry rail -- which is exactly what the engage-target fix does: the generous +1000
+ * bound then lands on the origin side, where a rail left at the ~10 V keepalive sits
+ * 700 mV high, perfectly stationary, inside the band, and is declared settled.
+ *
+ * The obvious repair -- pick the tight side at runtime from the entry rail -- was
+ * written and then rejected, because it makes the gate's correctness depend on a VBUS
+ * sample taken in the post-sw_reset window where this very ADC is known to LAG.  A gate
+ * that a stale sensor can silently invert is not a gate.  A symmetric band depends on
+ * nothing.
+ *
+ * SIZING.  The +282/-680 figures above came from the OLD single-read gate, which sampled
+ * rails that were still in motion; they measure how far a MOVING rail can be from
+ * target, not where a settled one lands.  With stationarity required, the one
+ * measurement taken through the fixed gate settled at +86 mV having moved 0 mV.  300 mV
+ * is ~3.5x that, and still rejects by a wide margin the ~700 mV a rail abandoned at the
+ * keepalive would show.  A settle that legitimately lands outside it aborts BEFORE any
+ * enable, costs a retry, and prints every number needed to widen it on evidence.
  */
-#define SM5440_DC_SETTLE_UNDER_MV	300	/* tight: how far BELOW target is acceptable */
-#define SM5440_DC_SETTLE_OVER_MV	1000	/* loose: how far ABOVE target is acceptable */
+#define SM5440_DC_SETTLE_BAND_MV	300	/* |VBUS - target| accepted, either side */
 #define SM5440_DC_SETTLE_STABLE_MV	50	/* read N vs read N-1 -> "stationary" */
+#define SM5440_DC_SETTLE_READ_MS	150	/* spacing between settle reads */
+#define SM5440_DC_SETTLE_MAX_READS	12	/* give the rail up to 1.8 s to arrive */
 #define SM5440_DC_RAIL_MOVING_MV	50	/* pre-enable slope over 100 ms -> "MOVING" */
 
 /*
@@ -764,6 +788,20 @@ struct sm5440 {
 	unsigned long pps_last_step;		/* jiffies of the last step (keepalive backoff) */
 	u8 pps_gone_cnt;			/* consecutive keepalive polls with the source absent */
 	unsigned long pps_rearm_next;		/* jiffies floor for the next PROG_ONLINE attempt */
+
+	/*
+	 * What dc_start preconditioned the rail to, stashed so the engine's FIRST
+	 * op-8 can state whether it agrees.  Zeroed once that comparison is logged,
+	 * so it fires exactly once per run.
+	 *
+	 * 🔴 This exists because the alternative instrument cannot report the negative
+	 * case: sm5440_pps_request() suppresses an unchanged setpoint SILENTLY, and
+	 * sm5440_dc_send_power_source_msg() logs only on error -- so "the engine agreed
+	 * and nothing moved" and "the engine never ran" produce byte-identical traces.
+	 * The comparison has to be printed, not inferred from an absence.
+	 */
+	u32 preset_expect_mv;
+	u32 preset_expect_ma;
 };
 
 /*
@@ -846,6 +884,106 @@ static int sm5440_get_vbat_mv(struct sm5440 *chip, int *mv)
 
 	*mv = 2048 + (raw * 500) / 1000;
 	return 0;
+}
+
+/*
+ * VBAT, read until two consecutive samples agree.
+ *
+ * The engage paths call this immediately after sw_reset + adc_enable_continuous,
+ * which is precisely the window in which this ADC is known to lag -- the same lag
+ * that made a single VBUS read accept a stale pre-step sample.  A stale VBAT is
+ * worse than a stale VBUS, because VBAT is the INPUT to the engage target: the
+ * settle loop would then faithfully verify the rail against a target computed from
+ * a number that was never true.  Under buck-inhibit the cell is unloaded and its
+ * voltage is nearly constant, so this converges on the second read.
+ */
+#define SM5440_VBAT_AGREE_MV	10	/* two reads this close -> the ADC is tracking */
+#define SM5440_VBAT_MAX_READS	6
+
+static int sm5440_get_vbat_settled_mv(struct sm5440 *chip, int *mv)
+{
+	int prev = 0, cur = 0, ret, i;
+
+	ret = sm5440_get_vbat_mv(chip, &prev);
+	if (ret)
+		return ret;
+
+	for (i = 1; i < SM5440_VBAT_MAX_READS; i++) {
+		usleep_range(10000, 12000);
+		ret = sm5440_get_vbat_mv(chip, &cur);
+		if (ret)
+			return ret;
+		if (abs(cur - prev) <= SM5440_VBAT_AGREE_MV) {
+			*mv = cur;
+			return 0;
+		}
+		prev = cur;
+	}
+
+	/*
+	 * Never agreed.  Report the last read and say so rather than silently
+	 * returning it -- a target derived from a drifting VBAT is exactly the
+	 * failure this function exists to make visible.
+	 */
+	dev_warn(chip->dev,
+		 "VBAT never settled over %d reads (last %dmV, previous %dmV) -- using the last read\n",
+		 SM5440_VBAT_MAX_READS, cur, prev);
+	*mv = cur;
+	return 0;
+}
+
+/* What a settle attempt actually observed, so the caller can log all of it. */
+struct sm5440_settle_result {
+	int vbus_mv;		/* the last read */
+	int diff_mv;		/* vbus_mv - target_mv, SIGNED */
+	int moved_mv;		/* |read N - read N-1| */
+	int reads;		/* how many reads were taken */
+	bool settled;
+};
+
+/**
+ * sm5440_settle_vbus - wait for VBUS to ARRIVE at @target_mv and STOP MOVING
+ * @chip:      pump instance
+ * @target_mv: the requested rail
+ * @r:         out: everything observed (valid whether or not it settled)
+ *
+ * ONE settle gate, two callers.  There used to be two copies of this test, and
+ * session 302 found the second one still carrying a defect the first had already
+ * been fixed for -- every positive control passed while half the fix was missing.
+ * A duplicated gate is a gate that will diverge.
+ *
+ * Acceptance is two-part and BOTH parts are required:
+ *   1. |VBUS - target| <= SM5440_DC_SETTLE_BAND_MV, symmetric on purpose, and
+ *   2. two consecutive reads agreeing within SM5440_DC_SETTLE_STABLE_MV.
+ *
+ * The earliest possible acceptance is therefore the SECOND read: one read can
+ * never establish stationarity, and the gate this replaced could accept on the
+ * first, and did, three times.
+ */
+static void sm5440_settle_vbus(struct sm5440 *chip, int target_mv,
+			       struct sm5440_settle_result *r)
+{
+	int vbus_uv = 0, prev_mv = 0, i;
+
+	memset(r, 0, sizeof(*r));
+	r->diff_mv = -target_mv;
+
+	for (i = 0; i < SM5440_DC_SETTLE_MAX_READS; i++) {
+		msleep(SM5440_DC_SETTLE_READ_MS);
+		prev_mv = r->vbus_mv;
+		sm5440_get_vbus_uv(chip, &vbus_uv);
+		r->vbus_mv = vbus_uv / 1000;
+		r->diff_mv = r->vbus_mv - target_mv;	/* SIGNED: the band is asymmetric */
+		r->moved_mv = abs(r->vbus_mv - prev_mv);
+		r->reads = i + 1;
+
+		if (i > 0 &&
+		    abs(r->diff_mv) <= SM5440_DC_SETTLE_BAND_MV &&
+		    r->moved_mv <= SM5440_DC_SETTLE_STABLE_MV) {
+			r->settled = true;
+			return;
+		}
+	}
 }
 
 static int sm5440_get_vout_mv(struct sm5440 *chip, int *mv)
@@ -1747,7 +1885,7 @@ static void sm5440_pump_monitor_work(struct work_struct *work)
 /* Engage sequence.  Caller holds engage_lock and has checked !pump_engaged. */
 static int sm5440_pump_engage(struct sm5440 *chip)
 {
-	int vbat_mv = 0, target_mv, off_mv, ret;
+	int vbat_mv = 0, target_mv, off_mv, entry_uv, entry_mv, ret;
 
 	if (!sm5440_pd_source_usable(chip)) {
 		dev_warn(chip->dev,
@@ -1770,7 +1908,7 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 	 * would be ~2.5:1 and trip the pump's startup precondition.  The SM5440 VBAT
 	 * ADC reads live because the contract already supplies VBUS.
 	 */
-	ret = sm5440_get_vbat_mv(chip, &vbat_mv);
+	ret = sm5440_get_vbat_settled_mv(chip, &vbat_mv);
 	if (ret || vbat_mv < 2500 || vbat_mv > 4500) {
 		dev_warn(chip->dev, "engage: implausible VBAT %d mV (ret=%d) -- aborting\n",
 			 vbat_mv, ret);
@@ -1782,6 +1920,15 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 	target_mv = min(target_mv, SM5440_DC_VBUS_OVP_TH - 500);
 	target_mv = max(target_mv, SM5440_TA_MIN_VOLTAGE);
 
+	/*
+	 * The rail BEFORE the request.  This is not decoration: it selects which side
+	 * of the settle band is the tight one, and without it the gate cannot tell
+	 * "arrived and stopped" from "never moved and was already close".
+	 */
+	entry_uv = 0;
+	sm5440_get_vbus_uv(chip, &entry_uv);
+	entry_mv = entry_uv / 1000;
+
 	ret = sm5440_pps_request(chip, target_mv, 5000, false);
 	if (ret) {
 		dev_warn(chip->dev, "engage: PPS request %d mV failed (%d)\n",
@@ -1789,9 +1936,8 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 		goto err_uninhibit;
 	}
 	dev_info(chip->dev,
-		 "engage: VBAT=%dmV -> PPS target=%dmV (offset %dmV); settling 300 ms\n",
-		 vbat_mv, target_mv, off_mv);
-	msleep(300);
+		 "engage: VBAT=%dmV, VBUS entry=%dmV -> PPS target=%dmV (offset %dmV); settling\n",
+		 vbat_mv, entry_mv, target_mv, off_mv);
 
 	/*
 	 * Confirm the PPS actually transitioned before flipping op-mode.  The
@@ -1800,41 +1946,28 @@ static int sm5440_pump_engage(struct sm5440 *chip)
 	 * engage at ~2.5:1 into the cell and trip STUP_FAIL.  Verifying VBUS here
 	 * turns that into a clean "PPS did not transition" abort instead.
 	 */
+	/*
+	 * Confirm the PPS actually transitioned, through the SHARED gate.  This used
+	 * to be a hand-rolled second copy of dc_start's settle test, and it is exactly
+	 * where 302's fix went missing: the copy kept the defect after the original was
+	 * repaired.  There is now one implementation.
+	 */
 	{
-		int vbus_uv = 0, vbus_mv, prev_mv, diff;
+		struct sm5440_settle_result s;
 
-		/*
-		 * SAME acceptance rule as sm5440_dc_start()'s settle loop, deliberately --
-		 * this is the second instance of the identical gate, and it carried the
-		 * identical defect.  A proportional 10 % band is ~976 mV at a 9788 mV target,
-		 * and this path was worse than dc_start's: it took ONE read after a fixed
-		 * sleep, so it could not even notice a rail still in motion.
-		 *
-		 * Proximity is not arrival, and the SM5440 ADC lags, so take a second read and
-		 * require the two to agree.  See the SM5440_DC_SETTLE_* definitions for the
-		 * measured sizing.
-		 */
-		sm5440_get_vbus_uv(chip, &vbus_uv);
-		prev_mv = vbus_uv / 1000;
-		msleep(150);
-		sm5440_get_vbus_uv(chip, &vbus_uv);
-		vbus_mv = vbus_uv / 1000;
-		diff = vbus_mv - target_mv;			/* SIGNED: the band is asymmetric */
-
-		if (diff < -SM5440_DC_SETTLE_UNDER_MV ||
-		    diff > SM5440_DC_SETTLE_OVER_MV ||
-		    abs(vbus_mv - prev_mv) > SM5440_DC_SETTLE_STABLE_MV) {
+		sm5440_settle_vbus(chip, target_mv, &s);
+		if (!s.settled) {
 			dev_warn(chip->dev,
-				 "engage: VBUS=%dmV not settled at target %dmV (%+dmV; band -%d/+%d, moved %dmV in 150 ms) -- PPS did not transition or the rail is still slewing -- aborting\n",
-				 vbus_mv, target_mv, diff,
-				 SM5440_DC_SETTLE_UNDER_MV, SM5440_DC_SETTLE_OVER_MV,
-				 abs(vbus_mv - prev_mv));
+				 "engage: VBUS=%dmV never settled at %dmV (%+dmV; entry %dmV, band +/-%d, stability %dmV, moved %dmV) after %d reads -- PPS did not transition or the rail is still slewing -- aborting\n",
+				 s.vbus_mv, target_mv, s.diff_mv, entry_mv,
+				 SM5440_DC_SETTLE_BAND_MV, SM5440_DC_SETTLE_STABLE_MV,
+				 s.moved_mv, s.reads);
 			ret = -EIO;
 			goto err_uninhibit;
 		}
 		dev_info(chip->dev,
-			 "engage: VBUS settled to %dmV (target %dmV, %+dmV, moved %dmV in 150 ms) -- flipping op-mode\n",
-			 vbus_mv, target_mv, diff, abs(vbus_mv - prev_mv));
+			 "engage: VBUS settled to %dmV (target %dmV, %+dmV, entry %dmV, %d reads, moved %dmV) -- flipping op-mode\n",
+			 s.vbus_mv, target_mv, s.diff_mv, entry_mv, s.reads, s.moved_mv);
 	}
 
 	ret = sm5440_pump_engage_chip(chip, SM5440_ENGAGE_IBUS_MA, SM5440_ENGAGE_VBAT_MV);
@@ -2304,6 +2437,36 @@ static int sm5440_dc_send_power_source_msg(struct i2c_client *i2c,
 {
 	struct sm5440 *chip = i2c_get_clientdata(i2c);
 	int ret;
+
+	/*
+	 * ONE-SHOT: state out loud whether the engine's FIRST request of a run agrees
+	 * with the rail dc_start preconditioned.  This has to be PRINTED, not inferred:
+	 * sm5440_pps_request() suppresses an unchanged setpoint silently and this
+	 * function logs only on error, so "the engine agreed and nothing moved" and
+	 * "the engine never got here" are byte-identical in the trace.  An instrument
+	 * that cannot report the negative case reports the positive one confidently.
+	 *
+	 * Both values compared here are raw sm_dc_calc_preset_request() output, before
+	 * sm5440_pps_request()'s APDO clamp and grid alignment -- which are applied
+	 * identically to both, so equality here is exactly the property under test:
+	 * do the two callers of the one formula produce the same number?
+	 */
+	if (chip->preset_expect_mv) {
+		u32 emv = chip->preset_expect_mv, ema = chip->preset_expect_ma;
+
+		chip->preset_expect_mv = 0;
+		chip->preset_expect_ma = 0;
+
+		if (ta->v == emv && ta->c == ema)
+			dev_info(chip->dev,
+				 "dc preset: engine asks %umV/%umA == preconditioned %umV/%umA -- SUPPRESSED, rail HELD, nothing steps before CHG_ON\n",
+				 ta->v, ta->c, emv, ema);
+		else
+			dev_info(chip->dev,
+				 "dc preset: engine asks %umV/%umA vs preconditioned %umV/%umA (%+dmV/%+dmA) -- the rail WILL step before CHG_ON\n",
+				 ta->v, ta->c, emv, ema,
+				 (int)ta->v - (int)emv, (int)ta->c - (int)ema);
+	}
 
 	ret = sm5440_pps_request(chip, ta->v, ta->c, false);
 	if (ret)
@@ -2842,19 +3005,45 @@ static void sm5440_dc_done_cb(void *ctx)
 }
 
 /*
- * Engine START.  Caller holds engage_lock and has checked !dc_running.  Reuses the
- * Inc-1 proven precondition (buck OFF -> chip sw_reset+init -> step PPS to
- * ~2*Vcell and VERIFY VBUS settled) so the engine's preset re-send is a near
- * no-op against an already-2:1-ready source, THEN hands control to the engine.
+ * Engine START.  Caller holds engage_lock and has checked !dc_running.  Buck OFF ->
+ * chip sw_reset+init -> step the PPS to the setpoint the engine's PRESET will ask
+ * for and VERIFY the rail arrived and STOPPED, THEN hand control to the engine.
+ *
+ * "A near no-op" was the intent from the start; it was not the behaviour.  The
+ * precondition derived its own target and missed the engine's by ~500 mV, so the
+ * preset re-send was a 500 mV step and CHG_ON fired 250 ms into it.  Both now take
+ * the number from sm_dc_calc_preset_request(), and the engine says so in its log.
  */
 static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptive)
 {
 	struct sm_dc_power_source_info ta = { };
-	int vbat_mv = 0, target_mv, off_mv, vbus_mv, prev_mv, diff, ret, engage_off, i;
+	int vbat_mv = 0, target_mv, entry_uv, entry_mv, ret, engage_off;
+	struct sm5440_settle_result settle;
 	unsigned int por;
-	bool settled;
-	u32 start_step;
+	u32 start_step, target_ma;
 	int soc;
+
+	/*
+	 * Disarm the preset comparison FIRST, so the one-shot printed by
+	 * sm5440_dc_send_power_source_msg() can only ever describe THIS run.  Every
+	 * entry point (auto-engage, the HRST re-engage, dc_test, dc_probe) lands here,
+	 * and a run that arms it and then dies after the settle would otherwise leave a
+	 * stale target for a later run's first op-8 to be compared against -- an
+	 * instrument reporting confidently on the wrong run.
+	 */
+	chip->preset_expect_mv = 0;
+	chip->preset_expect_ma = 0;
+
+	/*
+	 * probe() leaves chip->dc NULL if the engine instance could not be created and
+	 * carries on with telemetry + the bare pump path, so this is reachable rather
+	 * than defensive: the auto-engage supervisor calls dc_start regardless.  Refuse
+	 * cleanly instead of dereferencing NULL on a charging path.
+	 */
+	if (!chip->dc) {
+		dev_warn(chip->dev, "dc start: no engine instance -- direct charging unavailable\n");
+		return -ENODEV;
+	}
 
 	if (!sm5440_pd_source_usable(chip)) {
 		dev_warn(chip->dev, "dc start: no PPS contract -- arm pd_request + plug first\n");
@@ -2930,26 +3119,65 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	sm5440_init_reg_param(chip);
 	sm5440_adc_enable_continuous(chip);
 
-	/* precondition the PPS input to ~2*Vcell + IR offset, clamped to
-	 * [ta_min_voltage, dc_vbus_ovp_th - 500], and verify VBUS transitioned. */
-	ret = sm5440_get_vbat_mv(chip, &vbat_mv);
+	/*
+	 * Precondition the PPS input to the rail the pump will be ENABLED onto, and
+	 * verify it got there and stopped.
+	 *
+	 * 🔴 THE TARGET IS THE ENGINE'S, NOT OURS.  This precondition is a mainline
+	 * addition -- the device's own sm5440_start_charging() does sw_reset, init,
+	 * an APDO *query*, the watchdog, and then sm_dc_start_charging() with no rail
+	 * request at all, so downstream the FIRST PPS request of an engage is the
+	 * engine's PRESET step.  Adding a precondition is defensible; giving it a
+	 * SECOND opinion about the target was not.  It used to compute the IR offset
+	 * from the FULL run current while PRESET computes it from HALF (the CC ramp
+	 * starts at 50 %), a standing ~500 mV disagreement -- so this code settled the
+	 * rail to 9804 mV, handed over, and the engine's own first request immediately
+	 * dragged it toward 9304 mV with CHG_ON landing 250 ms into that slew.  Three
+	 * runs at 301 and three at 302 latched REVBLK 50-150 ms after CHG_ON.
+	 *
+	 * sm_dc_calc_preset_request() is now the only derivation of that number, and
+	 * both this call and PRESET take it from there.  Because sm5440_pps_request()
+	 * suppresses a setpoint equal to the one already sent, PRESET's request should
+	 * then put nothing on the wire at all -- which the engine states explicitly in
+	 * sm5440_dc_send_power_source_msg() rather than leaving it to be inferred from
+	 * a silent trace.
+	 *
+	 * No OVP clamp here, deliberately: PRESET does not clamp either, and a clamp
+	 * only this side applies would re-introduce the divergence at exactly the high
+	 * VBAT where it matters most.  Both paths pass through sm5440_pps_request(),
+	 * whose APDO clamp and grid alignment are therefore applied identically.
+	 */
+	ret = sm5440_get_vbat_settled_mv(chip, &vbat_mv);
 	if (ret || vbat_mv < 2500 || vbat_mv > 4500) {
 		dev_warn(chip->dev, "dc start: implausible VBAT %dmV -- abort\n", vbat_mv);
 		ret = ret ? ret : -EIO;
 		goto err_restore;
 	}
-	off_mv = (target_ibus_ma * (SM5440_GTS9U_R_TTL_UOHM / 1000)) / 1000 + 200;
-	target_mv = 2 * vbat_mv + off_mv;
-	target_mv = min(target_mv, SM5440_DC_VBUS_OVP_TH - 500);
-	target_mv = max(target_mv, SM5440_TA_MIN_VOLTAGE);
 
-	ret = sm5440_pps_request(chip, target_mv, target_ibus_ma, false);
+	target_mv = sm_dc_calc_preset_request(chip->dc, vbat_mv, target_ibus_ma,
+					      target_ibus_ma, &target_ma);
+	engage_off = target_mv - 2 * vbat_mv;	/* the ONE offset, read back off the ONE target */
+
+	/* The rail BEFORE the request: it chooses which side of the settle band is
+	 * the tight one, and it is the only way the trace can show whether the rail
+	 * had to move at all. */
+	entry_uv = 0;
+	sm5440_get_vbus_uv(chip, &entry_uv);
+	entry_mv = entry_uv / 1000;
+
+	ret = sm5440_pps_request(chip, target_mv, target_ma, false);
 	if (ret) {
 		dev_warn(chip->dev, "dc start: PPS request %dmV failed (%d)\n", target_mv, ret);
 		goto err_restore;
 	}
-	dev_info(chip->dev, "dc start: VBAT=%dmV -> PPS target=%dmV; settling\n",
-		 vbat_mv, target_mv);
+
+	/* Arm the one-shot comparison the engine's first op-8 will print. */
+	chip->preset_expect_mv = target_mv;
+	chip->preset_expect_ma = target_ma;
+
+	dev_info(chip->dev,
+		 "dc start: VBAT=%dmV, VBUS entry=%dmV -> engage target %dmV/%dmA (offset %dmV; this IS the engine's PRESET request); settling\n",
+		 vbat_mv, entry_mv, target_mv, target_ma, engage_off);
 
 	/*
 	 * Settle + verify VBUS reached the PPS target AND STOPPED MOVING.
@@ -2965,43 +3193,22 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	 * what put CHG_ON into a slewing rail three times.  Requiring two consecutive
 	 * agreeing reads settles both that and the ADC's lag with one condition.
 	 */
-	vbus_mv = 0;
-	prev_mv = 0;
-	diff = -target_mv;
-	settled = false;
-	for (i = 0; i < 12; i++) {
-		msleep(150);
-		prev_mv = vbus_mv;
-		sm5440_get_vbus_uv(chip, &vbus_mv);
-		vbus_mv /= 1000;
-		diff = vbus_mv - target_mv;		/* SIGNED: the band is asymmetric */
-
-		/*
-		 * i > 0 is load-bearing, not a guard against a bogus prev_mv: the whole
-		 * point is that ONE read can never establish stationarity, so the earliest
-		 * possible acceptance is the second read (300 ms).  The old gate could
-		 * accept at 150 ms on a single sample, and did, three times.
-		 */
-		if (i > 0 &&
-		    diff >= -SM5440_DC_SETTLE_UNDER_MV &&
-		    diff <= SM5440_DC_SETTLE_OVER_MV &&
-		    abs(vbus_mv - prev_mv) <= SM5440_DC_SETTLE_STABLE_MV) {
-			settled = true;
-			break;
-		}
-	}
-	if (!settled) {
+	sm5440_settle_vbus(chip, target_mv, &settle);
+	if (!settle.settled) {
 		dev_warn(chip->dev,
-			 "dc start: VBUS=%dmV never settled at %dmV (%+dmV; band -%d/+%d, stability %dmV) after %d reads -- PPS not transitioned or the rail is still slewing -- abort\n",
-			 vbus_mv, target_mv, diff,
-			 SM5440_DC_SETTLE_UNDER_MV, SM5440_DC_SETTLE_OVER_MV,
-			 SM5440_DC_SETTLE_STABLE_MV, i);
+			 "dc start: VBUS=%dmV never settled at %dmV (%+dmV; entry %dmV, band +/-%d, stability %dmV, moved %dmV) after %d reads -- PPS not transitioned or the rail is still slewing -- abort\n",
+			 settle.vbus_mv, target_mv, settle.diff_mv, entry_mv,
+			 SM5440_DC_SETTLE_BAND_MV, SM5440_DC_SETTLE_STABLE_MV,
+			 settle.moved_mv, settle.reads);
+		chip->preset_expect_mv = 0;	/* the run is dead; disarm the comparison */
+		chip->preset_expect_ma = 0;
 		ret = -EIO;
 		goto err_restore;
 	}
 	dev_info(chip->dev,
-		 "dc start: VBUS settled to %dmV (target %dmV, %+dmV, %d reads, moved %dmV since the previous read) -- handing to the engine\n",
-		 vbus_mv, target_mv, diff, i + 1, abs(vbus_mv - prev_mv));
+		 "dc start: VBUS settled to %dmV (target %dmV, %+dmV, entry %dmV, %d reads, moved %dmV since the previous read) -- handing to the engine\n",
+		 settle.vbus_mv, target_mv, settle.diff_mv, entry_mv,
+		 settle.reads, settle.moved_mv);
 
 	/*
 	 * TA descriptor: our 10 V APDO (pos 5); the engine ramps within it.  c_max =
@@ -3013,10 +3220,17 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 	 * limiter there).  p_max always uses the full 10500 ceiling so the engine's own
 	 * p_max guard never caps the probe's climb before ta.v_max does.
 	 */
-	engage_off = ((target_ibus_ma / 2) * (SM5440_GTS9U_R_TTL_UOHM / 1000)) / 1000 + 200;
+	/*
+	 * engage_off / target_mv were derived ABOVE from sm_dc_calc_preset_request()
+	 * and are used verbatim here.  This used to recompute the half-current offset
+	 * with its own expression -- so the file carried THREE spellings of the engage
+	 * target (the full-current settle target, this one, and the engine's).  Two of
+	 * them agreed, which is exactly why the disagreement survived so long.  Now
+	 * there is one, and 2*vbat_mv + engage_off == target_mv by construction.
+	 */
 	chip->probe_floor_off = engage_off;	/* ta.v_max never retreats below 2*Vcell + this */
 	chip->probe_vmax = sm5440_vmax_align(min_t(u32,
-				 2 * vbat_mv + engage_off + SM5440_PROBE_START_MARGIN,
+				 target_mv + SM5440_PROBE_START_MARGIN,
 				 SM5440_PROBE_VMAX_CEIL));
 
 	ta.pdo_pos = 5;
@@ -3061,8 +3275,8 @@ static int sm5440_dc_start(struct sm5440 *chip, u32 target_ibus_ma, bool adaptiv
 		schedule_delayed_work(&chip->probe_work,
 				      msecs_to_jiffies(SM5440_PROBE_TICK_MS));
 		dev_info(chip->dev,
-			 "dc ENGINE STARTED (ADAPTIVE probe): ci_gl=%umA v_max start=%umV (engage~%dmV) ceil=%dmV\n",
-			 target_ibus_ma, chip->probe_vmax, 2 * vbat_mv + engage_off,
+			 "dc ENGINE STARTED (ADAPTIVE probe): ci_gl=%umA v_max start=%umV (engage=%dmV) ceil=%dmV\n",
+			 target_ibus_ma, chip->probe_vmax, target_mv,
 			 SM5440_PROBE_VMAX_CEIL);
 	} else {
 		dev_info(chip->dev,

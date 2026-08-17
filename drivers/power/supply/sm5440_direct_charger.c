@@ -306,16 +306,66 @@ static int terminate_charging_work(struct sm_dc_info *sm_dc)
 /**
  *  PD3.0 PPS Direct-charging work functions
  */
-static inline u32 _calc_pps_v_init_offset(struct sm_dc_info *sm_dc)
+/*
+ * The device-own offset, with the request current passed IN rather than read from
+ * sm_dc->ta.c.  Downstream this reads ta.c because its only caller has just
+ * assigned it; taking it as an argument is semantically identical there and lets
+ * sm_dc_calc_preset_request() below compute the same answer for a caller that does
+ * not own sm_dc->ta yet.  No arithmetic changed.
+ */
+static inline u32 _calc_pps_v_init_offset(struct sm_dc_info *sm_dc, u32 pps_c_ma)
 {
 	u32 offset;
 
-	offset = (sm_dc->ta.c * sm_dc->config.r_ttl) / 1000000;
+	offset = (pps_c_ma * sm_dc->config.r_ttl) / 1000000;
 	offset += 200;   /* add to extra initial offset */
-	pr_info("%s %s: pps_c=%dmA, v_init_offset=%dmV\n", sm_dc->name, __func__, sm_dc->ta.c, offset);
+	pr_info("%s %s: pps_c=%dmA, v_init_offset=%dmV\n", sm_dc->name, __func__, pps_c_ma, offset);
 
 	return offset;
 }
+
+/**
+ * sm_dc_calc_preset_request - the PPS setpoint the PRESET step will ask for
+ * @sm_dc:       engine instance (read for config.r_ttl / ta_min_current / ta_min_voltage)
+ * @adc_vbat:    cell voltage in mV, read from the SM5440 VBAT ADC
+ * @ta_c_max:    the TA descriptor's current ceiling (mA)
+ * @target_ibus: the run's input-current goal (mA)
+ * @req_ma:      out: the request current, or NULL
+ *
+ * Returns the request VOLTAGE in mV.
+ *
+ * THIS IS THE ONLY PLACE THE ENGAGE SETPOINT IS DERIVED.  pd_preset_dc_work() is
+ * what actually sets the rail the pump is enabled onto: it asks for HALF the run's
+ * input current (the CC ramp starts at 50 %) and therefore only half the IR drop
+ * that current will eventually cost, then asserts CHG_ON 250 ms later.
+ *
+ * 🔴 A caller that preconditions the rail before handing over MUST precondition to
+ * THIS value.  Preconditioning to any other number does not merely waste a step: the
+ * engine's own first request then moves the rail, and CHG_ON lands 250 ms into that
+ * slew.  Sessions 301-302 measured exactly that -- the pump driver settled the rail
+ * to a full-current offset (2*VBAT + 1200 mV) while this function asks for the
+ * half-current one (2*VBAT + 700 mV), a standing 500 mV disagreement between two
+ * expressions of "the engage target".  Hence one function, two callers.
+ *
+ * The caller passes ta_c_max/target_ibus explicitly because sm_dc_start_charging()
+ * has not yet copied the TA descriptor in when the pump driver needs this answer.
+ */
+u32 sm_dc_calc_preset_request(struct sm_dc_info *sm_dc, int adc_vbat,
+			      u32 ta_c_max, u32 target_ibus, u32 *req_ma)
+{
+	u32 c, v;
+
+	c = MIN(ta_c_max, ((target_ibus * 50) / 100));
+	c = pps_c(MAX(c, sm_dc->config.ta_min_current));
+	v = (2 * adc_vbat) + _calc_pps_v_init_offset(sm_dc, c);
+	v = pps_v(MAX(v, sm_dc->config.ta_min_voltage));
+
+	if (req_ma)
+		*req_ma = c;
+
+	return v;
+}
+EXPORT_SYMBOL_GPL(sm_dc_calc_preset_request);
 
 static inline int _adjust_pps_v(struct sm_dc_info *sm_dc, int pps_v_original)
 {
@@ -468,10 +518,13 @@ static void pd_preset_dc_work(struct work_struct *work)
 			sm_dc->name, __func__, adc_vbat, sm_dc->config.ta_min_voltage, sm_dc->ta.v_max,
 			sm_dc->ta.c_max, sm_dc->target_ibus);
 
-	sm_dc->ta.c = MIN(sm_dc->ta.c_max, ((sm_dc->target_ibus * 50) / 100));
-	sm_dc->ta.c = pps_c(MAX(sm_dc->ta.c, sm_dc->config.ta_min_current));
-	sm_dc->ta.v = (2 * adc_vbat) + _calc_pps_v_init_offset(sm_dc);
-	sm_dc->ta.v = pps_v(MAX(sm_dc->ta.v, sm_dc->config.ta_min_voltage));
+	/*
+	 * Identical arithmetic to the four transcribed lines this replaces, moved
+	 * into sm_dc_calc_preset_request() so the pump driver's pre-handover rail
+	 * precondition can ask for the SAME number instead of deriving its own.
+	 */
+	sm_dc->ta.v = sm_dc_calc_preset_request(sm_dc, adc_vbat, sm_dc->ta.c_max,
+						sm_dc->target_ibus, &sm_dc->ta.c);
 	ret = send_power_source_msg(sm_dc);
 	if (ret < 0)
 		return;
