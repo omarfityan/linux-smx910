@@ -802,6 +802,13 @@ struct sm5440 {
 	 */
 	u32 preset_expect_mv;
 	u32 preset_expect_ma;
+
+	/*
+	 * Runtime gate for the pre-enable rail probe, which is itself a suspect (see
+	 * its comment in sm5440_dc_set_charging_enable).  Default TRUE so behaviour is
+	 * unchanged unless deliberately turned off; both arms then run on one binary.
+	 */
+	bool rail_probe_enabled;
 };
 
 /*
@@ -2178,23 +2185,52 @@ static int sm5440_dc_set_charging_enable(struct i2c_client *i2c, bool enable)
 		int s, vpre[3] = { }, applied[3] = { -1, -1, -1 }, slope;
 		union power_supply_propval apv;
 
-		for (s = 0; s < 3; s++) {
-			if (s)
-				msleep(50);
-			sm5440_get_vbus_uv(chip, &vpre[s]);
-			vpre[s] /= 1000;
-			if (chip->tcpm_psy &&
-			    !power_supply_get_property(chip->tcpm_psy,
-						       POWER_SUPPLY_PROP_VOLTAGE_NOW, &apv))
-				applied[s] = apv.intval / 1000;	/* -1 = unreadable, not a real zero */
+		/*
+		 * 🔴 THE PROBE IS ITSELF UNDER TEST, hence the runtime gate.
+		 *
+		 * It inserts ~100 ms of sampling between setup_direct_charging_work_config()
+		 * and the op-mode write below.  Scoring every saved trace showed that EVERY
+		 * capture containing this probe has zero pump current (2 of 2) and every
+		 * capture containing conversion lacks it (3 of 3), while its two rival
+		 * instruments are excluded by the same table -- the +0..450 ms enable probe
+		 * is present in a SUCCESSFUL run, and the INT flush below is present in two.
+		 * In the successful run "dc config" to the op-mode write is 4 ms; with this
+		 * probe it is 122 ms, and it lands inside the ~200 ms the chip needs to begin
+		 * converting.
+		 *
+		 * That correlation is NOT proof -- one failure predates the probe, so it
+		 * cannot be a sole necessary cause -- and it is retrospective across builds.
+		 * So it gets tested rather than argued: a runtime gate lets both arms run on
+		 * ONE binary, which removes "different build" as a confound.
+		 *
+		 * echo 0 > /sys/class/power_supply/sm5440-charge-pump/device/rail_probe
+		 *
+		 * The skip is LOGGED.  A silently-skipped instrument is indistinguishable
+		 * from one that ran and found nothing, and a capture must always say which
+		 * arm produced it.
+		 */
+		if (!READ_ONCE(chip->rail_probe_enabled)) {
+			dev_info(chip->dev,
+				 "pre-enable rail: probe SKIPPED (rail_probe=0) -- no sampling delay before the op-mode write\n");
+		} else {
+			for (s = 0; s < 3; s++) {
+				if (s)
+					msleep(50);
+				sm5440_get_vbus_uv(chip, &vpre[s]);
+				vpre[s] /= 1000;
+				if (chip->tcpm_psy &&
+				    !power_supply_get_property(chip->tcpm_psy,
+							       POWER_SUPPLY_PROP_VOLTAGE_NOW, &apv))
+					applied[s] = apv.intval / 1000;	/* -1 = unreadable, not a real zero */
+			}
+			slope = vpre[2] - vpre[0];
+			dev_info(chip->dev,
+				 "pre-enable rail: VBUS -100ms=%d -50ms=%d 0ms=%dmV (slope %+dmV/100ms -- %s) | contract %d/%d/%dmV -- %s\n",
+				 vpre[0], vpre[1], vpre[2], slope,
+				 abs(slope) > SM5440_DC_RAIL_MOVING_MV ? "MOVING" : "flat",
+				 applied[0], applied[1], applied[2],
+				 (applied[0] == applied[2]) ? "contract CONSTANT" : "contract MOVING");
 		}
-		slope = vpre[2] - vpre[0];
-		dev_info(chip->dev,
-			 "pre-enable rail: VBUS -100ms=%d -50ms=%d 0ms=%dmV (slope %+dmV/100ms -- %s) | contract %d/%d/%dmV -- %s\n",
-			 vpre[0], vpre[1], vpre[2], slope,
-			 abs(slope) > SM5440_DC_RAIL_MOVING_MV ? "MOVING" : "flat",
-			 applied[0], applied[1], applied[2],
-			 (applied[0] == applied[2]) ? "contract CONSTANT" : "contract MOVING");
 
 		if (!regmap_bulk_read(chip->regmap, SM5440_REG_INT1, pre, 4) &&
 		    (pre[0] | pre[1] | pre[2] | pre[3]))
@@ -3786,6 +3822,34 @@ static ssize_t dc_inject_hrst_store(struct device *dev, struct device_attribute 
 }
 static DEVICE_ATTR_WO(dc_inject_hrst);
 
+/*
+ * Enable/disable the pre-enable rail probe at runtime.  Readable as well as
+ * writable, deliberately: a capture has to be able to state which arm produced it,
+ * and asking the device beats trusting a note about what was set earlier.
+ */
+static ssize_t rail_probe_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct sm5440 *chip = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(chip->rail_probe_enabled) ? 1 : 0);
+}
+
+static ssize_t rail_probe_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct sm5440 *chip = dev_get_drvdata(dev);
+	bool on;
+
+	if (kstrtobool(buf, &on))
+		return -EINVAL;
+
+	WRITE_ONCE(chip->rail_probe_enabled, on);
+	dev_info(chip->dev, "pre-enable rail probe %s\n", on ? "ENABLED" : "DISABLED");
+	return count;
+}
+static DEVICE_ATTR_RW(rail_probe);
+
 static int sm5440_get_property(struct power_supply *psy,
 			       enum power_supply_property psp,
 			       union power_supply_propval *val)
@@ -3957,6 +4021,14 @@ static int sm5440_probe(struct i2c_client *client)
 	/* Guarded manual-engage bring-up trigger (non-fatal if it fails). */
 	if (device_create_file(dev, &dev_attr_pump_test))
 		dev_warn(dev, "could not create pump_test sysfs attribute\n");
+
+	/*
+	 * Default TRUE: turning the pre-enable rail probe off is an explicit act, so a
+	 * boot with no one watching behaves exactly as the captures that came before it.
+	 */
+	chip->rail_probe_enabled = true;
+	if (device_create_file(dev, &dev_attr_rail_probe))
+		dev_warn(dev, "could not create rail_probe sysfs attribute\n");
 
 	/*
 	 * Increment-2: create the sm_dc CC/CV engine instance, wire its ops to this
