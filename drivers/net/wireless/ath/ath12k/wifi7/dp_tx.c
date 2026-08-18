@@ -222,10 +222,13 @@ tcl_ring_sel:
 			goto map;
 		}
 
-		/* hdr is pointing to a wrong place after alignment,
-		 * so refresh it for later use.
+		/*
+		 * The payload may have been shifted or even the entire buffer may have
+		 * been reallocated for alignment. In that case, hdr and skb_cb
+		 * are stale pointers. Refresh them now for later dereference.
 		 */
 		hdr = (void *)skb->data;
+		skb_cb = ATH12K_SKB_CB(skb);
 	}
 map:
 	ti.paddr = dma_map_single(dp->dev, skb->data, skb->len, DMA_TO_DEVICE);
