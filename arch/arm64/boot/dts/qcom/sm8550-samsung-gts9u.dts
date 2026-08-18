@@ -17,6 +17,7 @@
 
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include <dt-bindings/sound/cs35l45.h>
 #include <dt-bindings/usb/pd.h>
 #include "sm8550.dtsi"
 #include "pm8550.dtsi"
@@ -99,6 +100,7 @@
 		i2c0 = &i2c_hub_8;	/* SM5714 charger 0x49 / MUIC 0x25 / FG 0x71 */
 		i2c1 = &i2c_hub_9;	/* SM5714 PDIC 0x33 */
 		i2c2 = &i2c_hub_3;	/* SM5440 charge-pump 0x63 (rung-3 45 W) */
+		i2c3 = &i2c_hub_6;	/* CS35L45 speaker amps 0x30-0x33 */
 	};
 
 	chosen {
@@ -165,6 +167,34 @@
 		regulator-name = "panel_ldo_en";
 		gpio = <&tlmm 187 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
+		regulator-boot-on;
+	};
+
+	/*
+	 * vreg_spkr_amp — the supply rail behind all four CS35L45 speaker
+	 * amplifiers. The device's own stock dtbo (gts9uwifi r03,
+	 * fragment@159) carries this as a regulator-fixed named "dummy_vreg",
+	 * with every amp's VP-supply AND VA-supply pointing at it.
+	 *
+	 * The stock name is misleading and is deliberately not reproduced: the
+	 * node is not a placeholder, it gates a real rail on TLMM 19
+	 * (gpio = <0xffffffff 0x13 0x00> in the overlay, resolved to &tlmm via
+	 * its own __fixups__), and TLMM 19 has exactly one consumer in the whole
+	 * stock overlay — this node. regulator-always-on because stock drives it
+	 * high at boot and never releases it; the amps have no other supply.
+	 *
+	 * Mainline's cs35l45 driver requests "vdd-a" and "vdd-batt"
+	 * (cs35l45.c:1379,1384), NOT stock's VP/VA property names. Because
+	 * regulator_get() substitutes a dummy regulator on a DT system rather
+	 * than failing, a mis-named supply would probe clean and silently leave
+	 * this GPIO undriven — so the rename is load-bearing, not cosmetic.
+	 */
+	vreg_spkr_amp: spkr-amp-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vreg_spkr_amp";
+		gpio = <&tlmm 19 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-always-on;
 		regulator-boot-on;
 	};
 
@@ -1524,6 +1554,161 @@
 	charger@63 {
 		compatible = "siliconmitus,sm5440";
 		reg = <0x63>;
+	};
+};
+
+/*
+ * Cirrus Logic CS35L45 quad speaker-amplifier control bus.
+ *
+ * The tablet's four speakers are driven by four CS35L45 smart amplifiers
+ * sharing ONE I2C control bus, ONE reset line and ONE interrupt line. Every
+ * value below is transcribed from this device's own stock dtbo (gts9uwifi
+ * r03, fragment@160), not from a sister device.
+ *
+ * The bus is qupv3_hub_i2c6 (i2c@998000) = mainline &i2c_hub_6, a fourth
+ * serial engine inside the same &i2c_master_hub_0 wrapper as the SM5714 and
+ * SM5440 buses above. That mapping is not inferred: the overlay's __fixups__
+ * node names the target label verbatim, "qupv3_hub_i2c6 =
+ * /fragment@160:target:0", and fragment@160 is the fragment holding all four
+ * amp nodes. clock-frequency mirrors stock's qcom,clk-freq-out = <0xf4240>
+ * (1 MHz). Pinned to i2c-3 via the root aliases node so that enabling this
+ * bus cannot renumber the charging buses that tools address as /dev/i2c-0.
+ *
+ * ADDRESSES AND PLACEMENT (stock node names -> cirrus,bd-suffix, which is how
+ * stock selects each amp's per-unit calibration blob):
+ *   0x30 cs35l45-rearleft   _2      0x31 cs35l45-frontleft   _0
+ *   0x32 cs35l45-rearright  _3      0x33 cs35l45-frontright  _1
+ *
+ * WHAT THIS NODE DOES NOT DO. I2C here is CONTROL only. Audio data reaches
+ * the amps over the LPASS primary port on TLMM gpio126/127/128/129 (stock
+ * pri_mi2s_pinctrl; mux functions i2s0_sck / i2s0_data0 / i2s0_data1 /
+ * i2s0_ws, which mainline's sm8550 TLMM carries under exactly those names),
+ * as four TDM slots at 48 kHz / 24-bit — the device's own PAL backend
+ * definition is TDM-LPAIF-RX-PRIMARY with <channels>4</channels>. Driving
+ * that needs a sound card plus an AudioReach topology binary, and mainline
+ * currently has neither the TDM DAI ops on the q6apm path nor an SM8550
+ * topology containing any I2S/TDM module. So no sound-card node is described
+ * here: these nodes bring the amplifiers up as I2C devices and nothing more.
+ * The in-tree sm8550-sony-xperia-yodo-pdx234.dts declares its CS35L45s the
+ * same way, with no card anywhere.
+ *
+ * RESET is shared by all four amps on TLMM 42, and the polarity is
+ * ACTIVE_HIGH — stock's flag cell is 0x00, and mainline's driver acquires the
+ * line GPIOD_OUT_LOW then drives logical 1 to release reset
+ * (cs35l45.c:1399,1413), so logical 1 must be physically high. Declaring it
+ * on all four nodes is correct and intended: the driver comments "If reset is
+ * shared only one instance can claim it", takes -EBUSY on the other three and
+ * continues (cs35l45.c:1398).
+ *
+ * INTERRUPTS are deliberately omitted for now. Stock wires all four amps to a
+ * shared TLMM 14 (overlay: interrupts = <0x0e 0x00>, interrupt-parent
+ * resolved to &tlmm via __fixups__), which in mainline form is
+ * interrupts-extended = <&tlmm 14 IRQ_TYPE_LEVEL_LOW> — the driver ORs in
+ * IRQF_TRIGGER_LOW | IRQF_SHARED itself. The driver treats the IRQ as
+ * optional ("if (cs35l45->irq)"), and leaving it out keeps a level-triggered
+ * shared line off a boot whose only job is to establish that the amplifiers
+ * power up and answer on I2C. It is added back with the sound card.
+ *
+ * No pinctrl is declared: gpiolib's request path muxes a TLMM pin to its GPIO
+ * function on its own, and four devices naming one pin group would collide in
+ * mainline's pinmux. Stock's cs35l45_gpio_default (gpio14 + gpio42, function
+ * "gpio", bias-disable, drive-strength 2) matches the TLMM defaults for these
+ * pins.
+ */
+&i2c_hub_6 {
+	status = "okay";
+	clock-frequency = <1000000>;
+
+	spkr_amp_rl: speaker-amp@30 {
+		compatible = "cirrus,cs35l45";
+		reg = <0x30>;
+
+		reset-gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>;
+
+		vdd-a-supply = <&vreg_spkr_amp>;
+		vdd-batt-supply = <&vreg_spkr_amp>;
+
+		cirrus,asp-sdout-hiz-ctrl = <(CS35L45_ASP_TX_HIZ_UNUSED |
+					      CS35L45_ASP_TX_HIZ_DISABLED)>;
+
+		#sound-dai-cells = <1>;
+
+		cirrus,gpio-ctrl1 {
+			gpio-ctrl = <0x2>;
+		};
+
+		cirrus,gpio-ctrl2 {
+			gpio-ctrl = <0x2>;
+		};
+	};
+
+	spkr_amp_fl: speaker-amp@31 {
+		compatible = "cirrus,cs35l45";
+		reg = <0x31>;
+
+		reset-gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>;
+
+		vdd-a-supply = <&vreg_spkr_amp>;
+		vdd-batt-supply = <&vreg_spkr_amp>;
+
+		cirrus,asp-sdout-hiz-ctrl = <(CS35L45_ASP_TX_HIZ_UNUSED |
+					      CS35L45_ASP_TX_HIZ_DISABLED)>;
+
+		#sound-dai-cells = <1>;
+
+		cirrus,gpio-ctrl1 {
+			gpio-ctrl = <0x2>;
+		};
+
+		cirrus,gpio-ctrl2 {
+			gpio-ctrl = <0x2>;
+		};
+	};
+
+	spkr_amp_rr: speaker-amp@32 {
+		compatible = "cirrus,cs35l45";
+		reg = <0x32>;
+
+		reset-gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>;
+
+		vdd-a-supply = <&vreg_spkr_amp>;
+		vdd-batt-supply = <&vreg_spkr_amp>;
+
+		cirrus,asp-sdout-hiz-ctrl = <(CS35L45_ASP_TX_HIZ_UNUSED |
+					      CS35L45_ASP_TX_HIZ_DISABLED)>;
+
+		#sound-dai-cells = <1>;
+
+		cirrus,gpio-ctrl1 {
+			gpio-ctrl = <0x2>;
+		};
+
+		cirrus,gpio-ctrl2 {
+			gpio-ctrl = <0x2>;
+		};
+	};
+
+	spkr_amp_fr: speaker-amp@33 {
+		compatible = "cirrus,cs35l45";
+		reg = <0x33>;
+
+		reset-gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>;
+
+		vdd-a-supply = <&vreg_spkr_amp>;
+		vdd-batt-supply = <&vreg_spkr_amp>;
+
+		cirrus,asp-sdout-hiz-ctrl = <(CS35L45_ASP_TX_HIZ_UNUSED |
+					      CS35L45_ASP_TX_HIZ_DISABLED)>;
+
+		#sound-dai-cells = <1>;
+
+		cirrus,gpio-ctrl1 {
+			gpio-ctrl = <0x2>;
+		};
+
+		cirrus,gpio-ctrl2 {
+			gpio-ctrl = <0x2>;
+		};
 	};
 };
 
