@@ -813,6 +813,16 @@ struct sm5440 {
 	 * unchanged unless deliberately turned off; both arms then run on one binary.
 	 */
 	bool rail_probe_enabled;
+
+	/*
+	 * Runtime gate for the +0..450 ms enable probe, which is itself a suspect (see
+	 * its comment in sm5440_dc_set_charging_enable).  It widens a DIFFERENT window
+	 * than rail_probe: the op-mode write -> first PRE_CC poll gap, which the
+	 * device-own path leaves at DELAY_PPS_UPDATE (250 ms) and the probe extends to
+	 * ~700 ms.  Default TRUE so behaviour is unchanged unless deliberately turned
+	 * off; both arms then run on one binary.
+	 */
+	bool enable_probe_enabled;
 };
 
 /*
@@ -2293,8 +2303,28 @@ static int sm5440_dc_set_charging_enable(struct i2c_client *i2c, bool enable)
 	 * 🔴 DIAGNOSTIC COST: this blocks ~450 ms inside every enable, healthy ones
 	 * included.  That is acceptable while the trigger is unknown and should be cut
 	 * back to the three start-up points once it is identified.
+	 *
+	 * 🔴 THE PROBE IS ITSELF UNDER TEST, hence the runtime gate below.
+	 *
+	 * It is the sole owner of the op-mode-write -> first PRE_CC poll window.  The
+	 * device-own path schedules that poll at DELAY_PPS_UPDATE (250 ms) and nothing
+	 * touches the chip in between -- pd_preset_dc_work only updates its own state
+	 * variable and queues delayed work -- so this probe stretches the window to
+	 * ~700 ms and gating it off restores the device-own 250 ms exactly.  That is a
+	 * DIFFERENT window from the one rail_probe widens (config write -> op-mode
+	 * write), so the two gates are not two halves of one delay.
+	 *
+	 * echo 0 > /sys/class/power_supply/sm5440-charge-pump/device/enable_probe
 	 */
-	if (enable) {
+	if (enable && !READ_ONCE(chip->enable_probe_enabled)) {
+		/*
+		 * The skip is LOGGED.  A silently-skipped instrument is indistinguishable
+		 * from one that ran and found nothing, and a capture must always say which
+		 * arm produced it.
+		 */
+		dev_info(chip->dev,
+			 "enable probe SKIPPED (enable_probe=0) -- no sampling delay after the op-mode write; PRE_CC polls at the device-own DELAY_PPS_UPDATE\n");
+	} else if (enable) {
 		/* Elapsed ms after the op-mode write, not gaps -- the sleep is the delta. */
 		static const int probe_at_ms[] = { 0, 50, 150, 200, 250, 300, 350, 400, 450 };
 		int k, opm, vb, vo, prev = 0;
@@ -3946,6 +3976,33 @@ static ssize_t rail_probe_store(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RW(rail_probe);
 
+/*
+ * enable_probe: the runtime gate for the +0..450 ms post-op-mode enable probe.
+ * Reading asks the driver rather than trusting a note about what was set earlier.
+ */
+static ssize_t enable_probe_show(struct device *dev, struct device_attribute *attr,
+				 char *buf)
+{
+	struct sm5440 *chip = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(chip->enable_probe_enabled) ? 1 : 0);
+}
+
+static ssize_t enable_probe_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct sm5440 *chip = dev_get_drvdata(dev);
+	bool on;
+
+	if (kstrtobool(buf, &on))
+		return -EINVAL;
+
+	WRITE_ONCE(chip->enable_probe_enabled, on);
+	dev_info(chip->dev, "post-enable sampling probe %s\n", on ? "ENABLED" : "DISABLED");
+	return count;
+}
+static DEVICE_ATTR_RW(enable_probe);
+
 static int sm5440_get_property(struct power_supply *psy,
 			       enum power_supply_property psp,
 			       union power_supply_propval *val)
@@ -4125,6 +4182,14 @@ static int sm5440_probe(struct i2c_client *client)
 	chip->rail_probe_enabled = true;
 	if (device_create_file(dev, &dev_attr_rail_probe))
 		dev_warn(dev, "could not create rail_probe sysfs attribute\n");
+
+	/*
+	 * Default TRUE for the same reason as rail_probe: a boot with no one watching
+	 * behaves exactly as the captures that came before it.
+	 */
+	chip->enable_probe_enabled = true;
+	if (device_create_file(dev, &dev_attr_enable_probe))
+		dev_warn(dev, "could not create enable_probe sysfs attribute\n");
 
 	/*
 	 * Increment-2: create the sm_dc CC/CV engine instance, wire its ops to this
