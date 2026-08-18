@@ -319,6 +319,9 @@
 						 * one-directional (it only lowers).  Raising the ratchet's ceiling
 						 * without raising this seed therefore has NO effect. */
 #define SM5440_AUTO_RETRY_MAX		3	/* consecutive engage failures before latching off until replug */
+#define SM5440_AUTO_WAIT_LOG_EVERY	20	/* ~60 s at the 3 s buck poll: keep a long PD wait observable
+					 * without logging every poll.  A silent wait and a hung wait
+					 * look identical, and one of them is a bug. */
 /*
  * What a strike COUNTS, and what may clear it.
  *
@@ -747,6 +750,7 @@ struct sm5440 {
 	bool auto_engaged;	/* this dc run was started by the supervisor (gates auto-disengage) */
 	bool dc_err_latched;	/* engage failed SM5440_AUTO_RETRY_MAX times -- stop until charger replug */
 	int dc_retry_cnt;	/* consecutive auto-engage failures (device-own dc_retry_cnt analog) */
+	int dc_wait_cnt;	/* consecutive "PD contract not ready yet" refusals -- NOT strikes */
 
 	/*
 	 * Build-2b: re-engage-on-HRST recovery.  dc_done marks a benign engine
@@ -3416,6 +3420,63 @@ static void sm5440_dc_intent_cb(void *ctx, bool intent)
  * engage_lock held across their sync-cancels (dc_stop sync-cancels the monitors,
  * which themselves take engage_lock).
  */
+/*
+ * Does this sm5440_dc_start() failure mean "the PD contract is not ready YET", rather
+ * than "the pump failed"?
+ *
+ * 🔴 THE DEFECT THIS EXISTS TO FIX, MEASURED THREE TIMES.  The supervisor is kicked by
+ * the buck worker's notify callback, and that worker is a pure 3 s poller -- so
+ * SM5440_AUTO_RETRY_MAX consecutive failures is a **6.2 s window** from charger detect.
+ * On a hot replug (and on the recovery after a source drop-out) PD negotiation routinely
+ * takes longer than that, especially when it goes through a Hard Reset.  Measured:
+ *
+ *   [ 683.534] dc start: PPS not active (-95) -- refusing ...  -> retry 1/3
+ *   [ 686.621] ...                                             -> retry 2/3
+ *   [ 689.674] auto-engage: 3 consecutive failures -- latching off until charger replug
+ *
+ * and ~8 s later the contract came up perfectly good (`C PD [PD_PPS]`, 9000 mV, 5 A) --
+ * unusable, because dc_err_latched clears ONLY on a physical unplug.  The user-visible
+ * result is a tablet that charges at the buck's ~1.8 A instead of the pump's ~9 A for the
+ * whole cable session.
+ *
+ * ⭐ WHY THE WINDOW IS ENTERED AT ALL: sm5440_pd_source_usable() reads tcpm's ONLINE /
+ * usb_type, which still carry the PRE-collapse PPS state, while tcpm_pps_activate() reads
+ * the live port->pps_data.supported, which a Hard Reset has cleared.  One predicate
+ * reports the source's CAPABILITY and the other its negotiated STATE; the gap between
+ * them is not a pump fault and must not be charged to a latch that exists to stop a
+ * FAILING PUMP from looping.
+ *
+ * ⭐⭐ MATCH-STOCK.  The device's own sec_direct_charger.c increments its dc_retry_cnt
+ * ONLY on POWER_SUPPLY_EXT_HEALTH_DC_ERR -- an actual direct-charger fault -- and never on
+ * a contract that has not finished negotiating; it simply does not enter direct mode until
+ * the cable type reports APDO.  Our own dc_reengage_work already words the same rule in
+ * its comment: "a 'PPS not back yet' within the window is a WAIT, not a strike."  The
+ * engage path never got it.  This gives it that rule.
+ *
+ * Every code below is an activation/contract verdict, never a converter verdict:
+ *   -ENOTCONN    sm5440_pd_source_usable() declined
+ *   -EOPNOTSUPP  tcpm: pps_data.supported still false (source caps not parsed yet)
+ *   -EAGAIN      tcpm: port not SNK_READY -- mid-negotiation, the post-Hard-Reset state
+ *   -ETIMEDOUT   the source did not enter PPS inside tcpm's own window
+ *   -EBUSY       our own activation rate-limit floor, which is self-clearing
+ *
+ * Anything else -- a chip fault, a failed buck inhibit, an implausible VBAT, a settle
+ * failure -- is a real engage failure and still earns a strike.
+ */
+static bool sm5440_dc_start_failed_on_contract(int ret)
+{
+	switch (ret) {
+	case -ENOTCONN:
+	case -EOPNOTSUPP:
+	case -EAGAIN:
+	case -ETIMEDOUT:
+	case -EBUSY:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static void sm5440_auto_engage_work(struct work_struct *work)
 {
 	struct sm5440 *chip = container_of(work, struct sm5440,
@@ -3459,6 +3520,7 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 	if (!intent) {
 		chip->dc_err_latched = false;
 		chip->dc_retry_cnt = 0;
+		chip->dc_wait_cnt = 0;		/* a fresh cable starts a fresh PD wait */
 		chip->dc_recover_armed = false;	/* Build-2b: unplug disarms any pending recovery */
 		WRITE_ONCE(chip->dc_done, false);	/* stock clears direct_chg_done on a cable change;
 							 * this is the ONLY place it clears, because the engage
@@ -3524,7 +3586,22 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 	WRITE_ONCE(chip->pps_active, false);
 	WRITE_ONCE(chip->pps_rearm_next, jiffies);	/* deliberate re-arm: never rate-limit it */
 	ret = sm5440_dc_start(chip, SM5440_AUTO_ENGAGE_CI_GL, false);
-	if (ret) {
+	if (ret && sm5440_dc_start_failed_on_contract(ret)) {
+		/*
+		 * WAIT, not a strike.  The buck keeps the pack meanwhile, and the next buck
+		 * poll (~3 s) retries -- exactly as before, minus the latch.  Unbounded on
+		 * purpose: stock simply does not enter direct mode until the cable type
+		 * reports APDO, and there is no vendor timeout to transcribe.  Logged on the
+		 * first wait and every SM5440_AUTO_WAIT_LOG_EVERY after it, because a wait
+		 * nobody can see is indistinguishable from a hang.
+		 */
+		if (chip->dc_wait_cnt++ % SM5440_AUTO_WAIT_LOG_EVERY == 0)
+			dev_info(chip->dev,
+				 "auto-engage: PD contract not ready (%d) -- WAITING, not a strike (wait %d, strikes still %d/%d)\n",
+				 ret, chip->dc_wait_cnt, chip->dc_retry_cnt,
+				 SM5440_AUTO_RETRY_MAX);
+	} else if (ret) {
+		chip->dc_wait_cnt = 0;
 		if (++chip->dc_retry_cnt >= SM5440_AUTO_RETRY_MAX) {
 			chip->dc_err_latched = true;
 			dev_warn(chip->dev,
@@ -3536,6 +3613,7 @@ static void sm5440_auto_engage_work(struct work_struct *work)
 				 ret, chip->dc_retry_cnt, SM5440_AUTO_RETRY_MAX);
 		}
 	} else {
+		chip->dc_wait_cnt = 0;
 		chip->auto_engaged = true;
 		/*
 		 * NOTE: starting is NOT success, so no dc_retry_cnt = 0 here.  Only an
@@ -3689,6 +3767,24 @@ static void sm5440_dc_reengage_work(struct work_struct *work)
 			dev_info(chip->dev,
 				 "reengage: RECOVERED -- PPS re-established, pump re-engaged (ci_gl=%u mA)\n",
 				 reengage_ci);
+			mutex_unlock(&chip->engage_lock);
+			return;
+		}
+		/*
+		 * Same rule as the engage path: a dc_start that refused because the contract
+		 * is not ready is a WAIT, not a strike.  This site is if anything MORE exposed
+		 * -- it runs immediately after a source drop-out, with the PD stack still
+		 * rebuilding, which is precisely when pd_source_usable()'s stale view and
+		 * tcpm's live pps_data.supported disagree.  Re-arm and let the next attempt
+		 * run; dc_intent going low still ends this cleanly, and the poll above already
+		 * bounds how long we sit here.
+		 */
+		if (sm5440_dc_start_failed_on_contract(ret)) {
+			dev_info(chip->dev,
+				 "reengage: contract back but not yet steppable (%d) -- WAITING, not a strike\n",
+				 ret);
+			mod_delayed_work(system_long_wq, &chip->dc_reengage_work,
+					 msecs_to_jiffies(SM5440_REENGAGE_GAP_MS));
 			mutex_unlock(&chip->engage_lock);
 			return;
 		}
