@@ -1615,9 +1615,54 @@
  * "gpio", bias-disable, drive-strength 2) matches the TLMM defaults for these
  * pins.
  */
+/*
+ * PIN CONFIGURATION FOR THE AMPLIFIER BUS -- both values taken from this
+ * device's own stock device tree, not from the SoC defaults.
+ *
+ * DRIVE STRENGTH 8 mA. The SoC base (kalama-pinctrl.dtsi:2471-2496, and
+ * mainline's own hub_i2c6_data_clk at sm8550.dtsi:4691-4697) declares these
+ * pins at 2 mA. This board's overlay overrides BOTH of them to 8 mA --
+ * fragment@166 for SDA and fragment@167 for SCL, each a bare
+ * "config { drive-strength = <0x08>; }" -- and i2c6 is the ONLY hub bus on
+ * this board that gets the override. It is also the only one stock runs at
+ * 1 MHz. Mainline had taken the 1 MHz and left the 2 mA: half a value pair.
+ *
+ * 🔴 This is NOT what fixed the transfer stall, and the record should be
+ * clear about that: an A/B measured on this hardware, taking both pads from
+ * 2 mA to 8 mA and reading the TLMM control registers back to prove it
+ * landed, moved the transfer time by 0.01 units out of 74. The stall was the
+ * Fast-mode-plus SCL high time, fixed in the driver's clock map. 8 mA is here
+ * because it is what the manufacturer specifies for this bus driving these
+ * four amplifiers, and a value this device's own source states is not
+ * optional on the grounds that one measurement did not need it.
+ *
+ * SLEEP STATE. Stock declares qupv3_hub_i2c6_sleep alongside the active
+ * states: both pins back to plain "gpio" at 2 mA. It is live, not decorative
+ * -- geni_se_resources_off() calls pinctrl_pm_select_sleep_state()
+ * (qcom-geni-se.c:601) on every runtime suspend, and this bus autosuspends
+ * after 250 ms. Bias is deliberately left unspecified, exactly as stock leaves
+ * it, so the pull is carried over from the active state rather than reset.
+ */
+&hub_i2c6_data_clk {
+	drive-strength = <8>;
+};
+
+&tlmm {
+	hub_i2c6_sleep: hub-i2c6-sleep-state {
+		/* SDA, SCL */
+		pins = "gpio8", "gpio9";
+		function = "gpio";
+		drive-strength = <2>;
+	};
+};
+
 &i2c_hub_6 {
 	status = "okay";
 	clock-frequency = <1000000>;
+
+	pinctrl-names = "default", "sleep";
+	pinctrl-0 = <&hub_i2c6_data_clk>;
+	pinctrl-1 = <&hub_i2c6_sleep>;
 
 	spkr_amp_rl: speaker-amp@30 {
 		compatible = "cirrus,cs35l45";
