@@ -22,6 +22,20 @@
 #define SE_I2C_RX_TRANS_LEN		0x270
 #define SE_I2C_SCL_COUNTERS		0x278
 
+/*
+ * Packing and byte-granularity live in the GENI core's private register map
+ * in drivers/soc/qcom/qcom-geni-se.c and are not exported, because until now
+ * no client has needed to read them back. geni_se_config_packing() programs
+ * them once, from probe. Reading them again at transfer time is the only way
+ * to tell "the engine was configured wrongly" from "the engine was configured
+ * correctly and did not keep it".
+ */
+#define SE_GENI_BYTE_GRAN		0x254
+#define SE_GENI_TX_PACKING_CFG0		0x260
+#define SE_GENI_TX_PACKING_CFG1		0x264
+#define SE_GENI_RX_PACKING_CFG0		0x284
+#define SE_GENI_RX_PACKING_CFG1		0x288
+
 #define SE_I2C_ERR  (M_CMD_OVERRUN_EN | M_ILLEGAL_CMD_EN | M_CMD_FAILURE_EN |\
 			M_GP_IRQ_1_EN | M_GP_IRQ_3_EN | M_GP_IRQ_4_EN)
 #define SE_I2C_ABORT		BIT(1)
@@ -219,6 +233,53 @@ static void qcom_geni_i2c_conf(struct geni_i2c_dev *gi2c)
 	writel_relaxed(val, gi2c->se.base + SE_I2C_SCL_COUNTERS);
 }
 
+/*
+ * Dump the serial engine's own view of its configuration. Called at two
+ * moments -- immediately after probe programs it, and again immediately
+ * before each transfer -- so the two can be compared. The I2C master hub is
+ * the only serial engine on this SoC whose core clock this driver gates, and
+ * the vendor driver re-writes GENI_OUTPUT_CTRL on every hub runtime resume,
+ * so "the configuration did not survive the gate" is a live possibility that
+ * a single absolute reading cannot distinguish from a wrong value.
+ *
+ * dev_dbg throughout: this costs nothing unless dynamic debug is enabled.
+ */
+static void geni_i2c_dump_se_cfg(struct geni_i2c_dev *gi2c, const char *when)
+{
+	void __iomem *base = gi2c->se.base;
+
+	dev_dbg(gi2c->se.dev,
+		"cfg@%s pack tx:0x%08x/0x%08x rx:0x%08x/0x%08x byte_gran:0x%x\n",
+		when,
+		readl_relaxed(base + SE_GENI_TX_PACKING_CFG0),
+		readl_relaxed(base + SE_GENI_TX_PACKING_CFG1),
+		readl_relaxed(base + SE_GENI_RX_PACKING_CFG0),
+		readl_relaxed(base + SE_GENI_RX_PACKING_CFG1),
+		readl_relaxed(base + SE_GENI_BYTE_GRAN));
+	dev_dbg(gi2c->se.dev,
+		"cfg@%s m_irq_en:0x%08x out_ctrl:0x%x force_dflt:0x%x dma_mode:0x%x\n",
+		when,
+		readl_relaxed(base + SE_GENI_M_IRQ_EN),
+		readl_relaxed(base + GENI_OUTPUT_CTRL),
+		readl_relaxed(base + GENI_FORCE_DEFAULT_REG),
+		readl_relaxed(base + SE_GENI_DMA_MODE_EN));
+	dev_dbg(gi2c->se.dev,
+		"cfg@%s tx_wm:0x%x rx_wm:0x%x rx_rfr:0x%x tx_fifo_stat:0x%08x\n",
+		when,
+		readl_relaxed(base + SE_GENI_TX_WATERMARK_REG),
+		readl_relaxed(base + SE_GENI_RX_WATERMARK_REG),
+		readl_relaxed(base + SE_GENI_RX_RFR_WATERMARK_REG),
+		readl_relaxed(base + SE_GENI_TX_FIFO_STATUS));
+	dev_dbg(gi2c->se.dev,
+		"cfg@%s scl_cnt:0x%08x m_clk_cfg:0x%x clk_sel:0x%x hw_param0:0x%08x status:0x%x\n",
+		when,
+		readl_relaxed(base + SE_I2C_SCL_COUNTERS),
+		readl_relaxed(base + GENI_SER_M_CLK_CFG),
+		readl_relaxed(base + SE_GENI_CLK_SEL),
+		readl_relaxed(base + SE_HW_PARAM_0),
+		readl_relaxed(base + SE_GENI_STATUS));
+}
+
 static void geni_i2c_err_misc(struct geni_i2c_dev *gi2c)
 {
 	u32 m_cmd = readl_relaxed(gi2c->se.base + SE_GENI_M_CMD0);
@@ -298,6 +359,19 @@ static irqreturn_t geni_i2c_irq(int irq, void *dev)
 	dma = readl_relaxed(base + SE_GENI_DMA_MODE_EN);
 	cur = gi2c->cur;
 
+	/*
+	 * Whether the TX watermark interrupt fires at all, and how far the fill
+	 * loop gets, is the whole question for a write that starts and stalls.
+	 * SE_GENI_M_IRQ_CLEAR is written below, so a status read taken later --
+	 * from the timeout path, say -- can only report what is still pending
+	 * and cannot show that an interrupt fired and was serviced.
+	 */
+	if (cur)
+		dev_dbg(gi2c->se.dev,
+			"irq-in  m_stat:0x%08x tx_fifo_stat:0x%08x wr:%d/%d rd:%d\n",
+			m_stat, readl_relaxed(base + SE_GENI_TX_FIFO_STATUS),
+			gi2c->cur_wr, cur->len, gi2c->cur_rd);
+
 	if (!cur ||
 	    m_stat & (M_CMD_FAILURE_EN | M_CMD_ABORT_EN) ||
 	    dm_rx_st & (DM_I2C_CB_ERR)) {
@@ -371,6 +445,12 @@ static irqreturn_t geni_i2c_irq(int irq, void *dev)
 	    dm_tx_st & TX_DMA_DONE || dm_tx_st & TX_RESET_DONE ||
 	    dm_rx_st & RX_DMA_DONE || dm_rx_st & RX_RESET_DONE)
 		complete(&gi2c->done);
+
+	if (cur)
+		dev_dbg(gi2c->se.dev,
+			"irq-out tx_fifo_stat:0x%08x wr:%d/%d rd:%d\n",
+			readl_relaxed(base + SE_GENI_TX_FIFO_STATUS),
+			gi2c->cur_wr, cur->len, gi2c->cur_rd);
 
 	spin_unlock(&gi2c->lock);
 
@@ -508,6 +588,12 @@ static int geni_i2c_tx_one_msg(struct geni_i2c_dev *gi2c, struct i2c_msg *msg,
 
 	writel_relaxed(len, se->base + SE_I2C_TX_TRANS_LEN);
 	geni_se_setup_m_cmd(se, I2C_WRITE, m_param);
+
+	dev_dbg(gi2c->se.dev,
+		"tx-cmd len:%zu trans_len:0x%x status:0x%x tx_fifo_stat:0x%08x\n",
+		len, readl_relaxed(se->base + SE_I2C_TX_TRANS_LEN),
+		readl_relaxed(se->base + SE_GENI_STATUS),
+		readl_relaxed(se->base + SE_GENI_TX_FIFO_STATUS));
 
 	if (dma_buf && geni_se_tx_dma_prep(se, dma_buf, len, &tx_dma)) {
 		geni_se_select_mode(se, GENI_SE_FIFO);
@@ -922,6 +1008,7 @@ static int geni_i2c_xfer(struct i2c_adapter *adap,
 	}
 
 	qcom_geni_i2c_conf(gi2c);
+	geni_i2c_dump_se_cfg(gi2c, "xfer");
 
 	if (gi2c->gpi_mode)
 		ret = geni_i2c_gpi_xfer(gi2c, msgs, num);
@@ -1129,6 +1216,7 @@ static int geni_i2c_probe(struct platform_device *pdev)
 				       PACKING_BYTES_PW, true, true, true);
 
 		dev_dbg(dev, "i2c fifo/se-dma mode. fifo depth:%d\n", tx_depth);
+		geni_i2c_dump_se_cfg(gi2c, "probe");
 	}
 
 	clk_disable_unprepare(gi2c->core_clk);
