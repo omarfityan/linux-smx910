@@ -1811,6 +1811,7 @@
 					      CS35L45_ASP_TX_HIZ_DISABLED)>;
 
 		#sound-dai-cells = <1>;
+		sound-name-prefix = "SpkrRearLeft";
 
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
@@ -1837,6 +1838,7 @@
 					      CS35L45_ASP_TX_HIZ_DISABLED)>;
 
 		#sound-dai-cells = <1>;
+		sound-name-prefix = "SpkrFrontLeft";
 
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
@@ -1863,6 +1865,7 @@
 					      CS35L45_ASP_TX_HIZ_DISABLED)>;
 
 		#sound-dai-cells = <1>;
+		sound-name-prefix = "SpkrRearRight";
 
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
@@ -1889,6 +1892,7 @@
 					      CS35L45_ASP_TX_HIZ_DISABLED)>;
 
 		#sound-dai-cells = <1>;
+		sound-name-prefix = "SpkrFrontRight";
 
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
