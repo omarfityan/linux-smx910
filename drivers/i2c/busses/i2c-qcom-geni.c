@@ -91,6 +91,46 @@ enum geni_i2c_err_code {
 #define XFER_TIMEOUT		HZ
 #define RST_TIMEOUT		HZ
 
+/*
+ * Diagnostic knobs. All default to exactly the behaviour without them, and all
+ * are writable at runtime, so both arms of a comparison live in ONE binary and
+ * no reflash sits between them.
+ *
+ * xfer_timeout_ms exists because "the transfer hangs" and "the transfer takes
+ * longer than one second" are the same observation through a fixed deadline,
+ * and on one bus here a single-byte write measures 547 ms against 0.18 ms on
+ * its siblings. Raising the deadline converts a pass/fail into a duration, and
+ * a duration can be fitted; a pass/fail cannot.
+ */
+static unsigned int xfer_timeout_ms;
+module_param(xfer_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(xfer_timeout_ms,
+	"Transfer timeout in ms; 0 uses the built-in default of one second.");
+
+/*
+ * SCL timing override, applied ONLY to the serial engine named in scl_dev, so a
+ * single bus can be changed without disturbing the others that are the control
+ * arm. Each counter is applied only if positive, so one field can be moved at a
+ * time. This is the vendor's 1 MHz row against mainline's without a device-tree
+ * change and without a vendor_boot flash.
+ */
+static char *scl_dev;
+static int scl_div, scl_high, scl_low, scl_cycle;
+module_param(scl_dev, charp, 0644);
+module_param(scl_div, int, 0644);
+module_param(scl_high, int, 0644);
+module_param(scl_low, int, 0644);
+module_param(scl_cycle, int, 0644);
+MODULE_PARM_DESC(scl_dev,
+	"Device name of the serial engine to apply the SCL overrides to, e.g. 998000.i2c.");
+
+static unsigned long geni_i2c_xfer_timeout(void)
+{
+	if (xfer_timeout_ms)
+		return msecs_to_jiffies(xfer_timeout_ms);
+	return XFER_TIMEOUT;
+}
+
 #define QCOM_I2C_MIN_NUM_OF_MSGS_MULTI_DESC	2
 
 /**
@@ -220,16 +260,31 @@ static int geni_i2c_clk_map_idx(struct geni_i2c_dev *gi2c)
 static void qcom_geni_i2c_conf(struct geni_i2c_dev *gi2c)
 {
 	const struct geni_i2c_clk_fld *itr = gi2c->clk_fld;
+	u32 div = itr->clk_div;
+	u32 high = itr->t_high_cnt;
+	u32 low = itr->t_low_cnt;
+	u32 cycle = itr->t_cycle_cnt;
 	u32 val;
+
+	if (scl_dev && !strcmp(dev_name(gi2c->se.dev), scl_dev)) {
+		if (scl_div > 0)
+			div = scl_div;
+		if (scl_high > 0)
+			high = scl_high;
+		if (scl_low > 0)
+			low = scl_low;
+		if (scl_cycle > 0)
+			cycle = scl_cycle;
+	}
 
 	writel_relaxed(0, gi2c->se.base + SE_GENI_CLK_SEL);
 
-	val = (itr->clk_div << CLK_DIV_SHFT) | SER_CLK_EN;
+	val = (div << CLK_DIV_SHFT) | SER_CLK_EN;
 	writel_relaxed(val, gi2c->se.base + GENI_SER_M_CLK_CFG);
 
-	val = itr->t_high_cnt << HIGH_COUNTER_SHFT;
-	val |= itr->t_low_cnt << LOW_COUNTER_SHFT;
-	val |= itr->t_cycle_cnt;
+	val = high << HIGH_COUNTER_SHFT;
+	val |= low << LOW_COUNTER_SHFT;
+	val |= cycle;
 	writel_relaxed(val, gi2c->se.base + SE_I2C_SCL_COUNTERS);
 }
 
@@ -536,6 +591,7 @@ static int geni_i2c_rx_one_msg(struct geni_i2c_dev *gi2c, struct i2c_msg *msg,
 {
 	dma_addr_t rx_dma = 0;
 	unsigned long time_left;
+	ktime_t t0;
 	void *dma_buf;
 	struct geni_se *se = &gi2c->se;
 	size_t len = msg->len;
@@ -561,7 +617,10 @@ static int geni_i2c_rx_one_msg(struct geni_i2c_dev *gi2c, struct i2c_msg *msg,
 	}
 
 	cur = gi2c->cur;
-	time_left = wait_for_completion_timeout(&gi2c->done, XFER_TIMEOUT);
+	t0 = ktime_get();
+	time_left = wait_for_completion_timeout(&gi2c->done, geni_i2c_xfer_timeout());
+	dev_dbg(gi2c->se.dev, "rx-done len:%zu elapsed:%lldus completed:%d\n",
+		len, ktime_us_delta(ktime_get(), t0), time_left ? 1 : 0);
 	if (!time_left)
 		geni_i2c_abort_xfer(gi2c);
 
@@ -575,6 +634,7 @@ static int geni_i2c_tx_one_msg(struct geni_i2c_dev *gi2c, struct i2c_msg *msg,
 {
 	dma_addr_t tx_dma = 0;
 	unsigned long time_left;
+	ktime_t t0;
 	void *dma_buf;
 	struct geni_se *se = &gi2c->se;
 	size_t len = msg->len;
@@ -609,7 +669,10 @@ static int geni_i2c_tx_one_msg(struct geni_i2c_dev *gi2c, struct i2c_msg *msg,
 		writel_relaxed(1, se->base + SE_GENI_TX_WATERMARK_REG);
 
 	cur = gi2c->cur;
-	time_left = wait_for_completion_timeout(&gi2c->done, XFER_TIMEOUT);
+	t0 = ktime_get();
+	time_left = wait_for_completion_timeout(&gi2c->done, geni_i2c_xfer_timeout());
+	dev_dbg(gi2c->se.dev, "tx-done len:%zu elapsed:%lldus completed:%d\n",
+		len, ktime_us_delta(ktime_get(), t0), time_left ? 1 : 0);
 	if (!time_left)
 		geni_i2c_abort_xfer(gi2c);
 
@@ -822,7 +885,7 @@ static int geni_i2c_gpi(struct geni_i2c_dev *gi2c, struct i2c_msg msgs[],
 
 		if ((msg_idx == (gi2c->num_msgs - 1)) || flags & DMA_PREP_INTERRUPT) {
 			ret = geni_i2c_gpi_multi_xfer_timeout_handler(gi2c->se.dev, gi2c_gpi_xfer,
-								      XFER_TIMEOUT, &gi2c->done);
+								      geni_i2c_xfer_timeout(), &gi2c->done);
 			if (ret) {
 				dev_err(gi2c->se.dev,
 					"I2C multi write msg transfer timeout: %d\n",
@@ -934,7 +997,7 @@ static int geni_i2c_gpi_xfer(struct geni_i2c_dev *gi2c, struct i2c_msg msgs[], i
 
 		if (!gi2c->is_tx_multi_desc_xfer) {
 			dma_async_issue_pending(gi2c->tx_c);
-			time_left = wait_for_completion_timeout(&gi2c->done, XFER_TIMEOUT);
+			time_left = wait_for_completion_timeout(&gi2c->done, geni_i2c_xfer_timeout());
 			if (!time_left) {
 				dev_err(gi2c->se.dev, "%s:I2C timeout\n", __func__);
 				gi2c->err = -ETIMEDOUT;
