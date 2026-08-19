@@ -18,6 +18,7 @@
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/sound/cs35l45.h>
+#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
 #include <dt-bindings/usb/pd.h>
 #include "sm8550.dtsi"
 #include "pm8550.dtsi"
@@ -508,6 +509,59 @@
 		compatible = "simple-battery";
 		charge-full-design-microamp-hours = <9800000>;
 		voltage-max-design-microvolt = <4440000>;
+	};
+
+	/*
+	 * Speaker sound card.
+	 *
+	 * The four CS35L45 amplifiers hang off the LPASS primary serial audio
+	 * interface. Stock drives it as a 4-slot TDM frame; this node currently
+	 * describes the same physical interface in plain I2S, which mainline
+	 * supports end to end (MODULE_ID_I2S_SINK + audioreach_i2s_set_media_format()
+	 * + q6i2s_ops all exist), so that the rest of the chain -- card, topology,
+	 * graph, LPAIF clocks, pinmux -- can be brought up and proven before the
+	 * TDM pieces mainline is missing are written. TDM remains the target.
+	 *
+	 * model= is load-bearing, not cosmetic: audioreach_tplg_init()
+	 * (qdsp6/topology.c:1318) builds the topology firmware path as
+	 *     "qcom/<card->driver_name>/<card->name>-tplg.bin"
+	 * where driver_name is the sndcard match data ("sm8550" for
+	 * qcom,sm8550-sndcard, sc8280xp.c:176) and card->name is this model
+	 * string (common.c:38). So this node asks for
+	 *     /lib/firmware/qcom/sm8550/GTS9U-tplg.bin
+	 * and without that file the card still probes -- request_firmware simply
+	 * fails and the graph is empty.
+	 *
+	 * The CPU-side format is NOT set here: sc8280xp_snd_init() matches
+	 * PRIMARY_MI2S_RX and calls snd_soc_dai_set_fmt(SND_SOC_DAIFMT_BP_FP)
+	 * itself, which is what makes audioreach_i2s_set_media_format() select
+	 * CONFIG_I2S_WS_SRC_INTERNAL. Stock agrees the SoC is clock master
+	 * (qcom,msm-mi2s-master = <1 1 1 1 1 1> in its own sound node).
+	 */
+	sound {
+		compatible = "qcom,sm8550-sndcard";
+		model = "GTS9U";
+
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&mi2s0_active>;
+		pinctrl-1 = <&mi2s0_sleep>;
+
+		speaker-dai-link {
+			link-name = "Speaker Playback";
+
+			cpu {
+				sound-dai = <&q6apmbedai PRIMARY_MI2S_RX>;
+			};
+
+			codec {
+				sound-dai = <&spkr_amp_rl 0>, <&spkr_amp_fl 0>,
+					    <&spkr_amp_rr 0>, <&spkr_amp_fr 0>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
 	};
 };
 
@@ -1114,6 +1168,70 @@
 			function = "gpio";
 			bias-pull-down;
 		};
+	};
+
+	/*
+	 * LPASS primary serial audio interface -> the four CS35L45 amplifiers.
+	 *
+	 * Every value below is this device's own, taken from the stock dtbo
+	 * overlay (fragment@162), which is what actually runs -- NOT from the
+	 * stock base device tree. The base tree defines tdm0_{clk,ws,din,dout}_active
+	 * with drive-strength 8, but nothing references those nodes: their phandles
+	 * appear exactly once each, at their own definition, and the base tree
+	 * contains no pri_mi2s or msm-cdc-pinctrl consumer at all. The nodes the
+	 * live system consumes are the overlay's, via
+	 * pri_mi2s_pinctrl.pinctrl-0 = <0x258 0x259 0x25a 0x25b>, and they specify
+	 * drive-strength 2. A defined-but-unreferenced value is not the hardware's
+	 * value.
+	 *
+	 * Stock:  gpio126 i2s0_sck / gpio129 i2s0_ws  -- 2 mA, bias-disable, output-high
+	 *         gpio127 i2s0_data0 / gpio128 i2s0_data1 -- 2 mA, bias-disable
+	 * Sleep (from the base tree, which the overlay does not override):
+	 *         all four as plain gpio, 2 mA, bias-pull-down, input-enable.
+	 *
+	 * output-high is transcribed literally and is meaningful here: in mainline
+	 * it maps to PIN_CONFIG_LEVEL (pinconf-generic.c:196), which pinctrl-msm
+	 * implements as "write the output value, then enable output" -- the same
+	 * thing the downstream pinctrl does.
+	 */
+	mi2s0_active: mi2s0-active-state {
+		sck-pins {
+			pins = "gpio126";
+			function = "i2s0_sck";
+			drive-strength = <2>;
+			bias-disable;
+			output-high;
+		};
+
+		ws-pins {
+			pins = "gpio129";
+			function = "i2s0_ws";
+			drive-strength = <2>;
+			bias-disable;
+			output-high;
+		};
+
+		data0-pins {
+			pins = "gpio127";
+			function = "i2s0_data0";
+			drive-strength = <2>;
+			bias-disable;
+		};
+
+		data1-pins {
+			pins = "gpio128";
+			function = "i2s0_data1";
+			drive-strength = <2>;
+			bias-disable;
+		};
+	};
+
+	mi2s0_sleep: mi2s0-sleep-state {
+		pins = "gpio126", "gpio127", "gpio128", "gpio129";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
 	};
 };
 
