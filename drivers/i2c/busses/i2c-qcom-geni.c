@@ -256,6 +256,19 @@ static void geni_i2c_err(struct geni_i2c_dev *gi2c, int err)
 	case NACK:
 	case GENI_TIMEOUT:
 		dev_dbg(gi2c->se.dev, "%s\n", gi2c_log[err].msg);
+		/*
+		 * A NACK and a transfer timeout are the two failures that carry
+		 * no other diagnostic, so the serial engine's own view of the
+		 * transaction is the only way to tell them apart from each
+		 * other and from a bus that never advanced. Whether
+		 * M_GENI_CMD_ACTIVE is set in geni_status separates "the
+		 * command was never issued" from "it was issued and did not
+		 * complete", and geni_ios carries the SCL/SDA levels as the
+		 * engine sees them, which need not match what the pin
+		 * controller reports. Both prints are dev_dbg, so this costs
+		 * nothing unless dynamic debug is enabled.
+		 */
+		geni_i2c_err_misc(gi2c);
 		break;
 	default:
 		dev_err(gi2c->se.dev, "%s\n", gi2c_log[err].msg);
