@@ -16,6 +16,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/soc/qcom/geni-se.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/units.h>
 
 #define SE_I2C_TX_TRANS_LEN		0x26c
@@ -226,7 +227,32 @@ struct geni_i2c_clk_fld {
 static const struct geni_i2c_clk_fld geni_i2c_clk_map_19p2mhz[] = {
 	{ I2C_MAX_STANDARD_MODE_FREQ, 7, 10, 12, 26 },
 	{ I2C_MAX_FAST_MODE_FREQ, 2,  5, 11, 22 },
-	{ I2C_MAX_FAST_MODE_PLUS_FREQ, 1, 2,  8, 18 },
+	/*
+	 * t_high_cnt is 3, not the 2 this table carried, and the difference is
+	 * the whole of a 300x transfer stall on the SM8550 I2C master hub.
+	 *
+	 * With 2, a transfer to a slave that ACKs burns one fixed timeout of 2^20
+	 * source-clock cycles -- 54.6 ms at 19.2 MHz -- in EVERY bit slot from the
+	 * address ACK onward. The data still arrives, correctly, at about two bytes
+	 * per second: a 4-byte write plus a 4-byte read measured 4.06 s against
+	 * 13.6 ms once fixed. Every explanation that stall invites is wrong. It is
+	 * not a hung bus, not a multi-byte limit and not a slave holding the line;
+	 * the transfer completes and returns the right bytes.
+	 *
+	 * Measured on four CS35L45 amplifiers on i2c@998000, with the counters as
+	 * runtime overrides so every arm shared one boot and each was verified at
+	 * SE_I2C_SCL_COUNTERS before it was believed:
+	 *
+	 *   {2, 8} 74.41 units   {2, 9} 74.43   -- t_low changes nothing
+	 *   {3, 8}  0.25 units   {3, 9}  0.26   {4, 8} 0.26   {6, 8} 0.26
+	 *
+	 * so t_high alone decides it and the threshold sits between 2 and 3 counts,
+	 * i.e. between 104 ns and 156 ns. 3 is also what this device's own vendor
+	 * kernel programs for Fast-mode-plus, and the I2C specification asks for
+	 * t_HIGH >= 260 ns at 1 MHz -- which 2 counts cannot reach even allowing for
+	 * the extra cycles the comment above says the firmware adds.
+	 */
+	{ I2C_MAX_FAST_MODE_PLUS_FREQ, 1, 3,  9, 18 },
 	{}
 };
 
@@ -266,7 +292,14 @@ static void qcom_geni_i2c_conf(struct geni_i2c_dev *gi2c)
 	u32 cycle = itr->t_cycle_cnt;
 	u32 val;
 
-	if (scl_dev && !strcmp(dev_name(gi2c->se.dev), scl_dev)) {
+	/*
+	 * sysfs_streq, not strcmp: a charp parameter keeps the trailing newline
+	 * that a shell redirect writes, param_set_charp strcpy's the sysfs buffer
+	 * verbatim, and strcmp then never matches. Two sessions of clock-timing
+	 * arms silently ran as baseline and were written up as refutations
+	 * because of it.
+	 */
+	if (scl_dev && sysfs_streq(dev_name(gi2c->se.dev), scl_dev)) {
 		if (scl_div > 0)
 			div = scl_div;
 		if (scl_high > 0)
