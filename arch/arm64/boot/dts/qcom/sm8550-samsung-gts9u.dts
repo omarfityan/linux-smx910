@@ -1600,14 +1600,27 @@
  * shared only one instance can claim it", takes -EBUSY on the other three and
  * continues (cs35l45.c:1398).
  *
- * INTERRUPTS are deliberately omitted for now. Stock wires all four amps to a
- * shared TLMM 14 (overlay: interrupts = <0x0e 0x00>, interrupt-parent
- * resolved to &tlmm via __fixups__), which in mainline form is
- * interrupts-extended = <&tlmm 14 IRQ_TYPE_LEVEL_LOW> — the driver ORs in
- * IRQF_TRIGGER_LOW | IRQF_SHARED itself. The driver treats the IRQ as
- * optional ("if (cs35l45->irq)"), and leaving it out keeps a level-triggered
- * shared line off a boot whose only job is to establish that the amplifiers
- * power up and answer on I2C. It is added back with the sound card.
+ * INTERRUPTS are wired as stock wires them: all four amplifiers share TLMM 14.
+ * The stock overlay carries interrupts = <0x0e 0x00> on each amp node with
+ * interrupt-parent resolved to &tlmm through __fixups__, which names all four
+ * explicitly. The second cell is 0 there because the vendor driver supplies the
+ * polarity itself; mainline's does the same, ORing in IRQF_TRIGGER_LOW (or HIGH
+ * when cirrus,gpio-ctrl2 sets irq_invert) together with IRQF_SHARED at
+ * cs35l45.c:1428-1439, so the type is spelled IRQ_TYPE_LEVEL_LOW here to say
+ * out loud what both drivers request.
+ *
+ * This was omitted for several sessions on the grounds that a level-triggered
+ * shared line had no business on a boot whose only job was to find out whether
+ * the amplifiers answered on I2C at all. They answer now, so that reason has
+ * expired -- and the interrupt is not decoration: it is how a CS35L45 reports
+ * over-temperature, over-current and short-circuit. An amplifier driven without
+ * its fault line is an amplifier whose protection reporting we have declined to
+ * connect, which is not what stock does.
+ *
+ * No pinctrl entry is needed for gpio14: the TLMM irqchip muxes a line to its
+ * GPIO function when the interrupt is requested. Stock's cs35l45_gpio_default
+ * (gpio14 + gpio42, function "gpio", bias-disable, drive-strength 2) matches
+ * the TLMM defaults for these pins.
  *
  * No pinctrl is declared: gpiolib's request path muxes a TLMM pin to its GPIO
  * function on its own, and four devices naming one pin group would collide in
@@ -1670,6 +1683,9 @@
 
 		reset-gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>;
 
+		interrupt-parent = <&tlmm>;
+		interrupts = <14 IRQ_TYPE_LEVEL_LOW>;
+
 		vdd-a-supply = <&vreg_spkr_amp>;
 		vdd-batt-supply = <&vreg_spkr_amp>;
 
@@ -1692,6 +1708,9 @@
 		reg = <0x31>;
 
 		reset-gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <14 IRQ_TYPE_LEVEL_LOW>;
 
 		vdd-a-supply = <&vreg_spkr_amp>;
 		vdd-batt-supply = <&vreg_spkr_amp>;
@@ -1716,6 +1735,9 @@
 
 		reset-gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>;
 
+		interrupt-parent = <&tlmm>;
+		interrupts = <14 IRQ_TYPE_LEVEL_LOW>;
+
 		vdd-a-supply = <&vreg_spkr_amp>;
 		vdd-batt-supply = <&vreg_spkr_amp>;
 
@@ -1738,6 +1760,9 @@
 		reg = <0x33>;
 
 		reset-gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <14 IRQ_TYPE_LEVEL_LOW>;
 
 		vdd-a-supply = <&vreg_spkr_amp>;
 		vdd-batt-supply = <&vreg_spkr_amp>;
