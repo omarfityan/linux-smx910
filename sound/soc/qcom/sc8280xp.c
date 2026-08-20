@@ -32,6 +32,15 @@ static int tdm_slots = 4;
 module_param(tdm_slots, int, 0444);
 MODULE_PARM_DESC(tdm_slots, "TDM slots per frame (default 4, as stock)");
 
+/*
+ * CS35L45 "Digital PCM Volume", in ALSA units, at exactly 0.00 dB.
+ *
+ * The control is SOC_SINGLE_S_TLV(..., -409, 48, ...) over a -102.25 dB scale
+ * with 0.25 dB steps, so ALSA value v is (-102.25 + v * 0.25) dB: 409 is unity
+ * and 457 -- the unlimited maximum -- is +12.00 dB.
+ */
+#define CS35L45_DIG_PCM_VOL_0DB		409
+
 static int tdm_slot_width = 32;
 module_param(tdm_slot_width, int, 0444);
 MODULE_PARM_DESC(tdm_slot_width, "TDM slot width in bits (default 32, as stock)");
@@ -141,6 +150,54 @@ static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
 					codec_dai->name, ret);
 				return ret;
 			}
+		}
+
+		/*
+		 * Cap the amplifiers at unity, which is where the vendor parks
+		 * them.  The part offers +12 dB of digital gain above 0 dB and
+		 * the vendor never uses it: its mixer configuration writes a
+		 * constant 0.00 dB on every playback path and does stream
+		 * volume further upstream.
+		 *
+		 * This matters because the digital volume is a HARDWARE VOLUME
+		 * CONTROL for the sound server -- userspace gangs the four
+		 * per-amplifier controls into one element and binds it as the
+		 * sink's volume.  PulseAudio maps its 0..100 % onto the
+		 * element's min_dB..max_dB, so an unlimited control puts +12 dB
+		 * at the top of the user's slider: four times the amplitude the
+		 * board is tuned for, and a level no vendor path produces.
+		 *
+		 * snd_soc_limit_volume() sets platform_max, which
+		 * snd_soc_info_volsw() reports as the control's maximum and
+		 * soc_put_volsw() enforces, so the cap reaches userspace as a
+		 * smaller dB range rather than as writes that are silently
+		 * clipped -- the slider ends at 0.00 dB instead of ending at
+		 * +12 dB with a dead zone.
+		 *
+		 * The name is built from each codec's own name_prefix rather
+		 * than hard-coded, so it follows a prefix rename.  A failure is
+		 * warned about and not ignored: ASoC registers the ALREADY
+		 * TRUNCATED control name, so a prefix long enough to push
+		 * "Digital PCM Volume" past the 44-byte limit would stop
+		 * matching, and a safety cap that quietly did not apply is
+		 * worse than one that never existed.
+		 */
+		for_each_rtd_codec_dais(rtd, i, codec_dai) {
+			const char *prefix = codec_dai->component->name_prefix;
+			char ctl[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
+
+			if (!prefix)
+				continue;
+
+			snprintf(ctl, sizeof(ctl), "%s Digital PCM Volume",
+				 prefix);
+
+			ret = snd_soc_limit_volume(card, ctl,
+						   CS35L45_DIG_PCM_VOL_0DB);
+			if (ret)
+				dev_warn(card->dev,
+					 "%s: 0 dB cap NOT applied: %d\n",
+					 ctl, ret);
 		}
 		break;
 	case WSA_CODEC_DMA_RX_0:
