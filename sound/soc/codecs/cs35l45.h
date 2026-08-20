@@ -405,6 +405,19 @@ enum cs35l45_cspl_mboxstate {
 	CSPL_MBOX_STS_HIBERNATE = 3,
 };
 
+/*
+ * Algorithm ids inside the speaker-protection firmware, and the
+ * constants its calibration block expects. Values taken from this
+ * device's own downstream driver, not inferred from control names:
+ * CIRRUS_AMP_ALG_ID_CSPL (include/sound/cirrus/core.h) and
+ * CS35L45_ALG_ID_VIMON (downstream cs35l45.c).
+ */
+#define CS35L45_ALG_ID_CSPL		0xcd
+#define CS35L45_ALG_ID_VIMON		0xf204
+#define CS35L45_CAL_STATUS_APPLIED	1
+#define CS35L45_VIMON_CAL_STATUS_INVALID	1
+#define CS35L45_VIMON_CAL_STATUS_SUCCESS	2
+
 enum cs35l45_cspl_mboxcmd {
 	CSPL_MBOX_CMD_NONE = 0,
 	CSPL_MBOX_CMD_PAUSE = 1,
@@ -501,6 +514,18 @@ struct cs35l45_private {
 	unsigned int i2c_addr;
 	enum control_bus_type bus_type;
 	struct regmap_irq_chip_data *irq_data;
+	/*
+	 * Per-unit speaker protection calibration, read from the device
+	 * tree. cal_valid gates the ReDC calibration (cal_rdc/cal_ambient);
+	 * cal_vimon_valid additionally gates the VIMON trims (cal_vsc/cal_isc),
+	 * which a unit may legitimately lack.
+	 */
+	bool cal_valid;
+	bool cal_vimon_valid;
+	u32 cal_rdc;
+	u32 cal_vsc;
+	u32 cal_isc;
+	u32 cal_ambient;
 };
 
 extern const struct dev_pm_ops cs35l45_pm_ops;

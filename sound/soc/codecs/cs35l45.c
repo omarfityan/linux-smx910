@@ -11,6 +11,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/firmware.h>
+#include <linux/firmware/cirrus/wmfw.h>
 #include <linux/regulator/consumer.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -112,6 +113,119 @@ static int cs35l45_global_en_ev(struct snd_soc_dapm_widget *w,
 	return 0;
 }
 
+static int cs35l45_write_cal_ctl(struct cs35l45_private *cs35l45,
+				 const char *name, unsigned int alg,
+				 unsigned int value)
+{
+	__be32 val = cpu_to_be32(value);
+	int ret;
+
+	ret = wm_adsp_write_ctl(&cs35l45->dsp, name, WMFW_ADSP2_XM, alg,
+				&val, sizeof(val));
+	if (ret)
+		dev_err(cs35l45->dev,
+			"Failed to write calibration control %s: %d\n", name, ret);
+
+	return ret;
+}
+
+/*
+ * Apply this unit's factory speaker calibration to the running protection
+ * firmware.
+ *
+ * Loading the tuning .bin leaves CAL_R at zero -- the firmware then models the
+ * driver as 0 ohm instead of its measured resistance -- so this must run on
+ * every firmware boot, not once at probe.
+ *
+ * The sequence is transcribed from this device's own downstream driver,
+ * cirrus_cal_cspl_cal_apply() in sound/soc/codecs/cirrus-cal-cspl.c. The
+ * firmware only re-reads its calibration across a REINIT, so the writes are
+ * bracketed by the STOP_PRE_REINIT/REINIT mailbox handshake. Both commands are
+ * acknowledged by the firmware and cs35l45_set_cspl_mbox_cmd() times out if an
+ * acknowledgement does not arrive, so firmware that ignored the writes cannot
+ * be mistaken for success.
+ *
+ * Controls are addressed by their full firmware subname. That is unaffected by
+ * the truncation wm_adsp applies when it derives the userspace-visible ALSA
+ * control names.
+ */
+static int cs35l45_apply_calibration(struct cs35l45_private *cs35l45)
+{
+	unsigned int status = CS35L45_CAL_STATUS_APPLIED;
+	unsigned int vimon_status;
+	int ret, reinit_ret;
+
+	if (!cs35l45->cal_valid)
+		return 0;
+
+	vimon_status = cs35l45->cal_vimon_valid ?
+			CS35L45_VIMON_CAL_STATUS_SUCCESS :
+			CS35L45_VIMON_CAL_STATUS_INVALID;
+
+	ret = cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
+					CSPL_MBOX_CMD_STOP_PRE_REINIT);
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * From here on every exit goes through the REINIT below. Leaving the
+	 * firmware parked in RDY_FOR_REINIT would leave the amplifier silent,
+	 * which is a worse outcome than running uncalibrated.
+	 */
+	ret = cs35l45_write_cal_ctl(cs35l45, "CAL_STATUS", CS35L45_ALG_ID_CSPL,
+				    status);
+	if (ret)
+		goto reinit;
+
+	ret = cs35l45_write_cal_ctl(cs35l45, "CAL_R", CS35L45_ALG_ID_CSPL,
+				    cs35l45->cal_rdc);
+	if (ret)
+		goto reinit;
+
+	ret = cs35l45_write_cal_ctl(cs35l45, "CAL_AMBIENT", CS35L45_ALG_ID_CSPL,
+				    cs35l45->cal_ambient);
+	if (ret)
+		goto reinit;
+
+	ret = cs35l45_write_cal_ctl(cs35l45, "CAL_CHECKSUM", CS35L45_ALG_ID_CSPL,
+				    status + cs35l45->cal_rdc);
+	if (ret)
+		goto reinit;
+
+	ret = cs35l45_write_cal_ctl(cs35l45, "VIMON_CAL_STATE",
+				    CS35L45_ALG_ID_VIMON, vimon_status);
+	if (ret)
+		goto reinit;
+
+	if (cs35l45->cal_vimon_valid) {
+		ret = cs35l45_write_cal_ctl(cs35l45, "VSC", CS35L45_ALG_ID_VIMON,
+					    cs35l45->cal_vsc);
+		if (ret)
+			goto reinit;
+
+		ret = cs35l45_write_cal_ctl(cs35l45, "ISC", CS35L45_ALG_ID_VIMON,
+					    cs35l45->cal_isc);
+		if (ret)
+			goto reinit;
+	}
+
+reinit:
+	reinit_ret = cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
+					       CSPL_MBOX_CMD_REINIT);
+	if (reinit_ret < 0)
+		return reinit_ret;
+
+	if (ret)
+		return ret;
+
+	dev_info(cs35l45->dev,
+		 "Calibration applied: rdc=%u ambient=%u vsc=0x%06x isc=0x%06x vimon_state=%u\n",
+		 cs35l45->cal_rdc, cs35l45->cal_ambient, cs35l45->cal_vsc,
+		 cs35l45->cal_isc, vimon_status);
+
+	return 0;
+}
+
 static int cs35l45_dsp_preload_ev(struct snd_soc_dapm_widget *w,
 				  struct snd_kcontrol *kcontrol, int event)
 {
@@ -132,7 +246,23 @@ static int cs35l45_dsp_preload_ev(struct snd_soc_dapm_widget *w,
 		regmap_set_bits(cs35l45->regmap, CS35L45_PWRMGT_CTL,
 				   CS35L45_MEM_RDY_MASK);
 
-		return wm_adsp_event(w, kcontrol, event);
+		ret = wm_adsp_event(w, kcontrol, event);
+		if (ret)
+			return ret;
+
+		/*
+		 * Deliberately not propagated: running on the firmware's
+		 * uncalibrated defaults still produces sound, whereas failing
+		 * this widget event would leave the device silent. Confirm the
+		 * calibration by reading CAL_R back, never by inferring it from
+		 * the absence of an error here.
+		 */
+		ret = cs35l45_apply_calibration(cs35l45);
+		if (ret)
+			dev_err(cs35l45->dev,
+				"Speaker calibration not applied: %d\n", ret);
+
+		return 0;
 	case SND_SOC_DAPM_PRE_PMD:
 		if (cs35l45->dsp.preloaded)
 			return 0;
@@ -1097,6 +1227,37 @@ static int cs35l45_sys_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * Read this unit's factory speaker calibration out of the device tree.
+ *
+ * These are per-unit measurements, not per-board constants: the factory
+ * records them in the sec_efs partition under /cirrus, keyed by an amplifier
+ * suffix, and they are carried here per amplifier node. Absent properties
+ * simply leave the calibration disabled, which is the pre-existing behaviour.
+ *
+ * cirrus,cal-isc and cirrus,cal-vsc are signed 24-bit trims stored zero-filled
+ * in 32 bits, matching the vendor's own bounds (e.g. its ISC lower bound is
+ * 0x00FFBE77). They must not be sign-extended.
+ */
+static void cs35l45_parse_calibration(struct cs35l45_private *cs35l45)
+{
+	struct device *dev = cs35l45->dev;
+
+	if (device_property_read_u32(dev, "cirrus,cal-rdc", &cs35l45->cal_rdc) ||
+	    device_property_read_u32(dev, "cirrus,cal-ambient",
+				     &cs35l45->cal_ambient))
+		return;
+
+	cs35l45->cal_valid = true;
+
+	/* The VIMON trims are optional; a unit may carry ReDC calibration only. */
+	if (device_property_read_u32(dev, "cirrus,cal-vsc", &cs35l45->cal_vsc) ||
+	    device_property_read_u32(dev, "cirrus,cal-isc", &cs35l45->cal_isc))
+		return;
+
+	cs35l45->cal_vimon_valid = true;
+}
+
 static int cs35l45_apply_property_config(struct cs35l45_private *cs35l45)
 {
 	struct device_node *node = cs35l45->dev->of_node;
@@ -1346,6 +1507,8 @@ static int cs35l45_initialize(struct cs35l45_private *cs35l45)
 	ret = cs35l45_apply_property_config(cs35l45);
 	if (ret < 0)
 		return ret;
+
+	cs35l45_parse_calibration(cs35l45);
 
 	cs35l45->amplifier_mode = AMP_MODE_SPK;
 

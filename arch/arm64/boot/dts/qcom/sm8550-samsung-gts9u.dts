@@ -1879,6 +1879,35 @@
 	pinctrl-0 = <&hub_i2c6_data_clk>;
 	pinctrl-1 = <&hub_i2c6_sleep>;
 
+	/*
+	 * Per-unit factory speaker calibration.
+	 *
+	 * These are measurements of THIS tablet's four drivers, not board
+	 * constants, recorded by the factory on 2023-12-11. They live on the
+	 * device in the sec_efs partition (/dev/disk/by-partlabel/sec_efs) under
+	 * /cirrus, as ASCII decimal in 12-byte files keyed by an amplifier
+	 * suffix. They are carried here because nothing in this system reads
+	 * that partition, and because the protection firmware zeroes CAL_R every
+	 * time its tuning .bin loads.
+	 *
+	 * The suffix-to-amplifier mapping is joined on the i2c address -- the
+	 * only invariant that cannot be misread -- using this device's own stock
+	 * dtbo. The intuitive reading of the suffixes is WRONG on all four:
+	 *
+	 *   0x30 cs35l45-rearleft    ""     0x31 cs35l45-frontleft   _b
+	 *   0x32 cs35l45-rearright   _r     0x33 cs35l45-frontright  _br
+	 *
+	 * so "_r" is REAR-right and "_b" is FRONT-left. The four rdc values span
+	 * only 2.8%, so a wrong assignment would produce a plausible, error-free
+	 * result that no measurement could detect. Do not "correct" these by
+	 * name; re-derive from the i2c address.
+	 *
+	 * Note cirrus,bd-suffix in the stock dtbo is a DIFFERENT suffix (the TDM
+	 * slot index) and must not be confused with the calibration suffix.
+	 *
+	 * cal-vsc/cal-isc are signed 24-bit trims stored zero-filled in 32 bits;
+	 * 0x00FFFF97 is -105. They must not be sign-extended.
+	 */
 	spkr_amp_rl: speaker-amp@30 {
 		compatible = "cirrus,cs35l45";
 		reg = <0x30>;
@@ -1896,6 +1925,12 @@
 
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "SpkrRearLeft";
+
+		/* factory calibration -- rdc_cal    / vsc_cal    / isc_cal */
+		cirrus,cal-rdc = <8737>;
+		cirrus,cal-vsc = <2338>;
+		cirrus,cal-isc = <410>;
+		cirrus,cal-ambient = <29>;
 
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
@@ -1924,6 +1959,12 @@
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "SpkrFrontLeft";
 
+		/* factory calibration -- rdc_cal_b  / vsc_cal_b  / isc_cal_b */
+		cirrus,cal-rdc = <8653>;
+		cirrus,cal-vsc = <1765>;
+		cirrus,cal-isc = <101>;
+		cirrus,cal-ambient = <29>;
+
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
 		};
@@ -1951,6 +1992,12 @@
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "SpkrRearRight";
 
+		/* factory calibration -- rdc_cal_r  / vsc_cal_r  / isc_cal_r */
+		cirrus,cal-rdc = <8893>;
+		cirrus,cal-vsc = <3170>;
+		cirrus,cal-isc = <0x00FFFF97>;
+		cirrus,cal-ambient = <29>;
+
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
 		};
@@ -1977,6 +2024,12 @@
 
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "SpkrFrontRight";
+
+		/* factory calibration -- rdc_cal_br / vsc_cal_br / isc_cal_br */
+		cirrus,cal-rdc = <8722>;
+		cirrus,cal-vsc = <2536>;
+		cirrus,cal-isc = <49>;
+		cirrus,cal-ambient = <29>;
 
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
