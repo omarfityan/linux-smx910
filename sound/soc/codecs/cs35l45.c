@@ -300,26 +300,13 @@ static int cs35l45_dsp_preload_ev(struct snd_soc_dapm_widget *w,
 		regmap_set_bits(cs35l45->regmap, CS35L45_PWRMGT_CTL,
 				   CS35L45_MEM_RDY_MASK);
 
-		ret = wm_adsp_event(w, kcontrol, event);
-		if (ret)
-			return ret;
-
-		/*
-		 * Deliberately not propagated: running on the firmware's
-		 * uncalibrated defaults still produces sound, whereas failing
-		 * this widget event would leave the device silent. Confirm the
-		 * calibration by reading CAL_R back, never by inferring it from
-		 * the absence of an error here.
-		 */
-		ret = cs35l45_apply_calibration(cs35l45);
-		if (ret)
-			dev_err(cs35l45->dev,
-				"Speaker calibration not applied: %d\n", ret);
-
-		return 0;
+		return wm_adsp_event(w, kcontrol, event);
 	case SND_SOC_DAPM_PRE_PMD:
 		if (cs35l45->dsp.preloaded)
 			return 0;
+
+		/* The tuning .bin zeroes CAL_R, so a reload must re-calibrate. */
+		cs35l45->cal_applied = false;
 
 		if (cs35l45->dsp.cs_dsp.running) {
 			ret = wm_adsp_event(w, kcontrol, event);
@@ -338,11 +325,44 @@ static int cs35l45_dsp_audio_ev(struct snd_soc_dapm_widget *w,
 {
 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
 	struct cs35l45_private *cs35l45 = snd_soc_component_get_drvdata(component);
+	int ret;
 
 	switch (event) {
 	case SND_SOC_DAPM_POST_PMU:
-		return cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
-						 CSPL_MBOX_CMD_RESUME);
+		ret = cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
+						CSPL_MBOX_CMD_RESUME);
+		if (ret < 0)
+			return ret;
+
+		/*
+		 * Calibrate here, and only here. A running CSPL owns its
+		 * calibration block and rewrites it every processing tick, so a
+		 * CAL_R write only sticks while the algorithm is stopped for
+		 * reinit -- and an algorithm can only be stopped once it is
+		 * running. This is the first point in the flow where that is
+		 * true; in the preload widget CSPL is still PAUSED and every
+		 * write is silently zeroed.
+		 *
+		 * Once per firmware boot rather than once per stream: a value
+		 * written in the RDY_FOR_REINIT window persists, so repeating it
+		 * would only add the handshake latency to every stream start.
+		 *
+		 * A failure is logged, not propagated: uncalibrated protection
+		 * still produces sound, whereas failing this event would leave
+		 * the device silent. Confirm success by reading CAL_R back, never
+		 * by the absence of an error here.
+		 */
+		if (cs35l45->cal_valid && !cs35l45->cal_applied) {
+			ret = cs35l45_apply_calibration(cs35l45);
+			if (ret)
+				dev_err(cs35l45->dev,
+					"Speaker calibration not applied: %d\n",
+					ret);
+			else
+				cs35l45->cal_applied = true;
+		}
+
+		return 0;
 	case SND_SOC_DAPM_PRE_PMD:
 		return cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
 						 CSPL_MBOX_CMD_PAUSE);
