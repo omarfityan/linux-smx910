@@ -248,6 +248,74 @@ static int q6i2s_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	return 0;
 }
 
+/*
+ * The parity trick below is only safe while the ids really do interleave.
+ * Anchor it at both ends of the block so a renumbering fails the build instead
+ * of quietly swapping every TDM link's slot mask for the other direction's.
+ */
+static_assert(PRIMARY_TDM_RX_0 % 2 == 0 && PRIMARY_TDM_TX_0 % 2 == 1 &&
+	      QUINARY_TDM_RX_7 % 2 == 0 && QUINARY_TDM_TX_7 % 2 == 1,
+	      "TDM DAI ids must interleave as RX even / TX odd");
+
+/*
+ * The frame layout, from the machine driver.
+ *
+ * tx_mask/rx_mask are accepted and only one of them is kept -- the mask for the
+ * direction this DAI carries.  A TDM endpoint occupies some slots of a frame
+ * and the interface parameter has a single slot_mask, so there is nothing to
+ * store the other direction in and nothing that would read it.
+ *
+ * slot_width is kept separate from the sample width on purpose: a 24-bit sample
+ * is usually carried in a 32-bit slot, and the bit clock follows the SLOT width
+ * (rate x slot_width x slots).  Taking the slot width from the format would
+ * produce a clock that is wrong by exactly the ratio between them.
+ */
+static int q6tdm_set_tdm_slot(struct snd_soc_dai *dai,
+			      unsigned int tx_mask, unsigned int rx_mask,
+			      int slots, int slot_width)
+{
+	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
+
+	if (slots <= 0 || slots > TDM_MAX_SLOTS_PER_FRAME)
+		return -EINVAL;
+
+	if (slot_width != 16 && slot_width != 24 && slot_width != 32)
+		return -EINVAL;
+
+	if (dai->id < PRIMARY_TDM_RX_0 || dai->id > QUINARY_TDM_TX_7)
+		return -EINVAL;
+
+	/*
+	 * Direction is the id's parity, not a range.  The TDM ids interleave
+	 * RX_0, TX_0, RX_1, TX_1 ... continuously from PRIMARY through QUINARY,
+	 * so every RX id in the block is even and every TX id odd -- and a
+	 * case range per direction would overlap rather than separate them.
+	 */
+	if (dai->id % 2 == 0)
+		cfg->tdm_slot_mask = rx_mask;
+	else
+		cfg->tdm_slot_mask = tx_mask;
+
+	if (!cfg->tdm_slot_mask)
+		return -EINVAL;
+
+	cfg->tdm_nslots = slots;
+	cfg->tdm_slot_width = slot_width;
+
+	return 0;
+}
+
+static const struct snd_soc_dai_ops q6tdm_ops = {
+	.prepare	= q6apm_lpass_dai_prepare,
+	.startup	= q6apm_lpass_dai_startup,
+	.shutdown	= q6apm_lpass_dai_shutdown,
+	.set_channel_map  = q6dma_set_channel_map,
+	.hw_params        = q6dma_hw_params,
+	.set_fmt	= q6i2s_set_fmt,
+	.set_tdm_slot	= q6tdm_set_tdm_slot,
+};
+
 static const struct snd_soc_dai_ops q6dma_ops = {
 	.prepare	= q6apm_lpass_dai_prepare,
 	.startup	= q6apm_lpass_dai_startup,
@@ -299,6 +367,7 @@ static int q6apm_lpass_dai_dev_probe(struct platform_device *pdev)
 	cfg.q6i2s_ops = &q6i2s_ops;
 	cfg.q6dma_ops = &q6dma_ops;
 	cfg.q6hdmi_ops = &q6hdmi_ops;
+	cfg.q6tdm_ops = &q6tdm_ops;
 	dais = q6dsp_audio_ports_set_config(dev, &cfg, &num_dais);
 
 	return devm_snd_soc_register_component(dev, &q6apm_lpass_dai_component, dais, num_dais);

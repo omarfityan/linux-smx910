@@ -20,6 +20,8 @@ struct q6apm_graph;
 #define MODULE_ID_PLACEHOLDER_DECODER	0x07001009
 #define MODULE_ID_I2S_SINK		0x0700100A
 #define MODULE_ID_I2S_SOURCE		0x0700100B
+#define MODULE_ID_TDM_SINK		0x0700100E
+#define MODULE_ID_TDM_SOURCE		0x0700100F
 #define MODULE_ID_SAL			0x07001010
 #define MODULE_ID_MFC			0x07001015
 #define MODULE_ID_DATA_LOGGING		0x0700101A
@@ -495,6 +497,60 @@ struct param_id_i2s_intf_cfg {
 #define PORT_ID_I2S_OUPUT		1
 #define I2S_STACK_SIZE			2048
 
+/*
+ * TDM interface configuration.
+ *
+ * The same LPAIF serial port that speaks I2S also speaks TDM, but it is a
+ * different module with a different parameter: where I2S names one serial-data
+ * line and lets the frame be implicit, TDM describes the frame itself -- how
+ * many slots it has, how wide they are, which of them this endpoint occupies,
+ * and where the data sits relative to the sync pulse.
+ *
+ * Note what is NOT here: there is no bit-clock inversion field.  Frame polarity
+ * has one (ctrl_invert_sync_pulse); the bit clock does not.  A codec that wants
+ * to latch on the opposite edge does so on its own side -- so a DAI format
+ * carrying SND_SOC_DAIFMT_IB_* is not being ignored here, it simply has nothing
+ * to set on the host.
+ */
+#define TDM_SYNC_SRC_EXTERNAL		0x0
+#define TDM_SYNC_SRC_INTERNAL		0x1
+#define TDM_CTRL_DATA_OE_DISABLE	0x0
+#define TDM_CTRL_DATA_OE_ENABLE		0x1
+#define TDM_SHORT_SYNC_BIT_MODE		0
+#define TDM_LONG_SYNC_MODE		1
+#define TDM_SHORT_SYNC_SLOT_MODE	2
+#define TDM_SYNC_NORMAL			0
+#define TDM_SYNC_INVERT			1
+#define TDM_DATA_DELAY_0_BCLK_CYCLE	0
+#define TDM_DATA_DELAY_1_BCLK_CYCLE	1
+#define TDM_DATA_DELAY_2_BCLK_CYCLE	2
+#define TDM_MAX_SLOTS_PER_FRAME		32
+
+#define PARAM_ID_TDM_INTF_CFG			0x0800101B
+struct param_id_tdm_intf_cfg {
+	uint32_t lpaif_type;
+	uint32_t intf_idx;
+	uint16_t sync_src;
+	uint16_t ctrl_data_out_enable;
+	uint32_t slot_mask;
+	uint16_t nslots_per_frame;
+	uint16_t slot_width;
+	uint16_t sync_mode;
+	uint16_t ctrl_invert_sync_pulse;
+	uint16_t ctrl_sync_data_delay;
+	uint16_t reserved;
+} __packed;
+
+#define TDM_INTF_TYPE_PRIMARY		0
+#define TDM_INTF_TYPE_SECONDARY		1
+#define TDM_INTF_TYPE_TERTIARY		2
+#define TDM_INTF_TYPE_QUATERNARY	3
+#define TDM_INTF_TYPE_QUINARY		4
+
+#define PORT_ID_TDM_INPUT		2
+#define PORT_ID_TDM_OUTPUT		1
+#define TDM_STACK_SIZE			2048
+
 #define PARAM_ID_DISPLAY_PORT_INTF_CFG		0x08001154
 
 struct param_id_display_port_intf_cfg {
@@ -815,6 +871,21 @@ struct audioreach_module_config {
 	u32	channel_allocation;
 	u32	sd_line_mask;
 	int	fmt;
+
+	/*
+	 * TDM frame, from snd_soc_dai_set_tdm_slot().  These live here rather
+	 * than in struct audioreach_module because they are a property of the
+	 * link at hw_params time, not of the topology: the same endpoint module
+	 * can be given a different frame by a different dai_link.
+	 *
+	 * slot_width is deliberately separate from bit_width.  A 24-bit sample
+	 * is commonly carried in a 32-bit slot, and it is the SLOT width that
+	 * sets the bit clock -- rate x slot_width x nslots -- so deriving one
+	 * from the other gets the clock wrong without ever looking wrong.
+	 */
+	u32	tdm_slot_mask;
+	u16	tdm_nslots;
+	u16	tdm_slot_width;
 	struct snd_codec codec;
 	u8 channel_map[AR_PCM_MAX_NUM_CHANNEL];
 };

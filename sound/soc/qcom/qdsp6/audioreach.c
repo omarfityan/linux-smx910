@@ -152,6 +152,13 @@ struct apm_i2s_module_intf_cfg {
 
 #define APM_I2S_INTF_CFG_PSIZE ALIGN(sizeof(struct apm_i2s_module_intf_cfg), 8)
 
+struct apm_tdm_module_intf_cfg {
+	struct apm_module_param_data param_data;
+	struct param_id_tdm_intf_cfg cfg;
+} __packed;
+
+#define APM_TDM_INTF_CFG_PSIZE ALIGN(sizeof(struct apm_tdm_module_intf_cfg), 8)
+
 struct apm_module_hw_ep_mf_cfg {
 	struct apm_module_param_data param_data;
 	struct param_id_hw_ep_mf mf;
@@ -1042,6 +1049,121 @@ static int audioreach_i2s_set_media_format(struct q6apm_graph *graph,
 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
 }
 
+static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
+					   const struct audioreach_module *module,
+					   const struct audioreach_module_config *cfg)
+{
+	struct apm_module_frame_size_factor_cfg *fs_cfg;
+	struct apm_module_param_data *param_data;
+	struct apm_tdm_module_intf_cfg *intf_cfg;
+	struct apm_module_hw_ep_mf_cfg *hw_cfg;
+	int ic_sz = APM_TDM_INTF_CFG_PSIZE;
+	int ep_sz = APM_HW_EP_CFG_PSIZE;
+	int fs_sz = APM_FS_CFG_PSIZE;
+	int size = ic_sz + ep_sz + fs_sz;
+	void *p;
+
+	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(size, APM_CMD_SET_CFG, 0);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+	intf_cfg = p;
+
+	param_data = &intf_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->error_code = 0;
+	param_data->param_id = PARAM_ID_TDM_INTF_CFG;
+	param_data->param_size = ic_sz - APM_MODULE_PARAM_DATA_SIZE;
+
+	intf_cfg->cfg.lpaif_type = module->hw_interface_type;
+	intf_cfg->cfg.intf_idx = module->hw_interface_idx;
+
+	/*
+	 * The slot description comes from set_tdm_slot() and the framing from
+	 * set_fmt(), which is the same split ASoC uses everywhere: a machine
+	 * driver states the frame layout once and the wire format separately.
+	 */
+	intf_cfg->cfg.slot_mask = cfg->tdm_slot_mask;
+	intf_cfg->cfg.nslots_per_frame = cfg->tdm_nslots;
+	intf_cfg->cfg.slot_width = cfg->tdm_slot_width;
+	intf_cfg->cfg.ctrl_data_out_enable = TDM_CTRL_DATA_OE_ENABLE;
+
+	switch (cfg->fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
+	case SND_SOC_DAIFMT_BC_FC:
+		/* CPU is consumer: the frame arrives from outside */
+		intf_cfg->cfg.sync_src = TDM_SYNC_SRC_EXTERNAL;
+		break;
+	case SND_SOC_DAIFMT_BP_FP:
+	default:
+		intf_cfg->cfg.sync_src = TDM_SYNC_SRC_INTERNAL;
+		break;
+	}
+
+	/*
+	 * DSP_A and DSP_B differ only in where the first slot begins relative
+	 * to the sync pulse -- one bit clock later for DSP_A, immediately for
+	 * DSP_B -- and both use a pulse rather than a half-frame sync.  I2S
+	 * framing on this port is the half-frame ("long") sync with the usual
+	 * one-cycle delay.
+	 */
+	switch (cfg->fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
+	case SND_SOC_DAIFMT_DSP_B:
+		intf_cfg->cfg.sync_mode = TDM_SHORT_SYNC_BIT_MODE;
+		intf_cfg->cfg.ctrl_sync_data_delay = TDM_DATA_DELAY_0_BCLK_CYCLE;
+		break;
+	case SND_SOC_DAIFMT_I2S:
+		intf_cfg->cfg.sync_mode = TDM_LONG_SYNC_MODE;
+		intf_cfg->cfg.ctrl_sync_data_delay = TDM_DATA_DELAY_1_BCLK_CYCLE;
+		break;
+	case SND_SOC_DAIFMT_DSP_A:
+	default:
+		intf_cfg->cfg.sync_mode = TDM_SHORT_SYNC_BIT_MODE;
+		intf_cfg->cfg.ctrl_sync_data_delay = TDM_DATA_DELAY_1_BCLK_CYCLE;
+		break;
+	}
+
+	/*
+	 * Only the FRAME polarity is settable here.  A DAI format asking for an
+	 * inverted BIT clock (SND_SOC_DAIFMT_IB_*) is not dropped by oversight:
+	 * the TDM interface parameter has no such field, and a codec that wants
+	 * the opposite edge inverts it on its own side.
+	 */
+	switch (cfg->fmt & SND_SOC_DAIFMT_INV_MASK) {
+	case SND_SOC_DAIFMT_NB_IF:
+	case SND_SOC_DAIFMT_IB_IF:
+		intf_cfg->cfg.ctrl_invert_sync_pulse = TDM_SYNC_INVERT;
+		break;
+	default:
+		intf_cfg->cfg.ctrl_invert_sync_pulse = TDM_SYNC_NORMAL;
+		break;
+	}
+
+	p += ic_sz;
+	hw_cfg = p;
+	param_data = &hw_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->error_code = 0;
+	param_data->param_id = PARAM_ID_HW_EP_MF_CFG;
+	param_data->param_size = ep_sz - APM_MODULE_PARAM_DATA_SIZE;
+
+	hw_cfg->mf.sample_rate = cfg->sample_rate;
+	hw_cfg->mf.bit_width = cfg->bit_width;
+	hw_cfg->mf.num_channels = cfg->num_channels;
+	hw_cfg->mf.data_format = module->data_format;
+
+	p += ep_sz;
+	fs_cfg = p;
+	param_data = &fs_cfg->param_data;
+	param_data->module_instance_id = module->instance_id;
+	param_data->error_code = 0;
+	param_data->param_id = PARAM_ID_HW_EP_FRAME_SIZE_FACTOR;
+	param_data->param_size = fs_sz - APM_MODULE_PARAM_DATA_SIZE;
+	fs_cfg->frame_size_factor = 1;
+
+	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+}
+
 static int audioreach_logging_set_media_format(struct q6apm_graph *graph,
 					       const struct audioreach_module *module)
 {
@@ -1340,6 +1462,10 @@ int audioreach_set_media_format(struct q6apm_graph *graph,
 	case MODULE_ID_I2S_SOURCE:
 	case MODULE_ID_I2S_SINK:
 		rc = audioreach_i2s_set_media_format(graph, module, cfg);
+		break;
+	case MODULE_ID_TDM_SOURCE:
+	case MODULE_ID_TDM_SINK:
+		rc = audioreach_tdm_set_media_format(graph, module, cfg);
 		break;
 	case MODULE_ID_WR_SHARED_MEM_EP:
 		rc = audioreach_shmem_set_media_format(graph, module, cfg);
