@@ -1208,6 +1208,35 @@ static int audioreach_logging_set_media_format(struct q6apm_graph *graph,
 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
 }
 
+/*
+ * AudioReach's "bits_per_sample" is the SAMPLE WORD SIZE -- the storage one
+ * sample occupies -- while "bit_width" is how many of those bits are
+ * significant.  For 16-bit audio the two are equal, which is exactly why
+ * substituting one for the other survived unnoticed: it is only wrong when they
+ * differ, and the first format where they differ is S24_LE -- 24 significant
+ * bits carried in a 32-bit word.
+ *
+ * It matters because DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2 carries a byte count
+ * (q6apm_write_async() sends snd_pcm_lib_period_bytes()), and the DSP turns
+ * those bytes into a frame count using this value.  Understating the word size
+ * makes it find MORE frames in a period than the period holds -- 4/3 as many
+ * for S24_LE, 640 where there are 480 -- so it reads past the end of the mapped
+ * buffer and takes an exception on the first period.
+ */
+static u16 audioreach_sample_word_size(const struct audioreach_module_config *cfg)
+{
+	/*
+	 * Callers must set this.  The check is only meaningful because the
+	 * config is zero-initialised at its declaration: on an uninitialised
+	 * stack struct "unset" is garbage rather than zero, and a guard that
+	 * cannot recognise the bad case is not a guard.
+	 */
+	if (WARN_ON_ONCE(!cfg->bits_per_sample))
+		return cfg->bit_width;
+
+	return cfg->bits_per_sample;
+}
+
 static int audioreach_pcm_set_media_format(struct q6apm_graph *graph,
 					   const struct audioreach_module *module,
 					   const struct audioreach_module_config *mcfg)
@@ -1249,7 +1278,7 @@ static int audioreach_pcm_set_media_format(struct q6apm_graph *graph,
 	media_cfg->interleaved = module->interleave_type;
 	media_cfg->num_channels = mcfg->num_channels;
 	media_cfg->q_factor = mcfg->bit_width - 1;
-	media_cfg->bits_per_sample = mcfg->bit_width;
+	media_cfg->bits_per_sample = audioreach_sample_word_size(mcfg);
 	memcpy(media_cfg->channel_mapping, mcfg->channel_map, mcfg->num_channels);
 
 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
@@ -1299,7 +1328,7 @@ static int audioreach_shmem_set_media_format(struct q6apm_graph *graph,
 		cfg->sample_rate = mcfg->sample_rate;
 		cfg->bit_width = mcfg->bit_width;
 		cfg->alignment = PCM_LSB_ALIGNED;
-		cfg->bits_per_sample = mcfg->bit_width;
+		cfg->bits_per_sample = audioreach_sample_word_size(mcfg);
 		cfg->q_factor = mcfg->bit_width - 1;
 		cfg->endianness = PCM_LITTLE_ENDIAN;
 		cfg->num_channels = mcfg->num_channels;

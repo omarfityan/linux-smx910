@@ -104,6 +104,7 @@ static int q6hdmi_hw_params(struct snd_pcm_substream *substream,
 	int ret;
 
 	cfg->bit_width = params_width(params);
+	cfg->bits_per_sample = params_physical_width(params);
 	cfg->sample_rate = params_rate(params);
 	cfg->num_channels = channels;
 	audioreach_set_default_channel_mapping(cfg->channel_map, channels);
@@ -134,6 +135,7 @@ static int q6dma_hw_params(struct snd_pcm_substream *substream,
 	int channels = hw_param_interval_c(params, SNDRV_PCM_HW_PARAM_CHANNELS)->max;
 
 	cfg->bit_width = params_width(params);
+	cfg->bits_per_sample = params_physical_width(params);
 	cfg->sample_rate = params_rate(params);
 	cfg->num_channels = channels;
 	audioreach_set_default_channel_mapping(cfg->channel_map, channels);

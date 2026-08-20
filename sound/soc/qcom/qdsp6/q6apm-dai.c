@@ -70,6 +70,13 @@ struct q6apm_dai_rtd {
 	uint64_t bytes_received;
 	uint64_t copied_total;
 	uint16_t bits_per_sample;
+	/*
+	 * The SIGNIFICANT width above, and the WORD SIZE here.  They differ
+	 * for S24_LE -- 24 bits in a 32-bit container -- and the DSP needs
+	 * both: the first says how much of the sample carries audio, the
+	 * second how far apart two samples sit in the buffer it reads.
+	 */
+	uint16_t sample_word_size;
 	snd_pcm_uframes_t queue_ptr;
 	bool next_track;
 	enum stream_state state;
@@ -208,7 +215,7 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
-	struct audioreach_module_config cfg;
+	struct audioreach_module_config cfg = {};
 	struct device *dev = component->dev;
 	struct q6apm_dai_data *pdata;
 	int ret;
@@ -226,6 +233,7 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 	cfg.sample_rate = runtime->rate;
 	cfg.num_channels = runtime->channels;
 	cfg.bit_width = prtd->bits_per_sample;
+	cfg.bits_per_sample = prtd->sample_word_size;
 	cfg.fmt = SND_AUDIOCODEC_PCM;
 	audioreach_set_default_channel_mapping(cfg.channel_map, runtime->channels);
 
@@ -463,6 +471,13 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
 		return -EINVAL;
 	}
 
+	/*
+	 * Taken from the format rather than derived from the width above,
+	 * because they are not the same number: S24_LE is 24 significant bits
+	 * in a 32-bit word, and it is the WORD that sets the buffer stride.
+	 */
+	prtd->sample_word_size = params_physical_width(params);
+
 	return 0;
 }
 
@@ -639,7 +654,7 @@ static int q6apm_dai_compr_set_params(struct snd_soc_component *component,
 	struct snd_compr_runtime *runtime = stream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 	struct q6apm_dai_data *pdata;
-	struct audioreach_module_config cfg;
+	struct audioreach_module_config cfg = {};
 	struct snd_codec *codec = &params->codec;
 	int dir = stream->direction;
 	int ret;
@@ -652,6 +667,7 @@ static int q6apm_dai_compr_set_params(struct snd_soc_component *component,
 	prtd->pcm_count = runtime->fragment_size;
 	prtd->pcm_size = runtime->fragments * runtime->fragment_size;
 	prtd->bits_per_sample = 16;
+	prtd->sample_word_size = 16;
 
 	if (prtd->next_track != true) {
 		memcpy(&prtd->codec, codec, sizeof(*codec));
@@ -664,6 +680,7 @@ static int q6apm_dai_compr_set_params(struct snd_soc_component *component,
 		cfg.sample_rate = codec->sample_rate;
 		cfg.num_channels = 2;
 		cfg.bit_width = prtd->bits_per_sample;
+		cfg.bits_per_sample = prtd->sample_word_size;
 		cfg.fmt = codec->id;
 		audioreach_set_default_channel_mapping(cfg.channel_map,
 						       cfg.num_channels);
@@ -696,6 +713,7 @@ static int q6apm_dai_compr_set_params(struct snd_soc_component *component,
 		cfg.sample_rate = codec->sample_rate;
 		cfg.num_channels = 2;
 		cfg.bit_width = prtd->bits_per_sample;
+		cfg.bits_per_sample = prtd->sample_word_size;
 		cfg.fmt = codec->id;
 		memcpy(&cfg.codec, codec, sizeof(*codec));
 
