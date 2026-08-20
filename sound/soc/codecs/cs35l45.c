@@ -14,6 +14,7 @@
 #include <linux/firmware.h>
 #include <linux/firmware/cirrus/wmfw.h>
 #include <linux/regulator/consumer.h>
+#include <linux/workqueue.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -164,6 +165,7 @@ static int cs35l45_write_cal_ctl(struct cs35l45_private *cs35l45,
 static void cs35l45_apply_cspl_calibration(struct cs35l45_private *cs35l45)
 {
 	unsigned int status = CS35L45_CAL_STATUS_APPLIED;
+	int ret;
 
 	if (!cs35l45->cal_valid)
 		return;
@@ -174,18 +176,29 @@ static void cs35l45_apply_cspl_calibration(struct cs35l45_private *cs35l45)
 	 * event would leave the device silent. Confirm success by reading CAL_R
 	 * back, never by the absence of an error here.
 	 */
-	cs35l45_write_cal_ctl(cs35l45, "CAL_STATUS", CS35L45_ALG_ID_CSPL,
-			      status);
-	cs35l45_write_cal_ctl(cs35l45, "CAL_R", CS35L45_ALG_ID_CSPL,
-			      cs35l45->cal_rdc);
-	cs35l45_write_cal_ctl(cs35l45, "CAL_AMBIENT", CS35L45_ALG_ID_CSPL,
-			      cs35l45->cal_ambient);
-	cs35l45_write_cal_ctl(cs35l45, "CAL_CHECKSUM", CS35L45_ALG_ID_CSPL,
-			      status + cs35l45->cal_rdc);
+	ret  = cs35l45_write_cal_ctl(cs35l45, "CAL_STATUS", CS35L45_ALG_ID_CSPL,
+				     status);
+	ret |= cs35l45_write_cal_ctl(cs35l45, "CAL_R", CS35L45_ALG_ID_CSPL,
+				     cs35l45->cal_rdc);
+	ret |= cs35l45_write_cal_ctl(cs35l45, "CAL_AMBIENT", CS35L45_ALG_ID_CSPL,
+				     cs35l45->cal_ambient);
+	ret |= cs35l45_write_cal_ctl(cs35l45, "CAL_CHECKSUM", CS35L45_ALG_ID_CSPL,
+				     status + cs35l45->cal_rdc);
 
-	dev_info(cs35l45->dev,
-		 "Calibration staged before DSP start: rdc=%u ambient=%u\n",
-		 cs35l45->cal_rdc, cs35l45->cal_ambient);
+	/*
+	 * Report what actually happened. An unconditional success message here
+	 * previously printed "staged" for an amplifier whose four writes had all
+	 * returned -ENOENT, which is precisely the kind of instrument that turns
+	 * a failure into a passing log line.
+	 */
+	if (ret)
+		dev_err(cs35l45->dev,
+			"Calibration NOT staged (rdc=%u): the protection firmware will run uncalibrated\n",
+			cs35l45->cal_rdc);
+	else
+		dev_info(cs35l45->dev,
+			 "Calibration staged before DSP start: rdc=%u ambient=%u\n",
+			 cs35l45->cal_rdc, cs35l45->cal_ambient);
 }
 
 static void cs35l45_apply_vimon_calibration(struct cs35l45_private *cs35l45)
@@ -235,6 +248,24 @@ static int cs35l45_dsp_preload_ev(struct snd_soc_dapm_widget *w,
 
 		regmap_set_bits(cs35l45->regmap, CS35L45_PWRMGT_CTL,
 				   CS35L45_MEM_RDY_MASK);
+
+		/*
+		 * wm_adsp_early_event() does not load the firmware; it only
+		 * queues it (queue_work(&dsp->boot_work)). PRE_PMU therefore
+		 * returns long before the wmfw and bin are parsed and before a
+		 * single coefficient control exists, so staging the calibration
+		 * here without waiting is a race against that work. Measured on
+		 * this device: the first amplifier's four writes all returned
+		 * -ENOENT while the other three happened to find their controls
+		 * already created.
+		 *
+		 * wm_adsp_run() waits with exactly this flush before calling
+		 * cs_dsp_run(), so performing it here places the staging
+		 * deterministically between the firmware load and the core
+		 * start. The flush inside wm_adsp_event() below then becomes a
+		 * no-op.
+		 */
+		flush_work(&cs35l45->dsp.boot_work);
 
 		/*
 		 * Stage the CSPL calibration into the control cache BEFORE the
