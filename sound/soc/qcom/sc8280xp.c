@@ -44,6 +44,24 @@ static int tdm_sample_bits = 24;
 module_param(tdm_sample_bits, int, 0444);
 MODULE_PARM_DESC(tdm_sample_bits, "sample width on a TDM backend, 16 or 24 (default 24, as stock)");
 
+/*
+ * Digital microphones on a VA-macro backend.
+ *
+ * Stock records from THREE microphones.  Its vendor mixer config gives every
+ * ordinary capture path -- recording, calls, VoIP -- the same shape: enable
+ * three decimators and set three gains, DEC0, DEC1 and DEC2.  It also defines a
+ * fourth microphone and never uses it: that path selects DMIC7, which lives on
+ * a pin pair stock's own device tree leaves disabled.
+ *
+ * A parameter rather than a constant for the same reason as the TDM ones above:
+ * a channel count is exactly the kind of value where a wrong guess produces a
+ * capture that opens, runs and contains silence in the extra channel, so both
+ * arms of a comparison should share one binary.
+ */
+static int dmic_channels = 3;
+module_param(dmic_channels, int, 0444);
+MODULE_PARM_DESC(dmic_channels, "max channels on a digital-microphone backend (default 3, as stock)");
+
 struct sc8280xp_snd_data {
 	bool stream_prepared[AFE_PORT_MAX];
 	struct snd_soc_card *card;
@@ -207,6 +225,31 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	case TX_CODEC_DMA_TX_2:
 	case TX_CODEC_DMA_TX_3:
 		channels->min = 1;
+		break;
+	case VA_CODEC_DMA_TX_0:
+	case VA_CODEC_DMA_TX_1:
+	case VA_CODEC_DMA_TX_2:
+		/*
+		 * The defaults above pin this backend to a stereo pair, which
+		 * silently caps a three-microphone board at two microphones:
+		 * the third is wired, clocked and populated, and simply has
+		 * nowhere to go.  Widen the range instead of moving it, so a
+		 * mono or stereo capture still negotiates.
+		 *
+		 * THE CHANNEL COUNT IS DECIDED IN TWO PLACES AND THEY MUST
+		 * AGREE.  This sets what the PCM may negotiate.  What the VA
+		 * macro actually configures comes from somewhere else entirely:
+		 * va_macro_hw_params() walks active_ch_mask, the bitmap the
+		 * "VA_AIF1_CAP Mixer DECn" switches maintain, and programs one
+		 * path per set bit.  It never compares that count against
+		 * params_channels().  So a PCM opened for three channels with
+		 * only two decimator switches enabled produces no error and a
+		 * third channel of nothing.  Whatever selects this backend --
+		 * the UCM verb here -- has to enable exactly as many
+		 * decimators as it opens channels.
+		 */
+		channels->min = 1;
+		channels->max = dmic_channels;
 		break;
 	default:
 		break;
