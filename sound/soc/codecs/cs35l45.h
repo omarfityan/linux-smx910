@@ -522,7 +522,6 @@ struct cs35l45_private {
 	 */
 	bool cal_valid;
 	bool cal_vimon_valid;
-	bool cal_applied;
 	u32 cal_rdc;
 	u32 cal_vsc;
 	u32 cal_isc;

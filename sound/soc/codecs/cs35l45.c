@@ -114,50 +114,6 @@ static int cs35l45_global_en_ev(struct snd_soc_dapm_widget *w,
 	return 0;
 }
 
-/*
- * The REINIT handshake is far slower than the PAUSE/RESUME commands that
- * cs35l45_set_cspl_mbox_cmd() was written for, and that helper gives up after
- * five ~1 ms polls. Measured on this device: STOP_PRE_REINIT still reported
- * PAUSED and REINIT still reported RDY_FOR_REINIT after 5 ms, on all four
- * amplifiers. This device's own downstream driver polls these two commands up
- * to 100 times at 1000-1500 us, with an unconditional 100 ms settle between
- * them, so use that budget here rather than relaxing the generic helper and
- * changing the timing of PAUSE/RESUME for every board.
- */
-#define CS35L45_CAL_MBOX_RETRIES	100
-
-static int cs35l45_cal_mbox_cmd(struct cs35l45_private *cs35l45,
-				enum cs35l45_cspl_mboxcmd cmd,
-				enum cs35l45_cspl_mboxstate want)
-{
-	unsigned int sts = 0;
-	int i, ret;
-
-	ret = regmap_write(cs35l45->regmap, CS35L45_DSP_VIRT1_MBOX_1, cmd);
-	if (ret < 0) {
-		dev_err(cs35l45->dev, "Failed to write MBOX: %d\n", ret);
-		return ret;
-	}
-
-	for (i = 0; i < CS35L45_CAL_MBOX_RETRIES; i++) {
-		usleep_range(1000, 1500);
-
-		ret = regmap_read(cs35l45->regmap, CS35L45_DSP_MBOX_2, &sts);
-		if (ret < 0) {
-			dev_err(cs35l45->dev, "Failed to read MBOX STS: %d\n", ret);
-			return ret;
-		}
-
-		if (sts == want)
-			return 0;
-	}
-
-	dev_err(cs35l45->dev, "Mailbox cmd %u: wanted status %u, got %u\n",
-		cmd, want, sts);
-
-	return -ENOMSG;
-}
-
 static int cs35l45_write_cal_ctl(struct cs35l45_private *cs35l45,
 				 const char *name, unsigned int alg,
 				 unsigned int value)
@@ -175,110 +131,90 @@ static int cs35l45_write_cal_ctl(struct cs35l45_private *cs35l45,
 }
 
 /*
- * Apply this unit's factory speaker calibration to the running protection
- * firmware.
+ * Apply this unit's factory speaker calibration.
  *
- * Loading the tuning .bin leaves CAL_R at zero -- the firmware then models the
- * driver as 0 ohm instead of its measured resistance -- so this must run on
- * every firmware boot, not once at probe.
+ * Split in two, because the two halves must be written at DIFFERENT points in
+ * the firmware boot, and the reason is the controls' own volatility:
  *
- * The sequence is transcribed from this device's own downstream driver,
- * cirrus_cal_cspl_cal_apply() in sound/soc/codecs/cirrus-cal-cspl.c. The
- * firmware only re-reads its calibration across a REINIT, so the writes are
- * bracketed by the STOP_PRE_REINIT/REINIT mailbox handshake. Both commands are
- * acknowledged by the firmware and cs35l45_set_cspl_mbox_cmd() times out if an
- * acknowledgement does not arrive, so firmware that ignored the writes cannot
- * be mistaken for success.
+ *   CAL_STATUS / CAL_R / CAL_AMBIENT / CAL_CHECKSUM are NON-volatile, so
+ *   cs_dsp_coeff_write_ctrl() stores them in the control cache, and
+ *   cs_dsp_run() flushes the cache with cs_dsp_coeff_sync_controls() BEFORE it
+ *   calls ops->start_core(). Writing them before wm_adsp_event() therefore
+ *   places them in DSP memory before the core executes a single instruction --
+ *   which is precisely what this device's own downstream driver does: its
+ *   cs35l45_dsp_boot_ev() holds the core in reset, calls cirrus_cal_apply(),
+ *   and only then calls halo_start_core().
  *
- * Controls are addressed by their full firmware subname. That is unaffected by
- * the truncation wm_adsp applies when it derives the userspace-visible ALSA
- * control names.
+ *   VIMON_CAL_STATE / VSC / ISC are VOLATILE, so the same call returns -EPERM
+ *   unless cs_dsp->running. They have to be written after the core is up.
+ *
+ * The ordering IS the fix. Written after the core has started, the values do
+ * land in DSP memory and do read back correctly -- but the firmware has already
+ * initialised without them, so CSPL reports an uncalibrated default in
+ * CAL_R_SELECTED and clears the calibration block on its first processing pass.
+ * Written before the core starts, CSPL adopts them, and CAL_R_SELECTED reads
+ * back equal to CAL_R.
+ *
+ * There is deliberately NO mailbox handshake here. The downstream apply,
+ * cirrus_cal_cspl_cal_apply(), issues none -- it writes these same controls and
+ * returns. STOP_PRE_REINIT/REINIT belong to the calibration *procedure*, not to
+ * applying a stored result, and a mailbox command cannot be acknowledged by a
+ * core that has not been started.
  */
-static int cs35l45_apply_calibration(struct cs35l45_private *cs35l45)
+static void cs35l45_apply_cspl_calibration(struct cs35l45_private *cs35l45)
 {
 	unsigned int status = CS35L45_CAL_STATUS_APPLIED;
-	unsigned int vimon_status;
-	int ret, reinit_ret;
 
 	if (!cs35l45->cal_valid)
-		return 0;
+		return;
+
+	/*
+	 * Failures are logged by cs35l45_write_cal_ctl() and not propagated:
+	 * uncalibrated protection still produces sound, whereas failing this
+	 * event would leave the device silent. Confirm success by reading CAL_R
+	 * back, never by the absence of an error here.
+	 */
+	cs35l45_write_cal_ctl(cs35l45, "CAL_STATUS", CS35L45_ALG_ID_CSPL,
+			      status);
+	cs35l45_write_cal_ctl(cs35l45, "CAL_R", CS35L45_ALG_ID_CSPL,
+			      cs35l45->cal_rdc);
+	cs35l45_write_cal_ctl(cs35l45, "CAL_AMBIENT", CS35L45_ALG_ID_CSPL,
+			      cs35l45->cal_ambient);
+	cs35l45_write_cal_ctl(cs35l45, "CAL_CHECKSUM", CS35L45_ALG_ID_CSPL,
+			      status + cs35l45->cal_rdc);
+
+	dev_info(cs35l45->dev,
+		 "Calibration staged before DSP start: rdc=%u ambient=%u\n",
+		 cs35l45->cal_rdc, cs35l45->cal_ambient);
+}
+
+static void cs35l45_apply_vimon_calibration(struct cs35l45_private *cs35l45)
+{
+	unsigned int vimon_status;
+
+	if (!cs35l45->cal_valid)
+		return;
 
 	vimon_status = cs35l45->cal_vimon_valid ?
 			CS35L45_VIMON_CAL_STATUS_SUCCESS :
 			CS35L45_VIMON_CAL_STATUS_INVALID;
 
-	/*
-	 * A timeout here is logged but not fatal, matching downstream, which
-	 * reports the same condition and writes the calibration regardless. The
-	 * writes have been observed to land on this device whether or not the
-	 * firmware reported REINIT-ready. The settle is unconditional, as it is
-	 * downstream.
-	 */
-	if (cs35l45_cal_mbox_cmd(cs35l45, CSPL_MBOX_CMD_STOP_PRE_REINIT,
-				 CSPL_MBOX_STS_RDY_FOR_REINIT))
-		dev_warn(cs35l45->dev,
-			 "REINIT-ready not reported; writing calibration anyway\n");
+	cs35l45_write_cal_ctl(cs35l45, "VIMON_CAL_STATE", CS35L45_ALG_ID_VIMON,
+			      vimon_status);
 
-	msleep(100);
+	if (!cs35l45->cal_vimon_valid)
+		return;
 
-	/*
-	 * From here on every exit goes through the REINIT below. Leaving the
-	 * firmware parked in RDY_FOR_REINIT would leave the amplifier silent,
-	 * which is a worse outcome than running uncalibrated.
-	 */
-	ret = cs35l45_write_cal_ctl(cs35l45, "CAL_STATUS", CS35L45_ALG_ID_CSPL,
-				    status);
-	if (ret)
-		goto reinit;
-
-	ret = cs35l45_write_cal_ctl(cs35l45, "CAL_R", CS35L45_ALG_ID_CSPL,
-				    cs35l45->cal_rdc);
-	if (ret)
-		goto reinit;
-
-	ret = cs35l45_write_cal_ctl(cs35l45, "CAL_AMBIENT", CS35L45_ALG_ID_CSPL,
-				    cs35l45->cal_ambient);
-	if (ret)
-		goto reinit;
-
-	ret = cs35l45_write_cal_ctl(cs35l45, "CAL_CHECKSUM", CS35L45_ALG_ID_CSPL,
-				    status + cs35l45->cal_rdc);
-	if (ret)
-		goto reinit;
-
-	ret = cs35l45_write_cal_ctl(cs35l45, "VIMON_CAL_STATE",
-				    CS35L45_ALG_ID_VIMON, vimon_status);
-	if (ret)
-		goto reinit;
-
-	if (cs35l45->cal_vimon_valid) {
-		ret = cs35l45_write_cal_ctl(cs35l45, "VSC", CS35L45_ALG_ID_VIMON,
-					    cs35l45->cal_vsc);
-		if (ret)
-			goto reinit;
-
-		ret = cs35l45_write_cal_ctl(cs35l45, "ISC", CS35L45_ALG_ID_VIMON,
-					    cs35l45->cal_isc);
-		if (ret)
-			goto reinit;
-	}
-
-reinit:
-	reinit_ret = cs35l45_cal_mbox_cmd(cs35l45, CSPL_MBOX_CMD_REINIT,
-					  CSPL_MBOX_STS_RUNNING);
-	if (reinit_ret < 0)
-		return reinit_ret;
-
-	if (ret)
-		return ret;
+	cs35l45_write_cal_ctl(cs35l45, "VSC", CS35L45_ALG_ID_VIMON,
+			      cs35l45->cal_vsc);
+	cs35l45_write_cal_ctl(cs35l45, "ISC", CS35L45_ALG_ID_VIMON,
+			      cs35l45->cal_isc);
 
 	dev_info(cs35l45->dev,
-		 "Calibration applied: rdc=%u ambient=%u vsc=0x%06x isc=0x%06x vimon_state=%u\n",
-		 cs35l45->cal_rdc, cs35l45->cal_ambient, cs35l45->cal_vsc,
-		 cs35l45->cal_isc, vimon_status);
-
-	return 0;
+		 "VIMON trims applied: vsc=0x%06x isc=0x%06x state=%u\n",
+		 cs35l45->cal_vsc, cs35l45->cal_isc, vimon_status);
 }
+
 
 static int cs35l45_dsp_preload_ev(struct snd_soc_dapm_widget *w,
 				  struct snd_kcontrol *kcontrol, int event)
@@ -300,13 +236,28 @@ static int cs35l45_dsp_preload_ev(struct snd_soc_dapm_widget *w,
 		regmap_set_bits(cs35l45->regmap, CS35L45_PWRMGT_CTL,
 				   CS35L45_MEM_RDY_MASK);
 
-		return wm_adsp_event(w, kcontrol, event);
+		/*
+		 * Stage the CSPL calibration into the control cache BEFORE the
+		 * core starts: cs_dsp_run() syncs cached controls into DSP
+		 * memory ahead of ops->start_core(), so the firmware
+		 * initialises with this unit's measured ReDC instead of a
+		 * default. Unconditional -- the writes are four cached stores,
+		 * and a flag that survived a firmware boot is what previously
+		 * made the loss permanent.
+		 */
+		cs35l45_apply_cspl_calibration(cs35l45);
+
+		ret = wm_adsp_event(w, kcontrol, event);
+		if (ret)
+			return ret;
+
+		/* The VIMON trims are volatile and need a running core. */
+		cs35l45_apply_vimon_calibration(cs35l45);
+
+		return 0;
 	case SND_SOC_DAPM_PRE_PMD:
 		if (cs35l45->dsp.preloaded)
 			return 0;
-
-		/* The tuning .bin zeroes CAL_R, so a reload must re-calibrate. */
-		cs35l45->cal_applied = false;
 
 		if (cs35l45->dsp.cs_dsp.running) {
 			ret = wm_adsp_event(w, kcontrol, event);
@@ -320,57 +271,23 @@ static int cs35l45_dsp_preload_ev(struct snd_soc_dapm_widget *w,
 	}
 }
 
+
 static int cs35l45_dsp_audio_ev(struct snd_soc_dapm_widget *w,
 				struct snd_kcontrol *kcontrol, int event)
 {
 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
 	struct cs35l45_private *cs35l45 = snd_soc_component_get_drvdata(component);
-	int ret;
 
 	switch (event) {
 	case SND_SOC_DAPM_POST_PMU:
-		ret = cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
-						CSPL_MBOX_CMD_RESUME);
-		if (ret < 0)
-			return ret;
-
-		/*
-		 * Calibrate here, and only here. A running CSPL owns its
-		 * calibration block and rewrites it every processing tick, so a
-		 * CAL_R write only sticks while the algorithm is stopped for
-		 * reinit -- and an algorithm can only be stopped once it is
-		 * running. This is the first point in the flow where that is
-		 * true; in the preload widget CSPL is still PAUSED and every
-		 * write is silently zeroed.
-		 *
-		 * Once per firmware boot rather than once per stream: a value
-		 * written in the RDY_FOR_REINIT window persists, so repeating it
-		 * would only add the handshake latency to every stream start.
-		 *
-		 * A failure is logged, not propagated: uncalibrated protection
-		 * still produces sound, whereas failing this event would leave
-		 * the device silent. Confirm success by reading CAL_R back, never
-		 * by the absence of an error here.
-		 */
-		if (cs35l45->cal_valid && !cs35l45->cal_applied) {
-			ret = cs35l45_apply_calibration(cs35l45);
-			if (ret)
-				dev_err(cs35l45->dev,
-					"Speaker calibration not applied: %d\n",
-					ret);
-			else
-				cs35l45->cal_applied = true;
-		}
-
-		return 0;
+		return cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
+						 CSPL_MBOX_CMD_RESUME);
 	case SND_SOC_DAPM_PRE_PMD:
 		return cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
 						 CSPL_MBOX_CMD_PAUSE);
 	default:
 		return 0;
 	}
-
-	return 0;
 }
 
 static int cs35l45_activate_ctl(struct snd_soc_component *component,
