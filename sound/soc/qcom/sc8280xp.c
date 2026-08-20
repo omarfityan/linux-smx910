@@ -15,6 +15,35 @@
 #include "common.h"
 #include "sdw.h"
 
+/*
+ * TDM frame, overridable at boot.
+ *
+ * The defaults are what stock drives this hardware with: four 32-bit slots
+ * carrying 24-bit samples.  They are parameters rather than constants because
+ * the ADSP asserts on its own heap when handed some TDM configurations, and
+ * finding which value it objects to means sweeping them -- one rebuild and
+ * flash per combination is minutes each, while a module parameter is a reboot.
+ *
+ * Both arms of any comparison then share one binary, which is the point: a
+ * sweep where each step is a different build cannot tell a value's effect from
+ * a build's.
+ */
+static int tdm_slots = 4;
+module_param(tdm_slots, int, 0444);
+MODULE_PARM_DESC(tdm_slots, "TDM slots per frame (default 4, as stock)");
+
+static int tdm_slot_width = 32;
+module_param(tdm_slot_width, int, 0444);
+MODULE_PARM_DESC(tdm_slot_width, "TDM slot width in bits (default 32, as stock)");
+
+static int tdm_channels = 4;
+module_param(tdm_channels, int, 0444);
+MODULE_PARM_DESC(tdm_channels, "channels on a TDM backend (default 4, as stock)");
+
+static int tdm_sample_bits = 24;
+module_param(tdm_sample_bits, int, 0444);
+MODULE_PARM_DESC(tdm_sample_bits, "sample width on a TDM backend, 16 or 24 (default 24, as stock)");
+
 struct sc8280xp_snd_data {
 	bool stream_prepared[AFE_PORT_MAX];
 	struct snd_soc_card *card;
@@ -78,14 +107,17 @@ static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
 		 * userspace, which is how four amplifiers on one frame each end
 		 * up on a different slot.
 		 */
-		ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0, GENMASK(3, 0), 4, 32);
+		ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0,
+					       GENMASK(tdm_slots - 1, 0),
+					       tdm_slots, tdm_slot_width);
 		if (ret) {
 			dev_err(card->dev, "Failed to set TDM slots: %d\n", ret);
 			return ret;
 		}
 
 		for_each_rtd_codec_dais(rtd, i, codec_dai) {
-			ret = snd_soc_dai_set_tdm_slot(codec_dai, 0, 0, 0, 32);
+			ret = snd_soc_dai_set_tdm_slot(codec_dai, 0, 0, 0,
+						       tdm_slot_width);
 			if (ret && ret != -ENOTSUPP) {
 				dev_err(card->dev, "%s: failed to set slot width: %d\n",
 					codec_dai->name, ret);
@@ -150,9 +182,11 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 		 * S24_LE is a 24-bit sample in a 32-bit container, which is what
 		 * the frame carries: the container is the slot.
 		 */
-		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S24_LE);
-		channels->min = 4;
-		channels->max = 4;
+		snd_mask_set_format(fmt, tdm_sample_bits == 16 ?
+					 SNDRV_PCM_FORMAT_S16_LE :
+					 SNDRV_PCM_FORMAT_S24_LE);
+		channels->min = tdm_channels;
+		channels->max = tdm_channels;
 		break;
 	case TX_CODEC_DMA_TX_0:
 	case TX_CODEC_DMA_TX_1:
