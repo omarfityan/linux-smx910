@@ -1063,13 +1063,11 @@ static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
 	struct apm_module_frame_size_factor_cfg *fs_cfg;
 	struct apm_module_param_data *param_data;
 	struct apm_tdm_module_intf_cfg *intf_cfg;
-	struct apm_tdm_module_lane_cfg *lane_cfg;
 	struct apm_module_hw_ep_mf_cfg *hw_cfg;
 	int ic_sz = APM_TDM_INTF_CFG_PSIZE;
-	int ln_sz = APM_TDM_LANE_CFG_PSIZE;
 	int ep_sz = APM_HW_EP_CFG_PSIZE;
 	int fs_sz = APM_FS_CFG_PSIZE;
-	int size = ic_sz + ln_sz + ep_sz + fs_sz;
+	int size = ic_sz + ep_sz + fs_sz;
 	void *p;
 
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(size, APM_CMD_SET_CFG, 0);
@@ -1133,6 +1131,14 @@ static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
 	}
 
 	/*
+	 * PARAM_ID_TDM_LANE_CFG is deliberately NOT sent.  Its own description
+	 * calls it "optional for single lane usage, should be configured if more
+	 * than 1 lane is required", and a frame whose slots all travel on one
+	 * wire is single-lane -- which is what a set of amplifiers sharing a
+	 * serial-data line is.  Sending an unrequested parameter to a hardware
+	 * endpoint module is not free, so it is left out until something needs
+	 * it.
+	 *
 	 * Only the FRAME polarity is settable here.  A DAI format asking for an
 	 * inverted BIT clock (SND_SOC_DAIFMT_IB_*) is not dropped by oversight:
 	 * the TDM interface parameter has no such field, and a codec that wants
@@ -1149,32 +1155,6 @@ static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
 	}
 
 	p += ic_sz;
-	lane_cfg = p;
-	param_data = &lane_cfg->param_data;
-	param_data->module_instance_id = module->instance_id;
-	param_data->error_code = 0;
-	param_data->param_id = PARAM_ID_TDM_LANE_CFG;
-	param_data->param_size = ln_sz - APM_MODULE_PARAM_DATA_SIZE;
-
-	/*
-	 * Which physical wire the frame goes out on.  The topology already
-	 * states this per endpoint as a 1-based serial-data-line index
-	 * (SD0 = 1), the same value the I2S path reads -- so the topology stays
-	 * the single description of the wiring instead of the driver acquiring
-	 * a second one that can silently disagree with it.
-	 *
-	 * The two representations are not interchangeable.  The I2S field is an
-	 * INDEX and lane_mask is a BITMASK, so SD1 is index 2 and lane 1, whose
-	 * mask is BIT(1) -- also 2, but by coincidence.  Copying the number
-	 * across survives exactly until an endpoint uses SD2, where index 3 and
-	 * mask BIT(2) = 4 part company.
-	 */
-	if (module->sd_line_idx)
-		lane_cfg->cfg.lane_mask = BIT(module->sd_line_idx - 1);
-	else
-		lane_cfg->cfg.lane_mask = BIT(0);
-
-	p += ln_sz;
 	hw_cfg = p;
 	param_data = &hw_cfg->param_data;
 	param_data->module_instance_id = module->instance_id;
