@@ -515,12 +515,29 @@
 	 * Speaker sound card.
 	 *
 	 * The four CS35L45 amplifiers hang off the LPASS primary serial audio
-	 * interface. Stock drives it as a 4-slot TDM frame; this node currently
-	 * describes the same physical interface in plain I2S, which mainline
-	 * supports end to end (MODULE_ID_I2S_SINK + audioreach_i2s_set_media_format()
-	 * + q6i2s_ops all exist), so that the rest of the chain -- card, topology,
-	 * graph, LPAIF clocks, pinmux -- can be brought up and proven before the
-	 * TDM pieces mainline is missing are written. TDM remains the target.
+	 * interface, driven as a 4-slot TDM frame -- which is what stock does,
+	 * and what lets each amplifier own a slot rather than two of them
+	 * sharing a channel.
+	 *
+	 * The frame is stock's, value for value:
+	 *   4 slots          qcom,tdm-max-slots = <4>, this device's own dtbo
+	 *   32-bit slots     TDM_SLOT_WIDTH_BITS, and the downstream machine
+	 *                    driver's snd_soc_dai_set_tdm_slot(codec, 0, 0, 0, 32)
+	 *   24-bit samples   PAL_AUDIO_FMT_PCM_S24_LE for PAL_DEVICE_OUT_SPEAKER
+	 *   48 kHz           same
+	 *   DSP_A, codec-consumer, inverted bit clock
+	 *                    the downstream LPASS_BE_PRI_TDM_RX_0 link's .dai_fmt
+	 * giving a 6.144 MHz bit clock (48000 x 32 x 4).
+	 *
+	 * The slot width is 32 while the samples are 24-bit: a 24-bit sample
+	 * rides inside a 32-bit slot, and it is the SLOT width that sets the bit
+	 * clock. Deriving the slot width from the sample width instead would ask
+	 * for 4.608 MHz, and look entirely reasonable doing it.
+	 *
+	 * Which amplifier takes which slot is NOT set here. A CS35L45 does not
+	 * learn its slot from the DAI -- it has its own ASPRX Slot Position
+	 * controls, driven from userspace, and stock uses exactly those:
+	 * front-left 0, front-right 1, rear-left 2, rear-right 3.
 	 *
 	 * model= is load-bearing, not cosmetic: audioreach_tplg_init()
 	 * (qdsp6/topology.c:1318) builds the topology firmware path as
@@ -532,10 +549,16 @@
 	 * and without that file the card still probes -- request_firmware simply
 	 * fails and the graph is empty.
 	 *
-	 * The CPU-side format is NOT set here: sc8280xp_snd_init() matches
-	 * PRIMARY_MI2S_RX and calls snd_soc_dai_set_fmt(SND_SOC_DAIFMT_BP_FP)
-	 * itself, which is what makes audioreach_i2s_set_media_format() select
-	 * CONFIG_I2S_WS_SRC_INTERNAL. Stock agrees the SoC is clock master
+	 * That topology has to name this interface in three more places than the
+	 * endpoint module: the graph index IS the DAI id (24 here), and the
+	 * stream and mixer widget names must match the ones q6dsp-lpass-ports.c
+	 * builds for PRIMARY_TDM_RX_0. A topology that changes only the module
+	 * loads happily and routes nothing.
+	 *
+	 * The format is NOT set here: sc8280xp_snd_init() matches
+	 * PRIMARY_TDM_RX_0 and applies DSP_A / codec-consumer / inverted bit
+	 * clock to the CPU and the four codec DAIs together, along with the
+	 * 4 x 32-bit slot layout. Stock agrees the SoC drives the clocks
 	 * (qcom,msm-mi2s-master = <1 1 1 1 1 1> in its own sound node).
 	 */
 	sound {
@@ -550,7 +573,7 @@
 			link-name = "Speaker Playback";
 
 			cpu {
-				sound-dai = <&q6apmbedai PRIMARY_MI2S_RX>;
+				sound-dai = <&q6apmbedai PRIMARY_TDM_RX_0>;
 			};
 
 			codec {
