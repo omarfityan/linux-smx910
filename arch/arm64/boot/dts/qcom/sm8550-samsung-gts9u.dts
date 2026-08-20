@@ -565,6 +565,25 @@
 		compatible = "qcom,sm8550-sndcard";
 		model = "GTS9U";
 
+		/*
+		 * Microphone bias. The VA macro exposes its vdd-micb-supply as
+		 * a DAPM regulator-supply widget literally named "vdd-micb"
+		 * (lpass-va-macro.c: SND_SOC_DAPM_REGULATOR_SUPPLY), and that
+		 * widget is powered only by a route reaching it -- nothing
+		 * inside the macro connects it. Boards with no WCD codec spell
+		 * it exactly this way (qcs6490-rb3gen2, qrb5165-rb5,
+		 * x1e80100-lenovo-yoga-slim7x); this device has no WCD either
+		 * (stock's own sound node sets qcom,wcd-disabled = <1>), so
+		 * there is no "MIC BIASn" to borrow.
+		 *
+		 * The three entries mirror stock's own routing, which ties
+		 * Digital Mic0-5 to "VA MIC BIAS". Only the odd indices are
+		 * populated on this SKU -- see the DMIC MUX note below.
+		 */
+		audio-routing = "VA DMIC1", "vdd-micb",
+				"VA DMIC3", "vdd-micb",
+				"VA DMIC5", "vdd-micb";
+
 		pinctrl-names = "default", "sleep";
 		pinctrl-0 = <&mi2s0_active>;
 		pinctrl-1 = <&mi2s0_sleep>;
@@ -579,6 +598,33 @@
 			codec {
 				sound-dai = <&spkr_amp_rl 0>, <&spkr_amp_fl 0>,
 					    <&spkr_amp_rr 0>, <&spkr_amp_fr 0>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+
+		/*
+		 * Digital microphones.
+		 *
+		 * VA_CODEC_DMA_TX_0 rather than TX_CODEC_DMA_TX_3: both are
+		 * carried by q6apm-lpass-dais.c, but the VA port is the one
+		 * paired with <&vamacro 0> on boards that have no WCD codec to
+		 * share the TX port with (sc8280xp-lenovo-thinkpad-x13s,
+		 * qcs6490-rb3gen2, x1e80100-lenovo-yoga-slim7x). sm8450-hdk
+		 * uses TX_CODEC_DMA_TX_3 for its VA link, but it does so
+		 * alongside a WCD938x on the same port; we have neither.
+		 */
+		mic-dai-link {
+			link-name = "DMIC Capture";
+
+			cpu {
+				sound-dai = <&q6apmbedai VA_CODEC_DMA_TX_0>;
+			};
+
+			codec {
+				sound-dai = <&lpass_vamacro 0>;
 			};
 
 			platform {
@@ -651,6 +697,21 @@
 			regulator-name = "vreg_l9b_2p9";
 			regulator-min-microvolt = <2960000>;
 			regulator-max-microvolt = <3008000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/*
+		 * Digital-microphone bias. This device's own stock base tree
+		 * defines the rail as pm_humu_l10 / L10B on rpmh resource
+		 * "ldob10" with min = max = init = 1800000 uV, and its stock
+		 * dtbo names L10B as the va-macro's va-vdd-micb-supply. The VA
+		 * macro's own node agrees: qcom,va-vdd-micb-voltage =
+		 * <1800000 1800000>, qcom,va-vdd-micb-current = <1500>.
+		 */
+		vreg_l10b_1p8: ldo10 {
+			regulator-name = "vreg_l10b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
@@ -2114,5 +2175,120 @@
 / {
 	pmic_glink: pmic-glink {
 		compatible = "qcom,sm8550-pmic-glink", "qcom,pmic-glink";
+	};
+};
+
+/*
+ * Digital microphones -- PDM parts on the LPASS LPI pins.
+ *
+ * TRANSPORT. Stock declares SoundWire microphones and switches every one of
+ * them off: in this device's own dtbo, va_swr_master and all four
+ * dmic_swr@5835022x carry status = "disabled", and qcom,is-used-swr-gpio is 0.
+ * The microphones are PDM parts clocked straight off the LPI pins.
+ *
+ * PINS. Stock enables three clock/data pairs and disables the fourth:
+ *
+ *     group    clk         data        drive-strength   cdc_dmicNN_pinctrl
+ *     dmic01   LPI gpio6   LPI gpio7   2                enabled
+ *     dmic23   LPI gpio8   LPI gpio9   2                enabled
+ *     dmic45   LPI gpio12  LPI gpio13  2                enabled
+ *     dmic67   LPI gpio17  LPI gpio18  8                DISABLED
+ *
+ * and its sound node references only the dmic01/23/45 pinctrl phandles.
+ * Mainline's LPI pinctrl driver maps the identical pins under its own function
+ * names -- pinctrl-sm8550-lpass-lpi.c gives dmic1_clk = gpio6, dmic1_data =
+ * gpio7, dmic2 = gpio8/9, dmic3 = gpio12/13, dmic4 = gpio17/18 -- so the pins
+ * transcribe without translation.
+ *
+ * WHY THESE STATES ARE BOARD-LOCAL. sm8550.dtsi already carries dmic01_default
+ * and dmic23_default, but at drive-strength 8, and it carries no dmic45 state
+ * at all. This device drives all three enabled pairs at 2 mA. Matching stock is
+ * not negotiable here and a shared SoC dtsi is the wrong place to change it, so
+ * the states are defined here and the dtsi's are left untouched.
+ *
+ * HOW MANY MICROPHONES. Three, not six. A clk/data pair is a CLOCK DOMAIN, not
+ * a microphone slot: each pair can carry two PDM parts, one per clock edge, and
+ * this device populates the ODD index of each pair. Its own HAL says so
+ * directly -- the vendor mixer_paths.xml maps main-mic -> TX DMIC MUX0 = DMIC1,
+ * sub-mic -> MUX1 = DMIC3, 3rd-mic -> MUX2 = DMIC5, and every quad-mic path
+ * (unprocessed-quad-mic, va-mic-qmic, va-mic-qmic-lpi) is an EMPTY path. The
+ * 4th-mic -> DMIC7 entry is inherited boilerplate: its pins are the disabled
+ * pair. Counting enabled pin pairs would give six and wire DMIC0/2/4, which are
+ * the edges this device does not populate.
+ *
+ * CLOCK. Stock runs the microphones at two rates and they are not
+ * interchangeable:
+ *
+ *     qcom,va-dmic-sample-rate =  600000   VA macro   low-power, always-on
+ *     qcom,tx-dmic-sample-rate = 2400000   TX macro   ordinary recording
+ *
+ * Across the whole vendor mixer_paths.xml, DMIC_RATE OVERRIDE = CLK_0P6MHZ is
+ * set exactly twice, on vr-lowpower-main-mic and vr-lowpower-dual-mic. Every
+ * ordinary capture path -- rec-main-mic, camcorder-*, call-*, voip-comm-*,
+ * loopback-*, handset-mic, speaker-mic -- runs at the TX macro's default. So
+ * 600 kHz is stock's documented low-power exception and 2.4 MHz is what its
+ * microphones see when something is actually being recorded; a desktop capture
+ * device matching stock wants the latter at the mic's clock pin.
+ *
+ * Mainline accepts it: va_macro_validate_dmic_sample_rate() divides
+ * VA_MACRO_MCLK_FREQ (9600000) by this property, and 9600000 / 2400000 = 4 is
+ * VA_MACRO_CLK_DIV_4, an enumerated case. The property is mandatory -- the
+ * driver dev_err()s when it is absent.
+ */
+&lpass_vamacro {
+	pinctrl-names = "default";
+	pinctrl-0 = <&dmic01_active>, <&dmic23_active>, <&dmic45_active>;
+
+	vdd-micb-supply = <&vreg_l10b_1p8>;
+	qcom,dmic-sample-rate = <2400000>;
+};
+
+&lpass_tlmm {
+	dmic01_active: dmic01-active-state {
+		clk-pins {
+			pins = "gpio6";
+			function = "dmic1_clk";
+			drive-strength = <2>;
+			output-high;
+		};
+
+		data-pins {
+			pins = "gpio7";
+			function = "dmic1_data";
+			drive-strength = <2>;
+			input-enable;
+		};
+	};
+
+	dmic23_active: dmic23-active-state {
+		clk-pins {
+			pins = "gpio8";
+			function = "dmic2_clk";
+			drive-strength = <2>;
+			output-high;
+		};
+
+		data-pins {
+			pins = "gpio9";
+			function = "dmic2_data";
+			drive-strength = <2>;
+			input-enable;
+		};
+	};
+
+	dmic45_active: dmic45-active-state {
+		clk-pins {
+			pins = "gpio12";
+			function = "dmic3_clk";
+			drive-strength = <2>;
+			output-high;
+		};
+
+		data-pins {
+			pins = "gpio13";
+			function = "dmic3_data";
+			drive-strength = <2>;
+			input-enable;
+		};
 	};
 };
