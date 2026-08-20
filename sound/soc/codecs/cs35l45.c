@@ -607,6 +607,42 @@ static const struct snd_kcontrol_new cs35l45_controls[] = {
 			 0, cs35l45_dig_pcm_vol_tlv),
 	WM_ADSP2_PRELOAD_SWITCH("DSP1", 1),
 	WM_ADSP_FW_CONTROL("DSP1", 0),
+
+	/*
+	 * ASP slot positions.
+	 *
+	 * A CS35L45 does not learn its slot from snd_soc_dai_set_tdm_slot():
+	 * cs35l45_asp_set_tdm_slot() keeps the slot width and the slot count and
+	 * discards both masks. The part takes its position from
+	 * ASP_FRAME_CONTROL1 and ASP_FRAME_CONTROL5 instead, and nothing in this
+	 * driver has ever written either, so every part stayed at the reset
+	 * default: RX1 on slot 0, RX2 on slot 1, TX1..TX4 on slots 0..3.
+	 *
+	 * That default only describes a lone amplifier on a stereo link. A board
+	 * that hangs several parts off one TDM frame gives each of them a
+	 * different slot, and that is a per-part decision the DAI op cannot
+	 * carry: the parts share a DAI link, so one set_tdm_slot() call reaches
+	 * all of them with the same mask. Cirrus's own driver therefore exposes
+	 * the positions as controls and lets the card's UCM profile place each
+	 * part; these are transcribed from it, name for name, so that an
+	 * existing mixer configuration keeps working.
+	 *
+	 * The fields are six bits wide, hence 0..63. Pointing a receiver at a
+	 * slot the frame does not contain is how an unused input is told to take
+	 * nothing, so the full range is offered rather than the slot count.
+	 */
+	SOC_SINGLE_RANGE("ASPTX1 Slot Position", CS35L45_ASP_FRAME_CONTROL1,
+			 CS35L45_ASP_TX1_SLOT_SHIFT, 0, 63, 0),
+	SOC_SINGLE_RANGE("ASPTX2 Slot Position", CS35L45_ASP_FRAME_CONTROL1,
+			 CS35L45_ASP_TX2_SLOT_SHIFT, 0, 63, 0),
+	SOC_SINGLE_RANGE("ASPTX3 Slot Position", CS35L45_ASP_FRAME_CONTROL1,
+			 CS35L45_ASP_TX3_SLOT_SHIFT, 0, 63, 0),
+	SOC_SINGLE_RANGE("ASPTX4 Slot Position", CS35L45_ASP_FRAME_CONTROL1,
+			 CS35L45_ASP_TX4_SLOT_SHIFT, 0, 63, 0),
+	SOC_SINGLE_RANGE("ASPRX1 Slot Position", CS35L45_ASP_FRAME_CONTROL5,
+			 CS35L45_ASP_RX1_SLOT_SHIFT, 0, 63, 0),
+	SOC_SINGLE_RANGE("ASPRX2 Slot Position", CS35L45_ASP_FRAME_CONTROL5,
+			 CS35L45_ASP_RX2_SLOT_SHIFT, 0, 63, 0),
 };
 
 static int cs35l45_set_pll(struct cs35l45_private *cs35l45, unsigned int freq)
