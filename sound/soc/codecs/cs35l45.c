@@ -6,6 +6,7 @@
 //
 // Author: James Schulman <james.schulman@cirrus.com>
 
+#include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
@@ -113,6 +114,50 @@ static int cs35l45_global_en_ev(struct snd_soc_dapm_widget *w,
 	return 0;
 }
 
+/*
+ * The REINIT handshake is far slower than the PAUSE/RESUME commands that
+ * cs35l45_set_cspl_mbox_cmd() was written for, and that helper gives up after
+ * five ~1 ms polls. Measured on this device: STOP_PRE_REINIT still reported
+ * PAUSED and REINIT still reported RDY_FOR_REINIT after 5 ms, on all four
+ * amplifiers. This device's own downstream driver polls these two commands up
+ * to 100 times at 1000-1500 us, with an unconditional 100 ms settle between
+ * them, so use that budget here rather than relaxing the generic helper and
+ * changing the timing of PAUSE/RESUME for every board.
+ */
+#define CS35L45_CAL_MBOX_RETRIES	100
+
+static int cs35l45_cal_mbox_cmd(struct cs35l45_private *cs35l45,
+				enum cs35l45_cspl_mboxcmd cmd,
+				enum cs35l45_cspl_mboxstate want)
+{
+	unsigned int sts = 0;
+	int i, ret;
+
+	ret = regmap_write(cs35l45->regmap, CS35L45_DSP_VIRT1_MBOX_1, cmd);
+	if (ret < 0) {
+		dev_err(cs35l45->dev, "Failed to write MBOX: %d\n", ret);
+		return ret;
+	}
+
+	for (i = 0; i < CS35L45_CAL_MBOX_RETRIES; i++) {
+		usleep_range(1000, 1500);
+
+		ret = regmap_read(cs35l45->regmap, CS35L45_DSP_MBOX_2, &sts);
+		if (ret < 0) {
+			dev_err(cs35l45->dev, "Failed to read MBOX STS: %d\n", ret);
+			return ret;
+		}
+
+		if (sts == want)
+			return 0;
+	}
+
+	dev_err(cs35l45->dev, "Mailbox cmd %u: wanted status %u, got %u\n",
+		cmd, want, sts);
+
+	return -ENOMSG;
+}
+
 static int cs35l45_write_cal_ctl(struct cs35l45_private *cs35l45,
 				 const char *name, unsigned int alg,
 				 unsigned int value)
@@ -162,10 +207,19 @@ static int cs35l45_apply_calibration(struct cs35l45_private *cs35l45)
 			CS35L45_VIMON_CAL_STATUS_SUCCESS :
 			CS35L45_VIMON_CAL_STATUS_INVALID;
 
-	ret = cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
-					CSPL_MBOX_CMD_STOP_PRE_REINIT);
-	if (ret < 0)
-		return ret;
+	/*
+	 * A timeout here is logged but not fatal, matching downstream, which
+	 * reports the same condition and writes the calibration regardless. The
+	 * writes have been observed to land on this device whether or not the
+	 * firmware reported REINIT-ready. The settle is unconditional, as it is
+	 * downstream.
+	 */
+	if (cs35l45_cal_mbox_cmd(cs35l45, CSPL_MBOX_CMD_STOP_PRE_REINIT,
+				 CSPL_MBOX_STS_RDY_FOR_REINIT))
+		dev_warn(cs35l45->dev,
+			 "REINIT-ready not reported; writing calibration anyway\n");
+
+	msleep(100);
 
 	/*
 	 * From here on every exit goes through the REINIT below. Leaving the
@@ -210,8 +264,8 @@ static int cs35l45_apply_calibration(struct cs35l45_private *cs35l45)
 	}
 
 reinit:
-	reinit_ret = cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
-					       CSPL_MBOX_CMD_REINIT);
+	reinit_ret = cs35l45_cal_mbox_cmd(cs35l45, CSPL_MBOX_CMD_REINIT,
+					  CSPL_MBOX_STS_RUNNING);
 	if (reinit_ret < 0)
 		return reinit_ret;
 
