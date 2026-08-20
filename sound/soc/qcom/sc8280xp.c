@@ -182,6 +182,20 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 		 * S24_LE is a 24-bit sample in a 32-bit container, which is what
 		 * the frame carries: the container is the slot.
 		 */
+		/*
+		 * snd_mask_set_format() SETS a bit; it does not replace the
+		 * mask.  The default above has already set S16_LE, so simply
+		 * setting S24_LE here leaves BOTH permitted and the resolution
+		 * takes the lower one.  The backend is then programmed for
+		 * 16-bit samples while the DSP endpoint has been told 24, and
+		 * nothing reports an error: the amplifiers' ASP_WL reads 16
+		 * beside an ASP_WIDTH_RX of 32, because the slot width comes
+		 * from set_tdm_slot() while the sample width comes from here.
+		 *
+		 * Clear the mask first so the backend carries exactly one
+		 * format and both ends of the link agree on it.
+		 */
+		snd_mask_none(fmt);
 		snd_mask_set_format(fmt, tdm_sample_bits == 16 ?
 					 SNDRV_PCM_FORMAT_S16_LE :
 					 SNDRV_PCM_FORMAT_S24_LE);
