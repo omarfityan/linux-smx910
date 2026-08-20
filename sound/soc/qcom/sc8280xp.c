@@ -234,7 +234,14 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 		 * silently caps a three-microphone board at two microphones:
 		 * the third is wired, clocked and populated, and simply has
 		 * nowhere to go.  Widen the range instead of moving it, so a
-		 * mono or stereo capture still negotiates.
+		 * narrower capture still negotiates.
+		 *
+		 * The floor set here is not the floor that results.  DPCM merges
+		 * the front end, the backend and the platform driver by keeping
+		 * the HIGHEST minimum and the LOWEST maximum, and
+		 * q6apm_dai_hardware_capture() declares channels_min 2 -- so the
+		 * PCM offers 2..3 whatever this asks for below 2.  Measured on
+		 * the device: 2 and 3 open, 1 and 4 are refused.
 		 *
 		 * THE CHANNEL COUNT IS DECIDED IN TWO PLACES AND THEY MUST
 		 * AGREE.  This sets what the PCM may negotiate.  What the VA
