@@ -526,6 +526,12 @@ struct param_id_i2s_intf_cfg {
 #define TDM_DATA_DELAY_2_BCLK_CYCLE	2
 #define TDM_MAX_SLOTS_PER_FRAME		32
 
+#define PARAM_ID_TDM_LANE_CFG			0x0800106A
+struct param_id_tdm_lane_cfg {
+	uint16_t lane_mask;
+	uint16_t reserved;
+} __packed;
+
 #define PARAM_ID_TDM_INTF_CFG			0x0800101B
 struct param_id_tdm_intf_cfg {
 	uint32_t lpaif_type;

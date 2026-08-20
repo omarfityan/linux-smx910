@@ -29,12 +29,69 @@ static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	struct snd_soc_card *card = rtd->card;
 	struct snd_soc_jack *dp_jack  = NULL;
+	struct snd_soc_dai *codec_dai;
 	int dp_pcm_id = 0;
+	int ret, i;
 
 	switch (cpu_dai->id) {
 	case PRIMARY_MI2S_RX...QUATERNARY_MI2S_TX:
 	case QUINARY_MI2S_RX...QUINARY_MI2S_TX:
 		snd_soc_dai_set_fmt(cpu_dai, SND_SOC_DAIFMT_BP_FP);
+		break;
+	case PRIMARY_TDM_RX_0...QUINARY_TDM_TX_7:
+		/*
+		 * DSP_A framing: a one-bit-clock-wide sync pulse with the first
+		 * slot starting one bit clock after it.
+		 *
+		 * snd_soc_runtime_set_dai_fmt() rather than
+		 * snd_soc_dai_set_fmt(cpu_dai, ...) as the MI2S case above uses,
+		 * because on a TDM link the codecs need the format too and the
+		 * cpu-only call never reaches them.  A codec left at its reset
+		 * format samples the wrong framing and, where the link asks for
+		 * an inverted bit clock as here, the wrong clock edge -- neither
+		 * of which reports an error, they just corrupt the audio.
+		 *
+		 * SND_SOC_DAIFMT_IB_NF is meaningful only to the codecs: the
+		 * host's TDM interface parameter can invert the frame but has no
+		 * bit-clock inversion at all, so the amplifiers are what latch on
+		 * the opposite edge.
+		 */
+		ret = snd_soc_runtime_set_dai_fmt(rtd, SND_SOC_DAIFMT_DSP_A |
+						  SND_SOC_DAIFMT_CBC_CFC |
+						  SND_SOC_DAIFMT_IB_NF);
+		if (ret) {
+			dev_err(card->dev, "Failed to set TDM format: %d\n", ret);
+			return ret;
+		}
+
+		/*
+		 * A four-slot frame, all four slots carried, in 32-bit slots.
+		 *
+		 * The slot width is 32 while the samples are 24-bit: a 24-bit
+		 * sample rides in a 32-bit slot, and the bit clock follows the
+		 * SLOT width, so this is what makes the link clock at
+		 * rate x 32 x 4 rather than three quarters of that.
+		 *
+		 * The codecs are given the slot WIDTH but no mask and no slot
+		 * count, because a CS35L45 does not take its slot position from
+		 * here -- it has its own ASPRX Slot Position controls, set from
+		 * userspace, which is how four amplifiers on one frame each end
+		 * up on a different slot.
+		 */
+		ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0, GENMASK(3, 0), 4, 32);
+		if (ret) {
+			dev_err(card->dev, "Failed to set TDM slots: %d\n", ret);
+			return ret;
+		}
+
+		for_each_rtd_codec_dais(rtd, i, codec_dai) {
+			ret = snd_soc_dai_set_tdm_slot(codec_dai, 0, 0, 0, 32);
+			if (ret && ret != -ENOTSUPP) {
+				dev_err(card->dev, "%s: failed to set slot width: %d\n",
+					codec_dai->name, ret);
+				return ret;
+			}
+		}
 		break;
 	case WSA_CODEC_DMA_RX_0:
 	case WSA_CODEC_DMA_RX_1:
@@ -82,6 +139,21 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	channels->min = 2;
 	channels->max = 2;
 	switch (cpu_dai->id) {
+	case PRIMARY_TDM_RX_0...QUINARY_TDM_TX_7:
+		/*
+		 * A TDM frame is not a stereo pair.  The defaults above describe
+		 * a two-channel 16-bit link, which is what every other backend
+		 * here happens to be; forcing them onto a TDM link would silently
+		 * collapse a four-slot frame to its first two slots and cut the
+		 * bit clock accordingly, without anything reporting an error.
+		 *
+		 * S24_LE is a 24-bit sample in a 32-bit container, which is what
+		 * the frame carries: the container is the slot.
+		 */
+		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S24_LE);
+		channels->min = 4;
+		channels->max = 4;
+		break;
 	case TX_CODEC_DMA_TX_0:
 	case TX_CODEC_DMA_TX_1:
 	case TX_CODEC_DMA_TX_2:
