@@ -313,6 +313,27 @@ void audioreach_set_default_channel_mapping(u8 *ch_map, int num_channels)
 	} else if (num_channels == 2) {
 		ch_map[0] =  PCM_CHANNEL_FL;
 		ch_map[1] =  PCM_CHANNEL_FR;
+	} else if (num_channels == 3) {
+		/*
+		 * Three channels had no case here at all, so the map was left
+		 * untouched -- PCM_CHANNEL_NULL in every position for a freshly
+		 * allocated config.  A three-channel capture then reaches the
+		 * DSP described as three channels with no valid position for
+		 * any of them, and what comes back is channel 0 repeated: on a
+		 * board with three digital microphones, all three capture
+		 * channels were bit-identical while the codec's own registers
+		 * showed three distinct decimators running correctly.
+		 *
+		 * Nothing reports an error for this.  The PCM opens, the frame
+		 * is the right size and the samples are plausible.
+		 *
+		 * FL/FR/FC is what q6dsp_map_channels() uses for three channels
+		 * on the older q6afe path; the two helpers describe the same
+		 * hardware and should not disagree.
+		 */
+		ch_map[0] =  PCM_CHANNEL_FL;
+		ch_map[1] =  PCM_CHANNEL_FR;
+		ch_map[2] =  PCM_CHANNEL_FC;
 	} else if (num_channels == 4) {
 		ch_map[0] =  PCM_CHANNEL_FL;
 		ch_map[1] =  PCM_CHANNEL_FR;
