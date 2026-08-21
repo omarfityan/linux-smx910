@@ -326,6 +326,12 @@
 #define CS35L45_BPE_INST_L2_BYP_MASK		BIT(9)
 #define CS35L45_BPE_INST_L1_BYP_SHIFT		8
 #define CS35L45_BPE_INST_L1_BYP_MASK		BIT(8)
+/*
+ * Bit 15 of BPE_MISC_CONFIG. It has no name in this header, no name in the
+ * vendor's, and no device-tree property feeds it -- so it is named here for
+ * what is known about it and nothing more. See cs35l45_apply_bpe_config().
+ */
+#define CS35L45_BPE_MISC_CONFIG_UNNAMED_BIT15	BIT(15)
 #define CS35L45_BPE_MODE_SEL_SHIFT		4
 #define CS35L45_BPE_MODE_SEL_MASK		GENMASK(5, 4)
 #define CS35L45_BPE_FILT_SEL_SHIFT		0

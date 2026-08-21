@@ -1581,6 +1581,49 @@ static void cs35l45_apply_bpe_config(struct cs35l45_private *cs35l45,
 	if (child) {
 		cs35l45_apply_scalar_props(cs35l45, child, cs35l45_bpe_misc_props,
 					   ARRAY_SIZE(cs35l45_bpe_misc_props));
+
+		/*
+		 * Stock's amplifiers carry BPE_MISC_CONFIG bit 15 and ours do
+		 * not: stock reads 0x00008600 where we read 0x00000600, all
+		 * four parts, both idle and playing. The lower bits are the two
+		 * bypass fields above, written from the device tree; bit 15 is
+		 * the whole of the difference.
+		 *
+		 * WHERE THE BIT COMES FROM ON STOCK. The vendor's reg_defaults
+		 * table carries {CS35L45_BPE_MISC_CONFIG, 0x00008000}, so its
+		 * regmap cache holds 0x8000 for this register from init.
+		 * _regmap_update_bits() reads through _regmap_read(), which is
+		 * cache-first, so the vendor's read-modify-write for the bypass
+		 * fields reads 0x8000 out of its own table -- never off the
+		 * part -- ORs in the device-tree bits and writes 0x8600 to
+		 * silicon. The bit reaches the hardware because the table said
+		 * so.
+		 *
+		 * It is NOT this part's reset value. We have no table entry, so
+		 * the identical read-modify-write took a cache miss and read
+		 * the register itself: it returned zero, and we wrote 0x0600.
+		 * A cache_bypass read of a live amplifier confirms 0x00000600
+		 * in silicon on all four.
+		 *
+		 * WHY THIS IS AN EXPLICIT WRITE and not a copy of the vendor's
+		 * reg_defaults entry. A reg_defaults entry is a claim about the
+		 * reset value, and the measurement above says that claim would
+		 * be false here. It would also make the write implicit: it
+		 * would only reach silicon as a side effect of some other
+		 * property triggering a read-modify-write on this register, so
+		 * a device tree without a bpe-misc-config node would leave the
+		 * cache asserting 0x8000 over hardware holding zero.
+		 *
+		 * WHAT IS NOT KNOWN: what the bit does. There is no datasheet,
+		 * and neither header names it. This reproduces stock's
+		 * configuration because matching stock is the requirement, not
+		 * because the function is understood. Do not build an
+		 * explanation on top of it.
+		 */
+		regmap_update_bits(cs35l45->regmap, CS35L45_BPE_MISC_CONFIG,
+				   CS35L45_BPE_MISC_CONFIG_UNNAMED_BIT15,
+				   CS35L45_BPE_MISC_CONFIG_UNNAMED_BIT15);
+
 		of_node_put(child);
 	}
 
