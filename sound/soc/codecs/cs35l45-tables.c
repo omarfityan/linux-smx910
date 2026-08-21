@@ -246,6 +246,35 @@ static bool cs35l45_volatile_reg(struct device *dev, unsigned int reg)
 	case CS35L45_SFT_RESET:
 	case CS35L45_GLOBAL_ENABLES:
 	case CS35L45_ERROR_RELEASE:
+	/*
+	 * The two Battery-Protection-Engine status registers. They report what
+	 * the engines are doing; nothing here ever writes them.
+	 *
+	 * They must be volatile or they cannot be read at all. regmap's read
+	 * path consults the cache BEFORE it looks at cache_only:
+	 *
+	 *	if (!map->cache_bypass) {
+	 *		ret = regcache_read(map, reg, val);
+	 *		if (ret == 0)
+	 *			return 0;
+	 *	}
+	 *	if (map->cache_only)
+	 *		return -EBUSY;
+	 *
+	 * and regcache_read() succeeds for any register that is not volatile.
+	 * So a non-volatile status register is served from whatever value
+	 * happened to be cached on its first read, for the life of the device,
+	 * however often it is re-read and whatever cache_only says. It looks
+	 * like a stable hardware reading and is nothing of the kind.
+	 *
+	 * The device's own downstream driver marks BST_BPE_INST_STATUS
+	 * volatile. This converges on it, and extends the same treatment to
+	 * BPE_INST_STATUS, which the vendor leaves cached -- with the result
+	 * that the vendor's own reads of it return its reg_defaults entry
+	 * (0x0000005A) and carry no information.
+	 */
+	case CS35L45_BST_BPE_INST_STATUS:
+	case CS35L45_BPE_INST_STATUS:
 	case CS35L45_AMP_PCM_HPF_TST:	/* not cachable */
 	case CS35L45_PWRMGT_STS:
 	case CS35L45_IRQ1_STATUS:
