@@ -563,6 +563,19 @@ static const struct snd_kcontrol_new cs35l45_dac_muxes[] = {
 static const struct snd_kcontrol_new amp_en_ctl =
 	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0);
 
+/*
+ * The two Battery Protection Engines. Both controls are SND_SOC_NOPM: they
+ * write no register themselves, they only connect or disconnect the path. The
+ * register bit belongs to the WIDGET, and DAPM writes it when the branch
+ * powers up -- which is why stock's BLOCK_ENABLES2 carries bits 12 and 13
+ * during playback and clears them at idle.
+ */
+static const struct snd_kcontrol_new abpe_en_ctl =
+	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0);
+
+static const struct snd_kcontrol_new bbpe_en_ctl =
+	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0);
+
 static const struct snd_soc_dapm_widget cs35l45_dapm_widgets[] = {
 	SND_SOC_DAPM_SPK("DSP1 Preload", NULL),
 	SND_SOC_DAPM_SUPPLY_S("DSP1 Preloader", 100, SND_SOC_NOPM, 0, 0,
@@ -625,6 +638,11 @@ static const struct snd_soc_dapm_widget cs35l45_dapm_widgets[] = {
 	SND_SOC_DAPM_MUX("DACPCM Source", SND_SOC_NOPM, 0, 0, &cs35l45_dac_muxes[0]),
 
 	SND_SOC_DAPM_SWITCH("AMP Enable", SND_SOC_NOPM, 0, 0, &amp_en_ctl),
+
+	SND_SOC_DAPM_SWITCH("ABPE Enable", CS35L45_BLOCK_ENABLES2,
+			    CS35L45_ABPE_EN_SHIFT, 0, &abpe_en_ctl),
+	SND_SOC_DAPM_SWITCH("BBPE Enable", CS35L45_BLOCK_ENABLES2,
+			    CS35L45_BBPE_EN_SHIFT, 0, &bbpe_en_ctl),
 
 	SND_SOC_DAPM_OUT_DRV("AMP", SND_SOC_NOPM, 0, 0, NULL, 0),
 
@@ -735,6 +753,31 @@ static const struct snd_soc_dapm_route cs35l45_dapm_routes[] = {
 
 	{ "AMP Enable", "Switch", "AMP" },
 	{ "SPK", NULL, "AMP Enable"},
+
+	/*
+	 * The Battery Protection Engines hang off the playback path as parallel
+	 * branches, which is the shape the vendor uses:
+	 *
+	 *	{"Entry", NULL, "AMP Enable"},
+	 *	{"ABPE Enable", "Switch", "Entry"},
+	 *	{"Exit",  NULL, "ABPE Enable"},
+	 *	{"SPK",   NULL, "Exit"},
+	 *
+	 * The vendor's "Entry" sits immediately downstream of its "AMP Enable"
+	 * switch and its "Exit" feeds SPK, so with no Entry/Exit mixers in this
+	 * graph the faithful attachment point is our own "AMP Enable", and SPK
+	 * is where the branch rejoins.
+	 *
+	 * The switches are Off at power-on -- dapm_kcontrol_data_alloc() takes a
+	 * kzalloc and these are not autodisable -- so userspace has to close
+	 * them, exactly as it does on stock, where they read On at 68 s uptime
+	 * with the amplifier switch still Off. Ours are closed by the UCM
+	 * profile's EnableSequence, alongside "AMP Enable".
+	 */
+	{ "ABPE Enable", "Switch", "AMP Enable" },
+	{ "BBPE Enable", "Switch", "AMP Enable" },
+	{ "SPK", NULL, "ABPE Enable" },
+	{ "SPK", NULL, "BBPE Enable" },
 };
 
 static const char * const amplifier_mode_texts[] = {"SPK", "RCV"};
