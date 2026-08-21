@@ -18,6 +18,78 @@
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/sound/cs35l45.h>
+
+/*
+ * Battery Protection Engine, transcribed from this device's own stock dtbo.
+ *
+ * Stock programs BPE and boost-BPE on all four amplifiers and the values are
+ * IDENTICAL on every one -- verified by decompiling both stock overlays, which
+ * are themselves byte-identical in this region. That sameness is expressed here
+ * as a macro so it stays a fact about the design rather than four copies that
+ * can drift apart.
+ *
+ * BPE watches the battery rail VP against four thresholds and applies a
+ * per-level output attenuation; boost-BPE drives the boost converter's current
+ * limits from the same ladder. Mainline configured none of it before.
+ *
+ * 🔴 bpe-filt-sel and bpe-mode-sel are declared here because STOCK'S DEVICE TREE
+ * DECLARES THEM -- this node is a faithful copy of stock's. They are, however,
+ * NEVER APPLIED, on stock or here: the vendor driver looks them up as
+ * "bst-bpe-mode-sel"/"bst-bpe-filt-sel", names that belong to the separate
+ * bst-bpe-misc-config node and do not exist in this one, so its lookups fail
+ * and the two register fields keep their reset value. Our driver reproduces
+ * that omission deliberately (see cs35l45_bpe_misc_props). Keeping the
+ * properties here and not reading them is what makes the DT match stock's DT
+ * and the behaviour match stock's behaviour, which are two different things.
+ */
+#define CS35L45_GTS9U_BPE_CONFIG					\
+	cirrus,bpe-inst-config {					\
+		bpe-inst-thld = <0x1e 0x28 0x46 0x5a>;			\
+		bpe-inst-attn = <0x0a 0x06 0x0c 0x06>;			\
+		bpe-inst-atk-rate = <0x00 0x01 0x06 0x06>;		\
+		bpe-inst-hold-time = <0x02 0x02 0x02 0x02>;		\
+		bpe-inst-rls-rate = <0x0a 0x08 0x05 0x05>;		\
+	};								\
+									\
+	cirrus,bpe-misc-config {					\
+		bpe-filt-sel = <0x00>;					\
+		bpe-mode-sel = <0x00>;					\
+		bpe-inst-l1-byp = <0x00>;				\
+		bpe-inst-l2-byp = <0x01>;				\
+		bpe-inst-l3-byp = <0x01>;				\
+		bpe-inst-inf-hold-rls = <0x00>;				\
+		bpe-inst-bpe-byp = <0x00>;				\
+	};								\
+									\
+	cirrus,bst-bpe-inst-config {					\
+		bst-bpe-inst-thld = <0x1e 0x28 0x46 0x5a 0x00>;		\
+		bst-bpe-inst-ilim = <0x00 0x04 0x0c 0x14 0x3c>;		\
+		bst-bpe-inst-ss-ilim = <0x00 0x00 0x04 0x08 0x1c>;	\
+		bst-bpe-inst-atk-rate = <0x00 0x03 0x06 0x06 0x00>;	\
+		bst-bpe-inst-hold-time = <0x02 0x02 0x02 0x02 0x00>;	\
+		bst-bpe-inst-rls-rate = <0x06 0x06 0x06 0x06 0x00>;	\
+	};								\
+									\
+	cirrus,bst-bpe-misc-config {					\
+		bst-bpe-filt-sel = <0x00>;				\
+		bst-bpe-inst-l1-byp = <0x00>;				\
+		bst-bpe-inst-l2-byp = <0x01>;				\
+		bst-bpe-inst-l3-byp = <0x01>;				\
+		bst-bpe-out-opmode-sel = <0x00>;			\
+		bst-bpe-il-lim-mode = <0x00>;				\
+		bst-bpe-inst-inf-hold-rls = <0x00>;			\
+	};								\
+									\
+	cirrus,bst-bpe-il-lim-config {					\
+		bst-bpe-il-lim1-dly = <0x04>;				\
+		bst-bpe-il-lim2-dly = <0x04>;				\
+		bst-bpe-il-lim-dly-hyst = <0x00>;			\
+		bst-bpe-il-lim-thld-hyst = <0x00>;			\
+		bst-bpe-il-lim1-thld = <0x2c>;				\
+		bst-bpe-il-lim-thld-del2 = <0x00>;			\
+		bst-bpe-il-lim-thld-del1 = <0x10>;			\
+	};
+
 #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
 #include <dt-bindings/usb/pd.h>
 #include "sm8550.dtsi"
@@ -1939,6 +2011,8 @@
 		cirrus,gpio-ctrl2 {
 			gpio-ctrl = <0x2>;
 		};
+
+		CS35L45_GTS9U_BPE_CONFIG
 	};
 
 	spkr_amp_fl: speaker-amp@31 {
@@ -1972,6 +2046,8 @@
 		cirrus,gpio-ctrl2 {
 			gpio-ctrl = <0x2>;
 		};
+
+		CS35L45_GTS9U_BPE_CONFIG
 	};
 
 	spkr_amp_rr: speaker-amp@32 {
@@ -2005,6 +2081,8 @@
 		cirrus,gpio-ctrl2 {
 			gpio-ctrl = <0x2>;
 		};
+
+		CS35L45_GTS9U_BPE_CONFIG
 	};
 
 	spkr_amp_fr: speaker-amp@33 {
@@ -2038,6 +2116,8 @@
 		cirrus,gpio-ctrl2 {
 			gpio-ctrl = <0x2>;
 		};
+
+		CS35L45_GTS9U_BPE_CONFIG
 	};
 };
 

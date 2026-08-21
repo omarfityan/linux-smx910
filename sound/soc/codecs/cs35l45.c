@@ -1280,6 +1280,314 @@ static void cs35l45_parse_calibration(struct cs35l45_private *cs35l45)
 	cs35l45->cal_vimon_valid = true;
 }
 
+
+/*
+ * ---------------------------------------------------------------------------
+ * Battery Protection Engine (BPE) and boost-BPE.
+ *
+ * Two staged brown-out protections the amplifier runs autonomously. BPE watches
+ * the battery rail VP against four thresholds and applies a per-level output
+ * attenuation with its own attack, hold and release rates. Boost-BPE drives the
+ * boost converter's current limits from the same ladder, and the IL_LIM block
+ * adds an inductor-current limiter on top.
+ *
+ * This device's own stock firmware programs all of it, identically, on all four
+ * amplifiers; mainline programmed none of it. The values live in the device
+ * tree, so the port is a transcription of the vendor's MECHANISM -- the
+ * register layout and the order things are applied -- while the numbers stay
+ * where they belong, in the DT.
+ *
+ * A level whose entry has reg == 0 is one the hardware does not implement at
+ * that level (there is no BST_BPE_INST_L4_THLD field, no L0_ILIM, and so on).
+ * The vendor's tables carry the same holes; they are reproduced rather than
+ * filled, because filling them would write a neighbouring field.
+ * ---------------------------------------------------------------------------
+ */
+struct cs35l45_bpe_field {
+	unsigned int reg;	/* 0: not implemented at this level -- skip */
+	unsigned int mask;
+	unsigned int shift;
+};
+
+/* A DT property holding one u32 per level, e.g. bpe-inst-thld = <a b c d>. */
+struct cs35l45_bpe_level_prop {
+	const char *name;
+	unsigned int levels;
+	const struct cs35l45_bpe_field *field;
+};
+
+/* A DT property holding a single u32. */
+struct cs35l45_bpe_scalar_prop {
+	const char *name;
+	unsigned int reg;
+	unsigned int mask;
+	unsigned int shift;
+};
+
+static const struct cs35l45_bpe_field cs35l45_bpe_inst_thld_lvl[] = {
+	{ CS35L45_BPE_INST_THLD, CS35L45_BPE_INST_L0_THLD_MASK, CS35L45_BPE_INST_L0_THLD_SHIFT },
+	{ CS35L45_BPE_INST_THLD, CS35L45_BPE_INST_L1_THLD_MASK, CS35L45_BPE_INST_L1_THLD_SHIFT },
+	{ CS35L45_BPE_INST_THLD, CS35L45_BPE_INST_L2_THLD_MASK, CS35L45_BPE_INST_L2_THLD_SHIFT },
+	{ CS35L45_BPE_INST_THLD, CS35L45_BPE_INST_L3_THLD_MASK, CS35L45_BPE_INST_L3_THLD_SHIFT },
+};
+
+static const struct cs35l45_bpe_field cs35l45_bpe_inst_attn_lvl[] = {
+	{ CS35L45_BPE_INST_ATTN, CS35L45_BPE_INST_L0_ATTN_MASK, CS35L45_BPE_INST_L0_ATTN_SHIFT },
+	{ CS35L45_BPE_INST_ATTN, CS35L45_BPE_INST_L1_ATTN_MASK, CS35L45_BPE_INST_L1_ATTN_SHIFT },
+	{ CS35L45_BPE_INST_ATTN, CS35L45_BPE_INST_L2_ATTN_MASK, CS35L45_BPE_INST_L2_ATTN_SHIFT },
+	{ CS35L45_BPE_INST_ATTN, CS35L45_BPE_INST_L3_ATTN_MASK, CS35L45_BPE_INST_L3_ATTN_SHIFT },
+};
+
+static const struct cs35l45_bpe_field cs35l45_bpe_inst_atk_rate_lvl[] = {
+	{ CS35L45_BPE_INST_ATK_RATE, CS35L45_BPE_INST_L0_ATK_RATE_MASK, CS35L45_BPE_INST_L0_ATK_RATE_SHIFT },
+	{ CS35L45_BPE_INST_ATK_RATE, CS35L45_BPE_INST_L1_ATK_RATE_MASK, CS35L45_BPE_INST_L1_ATK_RATE_SHIFT },
+	{ CS35L45_BPE_INST_ATK_RATE, CS35L45_BPE_INST_L2_ATK_RATE_MASK, CS35L45_BPE_INST_L2_ATK_RATE_SHIFT },
+	{ CS35L45_BPE_INST_ATK_RATE, CS35L45_BPE_INST_L3_ATK_RATE_MASK, CS35L45_BPE_INST_L3_ATK_RATE_SHIFT },
+};
+
+static const struct cs35l45_bpe_field cs35l45_bpe_inst_hold_time_lvl[] = {
+	{ CS35L45_BPE_INST_HOLD_TIME, CS35L45_BPE_INST_L0_HOLD_TIME_MASK, CS35L45_BPE_INST_L0_HOLD_TIME_SHIFT },
+	{ CS35L45_BPE_INST_HOLD_TIME, CS35L45_BPE_INST_L1_HOLD_TIME_MASK, CS35L45_BPE_INST_L1_HOLD_TIME_SHIFT },
+	{ CS35L45_BPE_INST_HOLD_TIME, CS35L45_BPE_INST_L2_HOLD_TIME_MASK, CS35L45_BPE_INST_L2_HOLD_TIME_SHIFT },
+	{ CS35L45_BPE_INST_HOLD_TIME, CS35L45_BPE_INST_L3_HOLD_TIME_MASK, CS35L45_BPE_INST_L3_HOLD_TIME_SHIFT },
+};
+
+static const struct cs35l45_bpe_field cs35l45_bpe_inst_rls_rate_lvl[] = {
+	{ CS35L45_BPE_INST_RLS_RATE, CS35L45_BPE_INST_L0_RLS_RATE_MASK, CS35L45_BPE_INST_L0_RLS_RATE_SHIFT },
+	{ CS35L45_BPE_INST_RLS_RATE, CS35L45_BPE_INST_L1_RLS_RATE_MASK, CS35L45_BPE_INST_L1_RLS_RATE_SHIFT },
+	{ CS35L45_BPE_INST_RLS_RATE, CS35L45_BPE_INST_L2_RLS_RATE_MASK, CS35L45_BPE_INST_L2_RLS_RATE_SHIFT },
+	{ CS35L45_BPE_INST_RLS_RATE, CS35L45_BPE_INST_L3_RLS_RATE_MASK, CS35L45_BPE_INST_L3_RLS_RATE_SHIFT },
+};
+
+static const struct cs35l45_bpe_field cs35l45_bst_bpe_inst_thld_lvl[] = {
+	{ CS35L45_BST_BPE_INST_THLD, CS35L45_BST_BPE_INST_L0_THLD_MASK, CS35L45_BST_BPE_INST_L0_THLD_SHIFT },
+	{ CS35L45_BST_BPE_INST_THLD, CS35L45_BST_BPE_INST_L1_THLD_MASK, CS35L45_BST_BPE_INST_L1_THLD_SHIFT },
+	{ CS35L45_BST_BPE_INST_THLD, CS35L45_BST_BPE_INST_L2_THLD_MASK, CS35L45_BST_BPE_INST_L2_THLD_SHIFT },
+	{ CS35L45_BST_BPE_INST_THLD, CS35L45_BST_BPE_INST_L3_THLD_MASK, CS35L45_BST_BPE_INST_L3_THLD_SHIFT },
+	{ 0 },   /* hardware has no such field at this level */
+};
+
+static const struct cs35l45_bpe_field cs35l45_bst_bpe_inst_ilim_lvl[] = {
+	{ 0 },   /* hardware has no such field at this level */
+	{ CS35L45_BST_BPE_INST_ILIM, CS35L45_BST_BPE_INST_L1_ILIM_MASK, CS35L45_BST_BPE_INST_L1_ILIM_SHIFT },
+	{ CS35L45_BST_BPE_INST_ILIM, CS35L45_BST_BPE_INST_L2_ILIM_MASK, CS35L45_BST_BPE_INST_L2_ILIM_SHIFT },
+	{ CS35L45_BST_BPE_INST_ILIM, CS35L45_BST_BPE_INST_L3_ILIM_MASK, CS35L45_BST_BPE_INST_L3_ILIM_SHIFT },
+	{ CS35L45_BST_BPE_INST_ILIM, CS35L45_BST_BPE_INST_L4_ILIM_MASK, CS35L45_BST_BPE_INST_L4_ILIM_SHIFT },
+};
+
+static const struct cs35l45_bpe_field cs35l45_bst_bpe_inst_ss_ilim_lvl[] = {
+	{ 0 },   /* hardware has no such field at this level */
+	{ CS35L45_BST_BPE_INST_SS_ILIM, CS35L45_BST_BPE_INST_L1_SS_ILIM_MASK, CS35L45_BST_BPE_INST_L1_SS_ILIM_SHIFT },
+	{ CS35L45_BST_BPE_INST_SS_ILIM, CS35L45_BST_BPE_INST_L2_SS_ILIM_MASK, CS35L45_BST_BPE_INST_L2_SS_ILIM_SHIFT },
+	{ CS35L45_BST_BPE_INST_SS_ILIM, CS35L45_BST_BPE_INST_L3_SS_ILIM_MASK, CS35L45_BST_BPE_INST_L3_SS_ILIM_SHIFT },
+	{ CS35L45_BST_BPE_INST_SS_ILIM, CS35L45_BST_BPE_INST_L4_SS_ILIM_MASK, CS35L45_BST_BPE_INST_L4_SS_ILIM_SHIFT },
+};
+
+static const struct cs35l45_bpe_field cs35l45_bst_bpe_inst_atk_rate_lvl[] = {
+	{ 0 },   /* hardware has no such field at this level */
+	{ CS35L45_BST_BPE_INST_ATK_RATE, CS35L45_BST_BPE_INST_L1_ATK_RATE_MASK, CS35L45_BST_BPE_INST_L1_ATK_RATE_SHIFT },
+	{ CS35L45_BST_BPE_INST_ATK_RATE, CS35L45_BST_BPE_INST_L2_ATK_RATE_MASK, CS35L45_BST_BPE_INST_L2_ATK_RATE_SHIFT },
+	{ CS35L45_BST_BPE_INST_ATK_RATE, CS35L45_BST_BPE_INST_L3_ATK_RATE_MASK, CS35L45_BST_BPE_INST_L3_ATK_RATE_SHIFT },
+	{ 0 },   /* hardware has no such field at this level */
+};
+
+static const struct cs35l45_bpe_field cs35l45_bst_bpe_inst_hold_time_lvl[] = {
+	{ CS35L45_BST_BPE_INST_HOLD_TIME, CS35L45_BST_BPE_INST_L0_HOLD_TIME_MASK, CS35L45_BST_BPE_INST_L0_HOLD_TIME_SHIFT },
+	{ CS35L45_BST_BPE_INST_HOLD_TIME, CS35L45_BST_BPE_INST_L1_HOLD_TIME_MASK, CS35L45_BST_BPE_INST_L1_HOLD_TIME_SHIFT },
+	{ CS35L45_BST_BPE_INST_HOLD_TIME, CS35L45_BST_BPE_INST_L2_HOLD_TIME_MASK, CS35L45_BST_BPE_INST_L2_HOLD_TIME_SHIFT },
+	{ CS35L45_BST_BPE_INST_HOLD_TIME, CS35L45_BST_BPE_INST_L3_HOLD_TIME_MASK, CS35L45_BST_BPE_INST_L3_HOLD_TIME_SHIFT },
+	{ 0 },   /* hardware has no such field at this level */
+};
+
+static const struct cs35l45_bpe_field cs35l45_bst_bpe_inst_rls_rate_lvl[] = {
+	{ CS35L45_BST_BPE_INST_RLS_RATE, CS35L45_BST_BPE_INST_L0_RLS_RATE_MASK, CS35L45_BST_BPE_INST_L0_RLS_RATE_SHIFT },
+	{ CS35L45_BST_BPE_INST_RLS_RATE, CS35L45_BST_BPE_INST_L1_RLS_RATE_MASK, CS35L45_BST_BPE_INST_L1_RLS_RATE_SHIFT },
+	{ CS35L45_BST_BPE_INST_RLS_RATE, CS35L45_BST_BPE_INST_L2_RLS_RATE_MASK, CS35L45_BST_BPE_INST_L2_RLS_RATE_SHIFT },
+	{ CS35L45_BST_BPE_INST_RLS_RATE, CS35L45_BST_BPE_INST_L3_RLS_RATE_MASK, CS35L45_BST_BPE_INST_L3_RLS_RATE_SHIFT },
+	{ 0 },   /* hardware has no such field at this level */
+};
+
+static const struct cs35l45_bpe_level_prop cs35l45_bpe_inst_props[] = {
+	{ "bpe-inst-thld",	4, cs35l45_bpe_inst_thld_lvl },
+	{ "bpe-inst-attn",	4, cs35l45_bpe_inst_attn_lvl },
+	{ "bpe-inst-atk-rate",	4, cs35l45_bpe_inst_atk_rate_lvl },
+	{ "bpe-inst-hold-time",	4, cs35l45_bpe_inst_hold_time_lvl },
+	{ "bpe-inst-rls-rate",	4, cs35l45_bpe_inst_rls_rate_lvl },
+};
+
+/*
+ * 🔴 bpe-mode-sel and bpe-filt-sel are DELIBERATELY ABSENT from this table.
+ *
+ * This device's own device tree declares both of them inside
+ * cirrus,bpe-misc-config -- but the vendor driver's bpe_misc_map looks them up
+ * as "bst-bpe-mode-sel" and "bst-bpe-filt-sel", with a bst- prefix that belongs
+ * to the SEPARATE cirrus,bst-bpe-misc-config node. Those names do not exist in
+ * the node it searches, the lookups fail, and stock therefore NEVER WRITES
+ * EITHER FIELD -- they sit at their reset value for the life of the device.
+ *
+ * Reading them here would be the obvious "correct" thing to do and would be a
+ * silent DEVIATION FROM STOCK, which is the one thing this port must not be. Do
+ * not "fix" this without first reading the two fields back from a live
+ * amplifier and confirming what stock actually leaves them at.
+ */
+static const struct cs35l45_bpe_scalar_prop cs35l45_bpe_misc_props[] = {
+	{ "bpe-inst-bpe-byp",	   CS35L45_BPE_MISC_CONFIG,
+	  CS35L45_BPE_INST_BPE_BYP_MASK, CS35L45_BPE_INST_BPE_BYP_SHIFT },
+	{ "bpe-inst-inf-hold-rls", CS35L45_BPE_MISC_CONFIG,
+	  CS35L45_BPE_INST_INF_HOLD_RLS_MASK, CS35L45_BPE_INST_INF_HOLD_RLS_SHIFT },
+	{ "bpe-inst-l1-byp",	   CS35L45_BPE_MISC_CONFIG,
+	  CS35L45_BPE_INST_L1_BYP_MASK, CS35L45_BPE_INST_L1_BYP_SHIFT },
+	{ "bpe-inst-l2-byp",	   CS35L45_BPE_MISC_CONFIG,
+	  CS35L45_BPE_INST_L2_BYP_MASK, CS35L45_BPE_INST_L2_BYP_SHIFT },
+	{ "bpe-inst-l3-byp",	   CS35L45_BPE_MISC_CONFIG,
+	  CS35L45_BPE_INST_L3_BYP_MASK, CS35L45_BPE_INST_L3_BYP_SHIFT },
+};
+
+static const struct cs35l45_bpe_level_prop cs35l45_bst_bpe_inst_props[] = {
+	{ "bst-bpe-inst-thld",	    5, cs35l45_bst_bpe_inst_thld_lvl },
+	{ "bst-bpe-inst-ilim",	    5, cs35l45_bst_bpe_inst_ilim_lvl },
+	{ "bst-bpe-inst-ss-ilim",   5, cs35l45_bst_bpe_inst_ss_ilim_lvl },
+	{ "bst-bpe-inst-atk-rate",  5, cs35l45_bst_bpe_inst_atk_rate_lvl },
+	{ "bst-bpe-inst-hold-time", 5, cs35l45_bst_bpe_inst_hold_time_lvl },
+	{ "bst-bpe-inst-rls-rate",  5, cs35l45_bst_bpe_inst_rls_rate_lvl },
+};
+
+static const struct cs35l45_bpe_scalar_prop cs35l45_bst_bpe_misc_props[] = {
+	{ "bst-bpe-inst-inf-hold-rls", CS35L45_BST_BPE_MISC_CONFIG,
+	  CS35L45_BST_BPE_INST_INF_HOLD_RLS_MASK, CS35L45_BST_BPE_INST_INF_HOLD_RLS_SHIFT },
+	{ "bst-bpe-il-lim-mode",       CS35L45_BST_BPE_MISC_CONFIG,
+	  CS35L45_BST_BPE_IL_LIM_MODE_MASK, CS35L45_BST_BPE_IL_LIM_MODE_SHIFT },
+	{ "bst-bpe-out-opmode-sel",    CS35L45_BST_BPE_MISC_CONFIG,
+	  CS35L45_BST_BPE_OUT_OPMODE_SEL_MASK, CS35L45_BST_BPE_OUT_OPMODE_SEL_SHIFT },
+	{ "bst-bpe-inst-l1-byp",       CS35L45_BST_BPE_MISC_CONFIG,
+	  CS35L45_BST_BPE_INST_L1_BYP_MASK, CS35L45_BST_BPE_INST_L1_BYP_SHIFT },
+	{ "bst-bpe-inst-l2-byp",       CS35L45_BST_BPE_MISC_CONFIG,
+	  CS35L45_BST_BPE_INST_L2_BYP_MASK, CS35L45_BST_BPE_INST_L2_BYP_SHIFT },
+	{ "bst-bpe-inst-l3-byp",       CS35L45_BST_BPE_MISC_CONFIG,
+	  CS35L45_BST_BPE_INST_L3_BYP_MASK, CS35L45_BST_BPE_INST_L3_BYP_SHIFT },
+	{ "bst-bpe-filt-sel",	       CS35L45_BST_BPE_MISC_CONFIG,
+	  CS35L45_BST_BPE_FILT_SEL_MASK, CS35L45_BST_BPE_FILT_SEL_SHIFT },
+};
+
+static const struct cs35l45_bpe_scalar_prop cs35l45_bst_bpe_il_lim_props[] = {
+	{ "bst-bpe-il-lim-thld-del1", CS35L45_BST_BPE_IL_LIM_THLD,
+	  CS35L45_BST_BPE_IL_LIM_THLD_DEL1_MASK, CS35L45_BST_BPE_IL_LIM_THLD_DEL1_SHIFT },
+	{ "bst-bpe-il-lim-thld-del2", CS35L45_BST_BPE_IL_LIM_THLD,
+	  CS35L45_BST_BPE_IL_LIM_THLD_DEL2_MASK, CS35L45_BST_BPE_IL_LIM_THLD_DEL2_SHIFT },
+	{ "bst-bpe-il-lim1-thld",     CS35L45_BST_BPE_IL_LIM_THLD,
+	  CS35L45_BST_BPE_IL_LIM1_THLD_MASK, CS35L45_BST_BPE_IL_LIM1_THLD_SHIFT },
+	{ "bst-bpe-il-lim-thld-hyst", CS35L45_BST_BPE_IL_LIM_THLD,
+	  CS35L45_BST_BPE_IL_LIM_THLD_HYST_MASK, CS35L45_BST_BPE_IL_LIM_THLD_HYST_SHIFT },
+	{ "bst-bpe-il-lim1-dly",      CS35L45_BST_BPE_IL_LIM_DLY,
+	  CS35L45_BST_BPE_IL_LIM1_DLY_MASK, CS35L45_BST_BPE_IL_LIM1_DLY_SHIFT },
+	{ "bst-bpe-il-lim2-dly",      CS35L45_BST_BPE_IL_LIM_DLY,
+	  CS35L45_BST_BPE_IL_LIM2_DLY_MASK, CS35L45_BST_BPE_IL_LIM2_DLY_SHIFT },
+	{ "bst-bpe-il-lim-dly-hyst",  CS35L45_BST_BPE_IL_LIM_DLY,
+	  CS35L45_BST_BPE_IL_LIM_DLY_HYST_MASK, CS35L45_BST_BPE_IL_LIM_DLY_HYST_SHIFT },
+};
+
+#define CS35L45_BPE_MAX_LEVELS	5
+
+static void cs35l45_apply_bpe_levels(struct cs35l45_private *cs35l45,
+				     struct device_node *child,
+				     const struct cs35l45_bpe_level_prop *props,
+				     unsigned int nprops)
+{
+	u32 vals[CS35L45_BPE_MAX_LEVELS];
+	unsigned int i, j;
+
+	for (i = 0; i < nprops; i++) {
+		/*
+		 * A property that is absent, or whose array is the wrong
+		 * length, is SKIPPED ENTIRELY rather than partially applied.
+		 * of_property_read_u32_array() leaves vals[] untouched on
+		 * error, so applying anything here would write stack garbage
+		 * into a protection threshold.
+		 */
+		if (of_property_read_u32_array(child, props[i].name, vals,
+					       props[i].levels))
+			continue;
+
+		for (j = 0; j < props[i].levels; j++) {
+			if (!props[i].field[j].reg)
+				continue;
+			regmap_update_bits(cs35l45->regmap,
+					   props[i].field[j].reg,
+					   props[i].field[j].mask,
+					   vals[j] << props[i].field[j].shift);
+		}
+	}
+}
+
+static void cs35l45_apply_bpe_scalars(struct cs35l45_private *cs35l45,
+				      struct device_node *child,
+				      const struct cs35l45_bpe_scalar_prop *props,
+				      unsigned int nprops)
+{
+	unsigned int i, val;
+
+	for (i = 0; i < nprops; i++) {
+		if (of_property_read_u32(child, props[i].name, &val))
+			continue;
+		regmap_update_bits(cs35l45->regmap, props[i].reg,
+				   props[i].mask, val << props[i].shift);
+	}
+}
+
+/*
+ * Each block is applied only if its node exists, so a device tree that
+ * describes none of them behaves exactly as before this was added.
+ *
+ * The values are written once, here. They survive runtime suspend without any
+ * further work: the registers are in the regmap cache (REGCACHE_MAPLE) and
+ * cs35l45_runtime_resume() calls regcache_sync(). That is why they also had to
+ * be added to cs35l45_readable_reg() -- they are not in cs35l45_defaults, so
+ * regmap_update_bits() must read each one before it can modify it.
+ */
+static void cs35l45_apply_bpe_config(struct cs35l45_private *cs35l45,
+				     struct device_node *node)
+{
+	struct device_node *child;
+
+	child = of_get_child_by_name(node, "cirrus,bpe-inst-config");
+	if (child) {
+		cs35l45_apply_bpe_levels(cs35l45, child, cs35l45_bpe_inst_props,
+					 ARRAY_SIZE(cs35l45_bpe_inst_props));
+		of_node_put(child);
+	}
+
+	child = of_get_child_by_name(node, "cirrus,bpe-misc-config");
+	if (child) {
+		cs35l45_apply_bpe_scalars(cs35l45, child, cs35l45_bpe_misc_props,
+					  ARRAY_SIZE(cs35l45_bpe_misc_props));
+		of_node_put(child);
+	}
+
+	child = of_get_child_by_name(node, "cirrus,bst-bpe-inst-config");
+	if (child) {
+		cs35l45_apply_bpe_levels(cs35l45, child,
+					 cs35l45_bst_bpe_inst_props,
+					 ARRAY_SIZE(cs35l45_bst_bpe_inst_props));
+		of_node_put(child);
+	}
+
+	child = of_get_child_by_name(node, "cirrus,bst-bpe-misc-config");
+	if (child) {
+		cs35l45_apply_bpe_scalars(cs35l45, child,
+					  cs35l45_bst_bpe_misc_props,
+					  ARRAY_SIZE(cs35l45_bst_bpe_misc_props));
+		of_node_put(child);
+	}
+
+	child = of_get_child_by_name(node, "cirrus,bst-bpe-il-lim-config");
+	if (child) {
+		cs35l45_apply_bpe_scalars(cs35l45, child,
+					  cs35l45_bst_bpe_il_lim_props,
+					  ARRAY_SIZE(cs35l45_bst_bpe_il_lim_props));
+		of_node_put(child);
+	}
+}
+
 static int cs35l45_apply_property_config(struct cs35l45_private *cs35l45)
 {
 	struct device_node *node = cs35l45->dev->of_node;
@@ -1349,6 +1657,8 @@ static int cs35l45_apply_property_config(struct cs35l45_private *cs35l45)
 				   CS35L45_ASP_DOUT_HIZ_CTRL_MASK,
 				   val << CS35L45_ASP_DOUT_HIZ_CTRL_SHIFT);
 	}
+
+	cs35l45_apply_bpe_config(cs35l45, node);
 
 	return 0;
 }

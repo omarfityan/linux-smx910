@@ -202,6 +202,23 @@ static bool cs35l45_readable_reg(struct device *dev, unsigned int reg)
 	case CS35L45_DSP1_XMEM_UNPACK24_0 ... CS35L45_DSP1_XMEM_UNPACK24_6143:
 	case CS35L45_DSP1_YMEM_PACK_0 ... CS35L45_DSP1_YMEM_PACK_1532:
 	case CS35L45_DSP1_YMEM_UNPACK32_0 ... CS35L45_DSP1_YMEM_UNPACK32_1022:
+	/*
+	 * BPE / boost-BPE. These MUST be readable: they are absent from
+	 * cs35l45_defaults, so the regmap cache has no entry for them and
+	 * regmap_update_bits() has to read the register before it can
+	 * read-modify-write. An unreadable register there fails the write
+	 * silently as far as the caller is concerned.
+	 */
+	case CS35L45_BST_BPE_INST_THLD ... CS35L45_BST_BPE_INST_RLS_RATE:
+	case CS35L45_BST_BPE_MISC_CONFIG ... CS35L45_BST_BPE_IL_LIM_RLS_RATE:
+	case CS35L45_BST_BPE_INST_STATUS:
+	case CS35L45_BPE_INST_THLD:
+	case CS35L45_BPE_INST_ATTN:
+	case CS35L45_BPE_INST_ATK_RATE:
+	case CS35L45_BPE_INST_HOLD_TIME:
+	case CS35L45_BPE_INST_RLS_RATE:
+	case CS35L45_BPE_MISC_CONFIG:
+	case CS35L45_BPE_INST_STATUS:
 	case CS35L45_DSP1_YMEM_UNPACK24_0 ... CS35L45_DSP1_YMEM_UNPACK24_2043:
 	case CS35L45_DSP1_PMEM_0 ... CS35L45_DSP1_PMEM_3834:
 		return true;
