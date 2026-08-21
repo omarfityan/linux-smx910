@@ -1165,6 +1165,8 @@ static int cs35l45_exit_hibernate(struct cs35l45_private *cs35l45)
 	return -ETIMEDOUT;
 }
 
+static void cs35l45_pulse_classh_ovb_latch(struct cs35l45_private *cs35l45);
+
 static int cs35l45_runtime_suspend(struct device *dev)
 {
 	struct cs35l45_private *cs35l45 = dev_get_drvdata(dev);
@@ -1201,6 +1203,16 @@ static int cs35l45_runtime_resume(struct device *dev)
 	ret = regcache_sync(cs35l45->regmap);
 	if (ret != 0)
 		dev_warn(cs35l45->dev, "regcache_sync failed: %d\n", ret);
+
+	/*
+	 * regcache_sync() has just restored the Class-H configuration, but a
+	 * cache can only restore values, not edges: CH_OVB_LATCH rests at zero
+	 * and its pulse is never replayed. Re-issue it here, on the boards
+	 * that configure Class-H at all. Writing it twice is harmless; leaving
+	 * thresholds written but not latched would not be.
+	 */
+	if (cs35l45->classh_configured)
+		cs35l45_pulse_classh_ovb_latch(cs35l45);
 
 	/* Clear global error status */
 	regmap_clear_bits(cs35l45->regmap, CS35L45_ERROR_RELEASE, CS35L45_GLOBAL_ERR_RLS_MASK);
@@ -1317,7 +1329,7 @@ struct cs35l45_bpe_level_prop {
 };
 
 /* A DT property holding a single u32. */
-struct cs35l45_bpe_scalar_prop {
+struct cs35l45_scalar_prop {
 	const char *name;
 	unsigned int reg;
 	unsigned int mask;
@@ -1430,7 +1442,7 @@ static const struct cs35l45_bpe_level_prop cs35l45_bpe_inst_props[] = {
  * not "fix" this without first reading the two fields back from a live
  * amplifier and confirming what stock actually leaves them at.
  */
-static const struct cs35l45_bpe_scalar_prop cs35l45_bpe_misc_props[] = {
+static const struct cs35l45_scalar_prop cs35l45_bpe_misc_props[] = {
 	{ "bpe-inst-bpe-byp",	   CS35L45_BPE_MISC_CONFIG,
 	  CS35L45_BPE_INST_BPE_BYP_MASK, CS35L45_BPE_INST_BPE_BYP_SHIFT },
 	{ "bpe-inst-inf-hold-rls", CS35L45_BPE_MISC_CONFIG,
@@ -1452,7 +1464,7 @@ static const struct cs35l45_bpe_level_prop cs35l45_bst_bpe_inst_props[] = {
 	{ "bst-bpe-inst-rls-rate",  5, cs35l45_bst_bpe_inst_rls_rate_lvl },
 };
 
-static const struct cs35l45_bpe_scalar_prop cs35l45_bst_bpe_misc_props[] = {
+static const struct cs35l45_scalar_prop cs35l45_bst_bpe_misc_props[] = {
 	{ "bst-bpe-inst-inf-hold-rls", CS35L45_BST_BPE_MISC_CONFIG,
 	  CS35L45_BST_BPE_INST_INF_HOLD_RLS_MASK, CS35L45_BST_BPE_INST_INF_HOLD_RLS_SHIFT },
 	{ "bst-bpe-il-lim-mode",       CS35L45_BST_BPE_MISC_CONFIG,
@@ -1469,7 +1481,7 @@ static const struct cs35l45_bpe_scalar_prop cs35l45_bst_bpe_misc_props[] = {
 	  CS35L45_BST_BPE_FILT_SEL_MASK, CS35L45_BST_BPE_FILT_SEL_SHIFT },
 };
 
-static const struct cs35l45_bpe_scalar_prop cs35l45_bst_bpe_il_lim_props[] = {
+static const struct cs35l45_scalar_prop cs35l45_bst_bpe_il_lim_props[] = {
 	{ "bst-bpe-il-lim-thld-del1", CS35L45_BST_BPE_IL_LIM_THLD,
 	  CS35L45_BST_BPE_IL_LIM_THLD_DEL1_MASK, CS35L45_BST_BPE_IL_LIM_THLD_DEL1_SHIFT },
 	{ "bst-bpe-il-lim-thld-del2", CS35L45_BST_BPE_IL_LIM_THLD,
@@ -1495,6 +1507,7 @@ static void cs35l45_apply_bpe_levels(struct cs35l45_private *cs35l45,
 {
 	u32 vals[CS35L45_BPE_MAX_LEVELS];
 	unsigned int i, j;
+	int ret;
 
 	for (i = 0; i < nprops; i++) {
 		/*
@@ -1511,26 +1524,34 @@ static void cs35l45_apply_bpe_levels(struct cs35l45_private *cs35l45,
 		for (j = 0; j < props[i].levels; j++) {
 			if (!props[i].field[j].reg)
 				continue;
-			regmap_update_bits(cs35l45->regmap,
-					   props[i].field[j].reg,
-					   props[i].field[j].mask,
-					   vals[j] << props[i].field[j].shift);
+			ret = regmap_update_bits(cs35l45->regmap,
+						 props[i].field[j].reg,
+						 props[i].field[j].mask,
+						 vals[j] << props[i].field[j].shift);
+			if (ret)
+				dev_err(cs35l45->dev,
+					"%pOFn/%s[%u]: write failed (%d)\n",
+					child, props[i].name, j, ret);
 		}
 	}
 }
 
-static void cs35l45_apply_bpe_scalars(struct cs35l45_private *cs35l45,
-				      struct device_node *child,
-				      const struct cs35l45_bpe_scalar_prop *props,
-				      unsigned int nprops)
+static void cs35l45_apply_scalar_props(struct cs35l45_private *cs35l45,
+				       struct device_node *child,
+				       const struct cs35l45_scalar_prop *props,
+				       unsigned int nprops)
 {
 	unsigned int i, val;
+	int ret;
 
 	for (i = 0; i < nprops; i++) {
 		if (of_property_read_u32(child, props[i].name, &val))
 			continue;
-		regmap_update_bits(cs35l45->regmap, props[i].reg,
-				   props[i].mask, val << props[i].shift);
+		ret = regmap_update_bits(cs35l45->regmap, props[i].reg,
+					 props[i].mask, val << props[i].shift);
+		if (ret)
+			dev_err(cs35l45->dev, "%pOFn/%s: write failed (%d)\n",
+				child, props[i].name, ret);
 	}
 }
 
@@ -1558,8 +1579,8 @@ static void cs35l45_apply_bpe_config(struct cs35l45_private *cs35l45,
 
 	child = of_get_child_by_name(node, "cirrus,bpe-misc-config");
 	if (child) {
-		cs35l45_apply_bpe_scalars(cs35l45, child, cs35l45_bpe_misc_props,
-					  ARRAY_SIZE(cs35l45_bpe_misc_props));
+		cs35l45_apply_scalar_props(cs35l45, child, cs35l45_bpe_misc_props,
+					   ARRAY_SIZE(cs35l45_bpe_misc_props));
 		of_node_put(child);
 	}
 
@@ -1573,18 +1594,160 @@ static void cs35l45_apply_bpe_config(struct cs35l45_private *cs35l45,
 
 	child = of_get_child_by_name(node, "cirrus,bst-bpe-misc-config");
 	if (child) {
-		cs35l45_apply_bpe_scalars(cs35l45, child,
-					  cs35l45_bst_bpe_misc_props,
-					  ARRAY_SIZE(cs35l45_bst_bpe_misc_props));
+		cs35l45_apply_scalar_props(cs35l45, child,
+					   cs35l45_bst_bpe_misc_props,
+					   ARRAY_SIZE(cs35l45_bst_bpe_misc_props));
 		of_node_put(child);
 	}
 
 	child = of_get_child_by_name(node, "cirrus,bst-bpe-il-lim-config");
 	if (child) {
-		cs35l45_apply_bpe_scalars(cs35l45, child,
-					  cs35l45_bst_bpe_il_lim_props,
-					  ARRAY_SIZE(cs35l45_bst_bpe_il_lim_props));
+		cs35l45_apply_scalar_props(cs35l45, child,
+					   cs35l45_bst_bpe_il_lim_props,
+					   ARRAY_SIZE(cs35l45_bst_bpe_il_lim_props));
 		of_node_put(child);
+	}
+}
+
+/*
+ * HVLV -- the high-voltage/low-voltage supply mode.
+ *
+ * The amplifier can run from the boost rail or from the battery directly, and
+ * HVLV decides where the crossover sits: a threshold, a hysteresis around it
+ * and a transition delay. cs35l45_amplifier_mode_put() already writes the MODE
+ * field of this register; the three DT-supplied fields around it were not read
+ * at all, so the part crossed over at its power-on threshold rather than the
+ * one this device is tuned for.
+ *
+ * Stock declares all three and the vendor driver reads all three under exactly
+ * these names, so unlike the BPE misc block there is nothing to reproduce here
+ * but the values themselves.
+ */
+static const struct cs35l45_scalar_prop cs35l45_hvlv_props[] = {
+	{ "hvlv-thld-hys",	  CS35L45_HVLV_CONFIG,
+	  CS35L45_HVLV_THLD_HYS_MASK, CS35L45_HVLV_THLD_HYS_SHIFT },
+	{ "hvlv-thld",		  CS35L45_HVLV_CONFIG,
+	  CS35L45_HVLV_THLD_MASK, CS35L45_HVLV_THLD_SHIFT },
+	{ "hvlv-dly",		  CS35L45_HVLV_CONFIG,
+	  CS35L45_HVLV_DLY_MASK, CS35L45_HVLV_DLY_SHIFT },
+};
+
+/*
+ * ---------------------------------------------------------------------------
+ * Low-power mode (LDPM) and Class-H envelope tracking.
+ *
+ * LDPM decides which blocks keep running once the PCM input goes quiet. There
+ * are two independent groups, each with its own signal threshold and entry
+ * delay: group 1 covers the amplifier and the boost converter, group 2 covers
+ * the VMON and IMON sense paths.
+ *
+ * Class-H moves the boost target with the audio envelope instead of holding
+ * the rail at its maximum, and the OVB thresholds decide how far ahead of the
+ * signal the rail is allowed to sit.
+ *
+ * This device's stock firmware programs both, identically on all four
+ * amplifiers; mainline programmed neither. Same shape as the BPE
+ * transcription above -- the vendor's mechanism is ported, the numbers stay
+ * in the device tree.
+ *
+ * The tables below list the properties in the same order as the vendor's
+ * ldpm_map[] and classh_map[], so the two can be compared line for line.
+ * ---------------------------------------------------------------------------
+ */
+static const struct cs35l45_scalar_prop cs35l45_ldpm_props[] = {
+	{ "ldpm-gp1-boost-sel",	  CS35L45_LDPM_CONFIG,
+	  CS35L45_LDPM_GP1_BOOST_SEL_MASK, CS35L45_LDPM_GP1_BOOST_SEL_SHIFT },
+	{ "ldpm-gp1-amp-sel",	  CS35L45_LDPM_CONFIG,
+	  CS35L45_LDPM_GP1_AMP_SEL_MASK, CS35L45_LDPM_GP1_AMP_SEL_SHIFT },
+	{ "ldpm-gp1-delay",	  CS35L45_LDPM_CONFIG,
+	  CS35L45_LDPM_GP1_DELAY_MASK, CS35L45_LDPM_GP1_DELAY_SHIFT },
+	{ "ldpm-gp1-pcm-thld",	  CS35L45_LDPM_CONFIG,
+	  CS35L45_LDPM_GP1_PCM_THLD_MASK, CS35L45_LDPM_GP1_PCM_THLD_SHIFT },
+	{ "ldpm-gp2-imon-sel",	  CS35L45_LDPM_CONFIG,
+	  CS35L45_LDPM_GP2_IMON_SEL_MASK, CS35L45_LDPM_GP2_IMON_SEL_SHIFT },
+	{ "ldpm-gp2-vmon-sel",	  CS35L45_LDPM_CONFIG,
+	  CS35L45_LDPM_GP2_VMON_SEL_MASK, CS35L45_LDPM_GP2_VMON_SEL_SHIFT },
+	{ "ldpm-gp2-delay",	  CS35L45_LDPM_CONFIG,
+	  CS35L45_LDPM_GP2_DELAY_MASK, CS35L45_LDPM_GP2_DELAY_SHIFT },
+	{ "ldpm-gp2-pcm-thld",	  CS35L45_LDPM_CONFIG,
+	  CS35L45_LDPM_GP2_PCM_THLD_MASK, CS35L45_LDPM_GP2_PCM_THLD_SHIFT },
+};
+
+static const struct cs35l45_scalar_prop cs35l45_classh_props[] = {
+	/*
+	 * "ch-hdrm" is kept here so this table matches the vendor's
+	 * classh_map[] entry for entry, but this device's device tree does
+	 * not declare it -- deliberately, because stock's does not either.
+	 * See the comment on the Class-H node in the device tree.
+	 */
+	{ "ch-hdrm",		  CS35L45_CLASSH_CONFIG1,
+	  CS35L45_CH_HDRM_MASK, CS35L45_CH_HDRM_SHIFT },
+	{ "ch-ratio",		  CS35L45_CLASSH_CONFIG1,
+	  CS35L45_CH_RATIO_MASK, CS35L45_CH_RATIO_SHIFT },
+	{ "ch-rel-rate",	  CS35L45_CLASSH_CONFIG1,
+	  CS35L45_CH_REL_RATE_MASK, CS35L45_CH_REL_RATE_SHIFT },
+	{ "ch-ovb-thld1",	  CS35L45_CLASSH_CONFIG2,
+	  CS35L45_CH_OVB_THLD1_MASK, CS35L45_CH_OVB_THLD1_SHIFT },
+	{ "ch-ovb-thlddelta",	  CS35L45_CLASSH_CONFIG2,
+	  CS35L45_CH_OVB_THLDDELTA_MASK, CS35L45_CH_OVB_THLDDELTA_SHIFT },
+	{ "ch-vdd-bst-max",	  CS35L45_CLASSH_CONFIG2,
+	  CS35L45_CH_VDD_BST_MAX_MASK, CS35L45_CH_VDD_BST_MAX_SHIFT },
+	{ "ch-ovb-ratio",	  CS35L45_CLASSH_CONFIG3,
+	  CS35L45_CH_OVB_RATIO_MASK, CS35L45_CH_OVB_RATIO_SHIFT },
+	{ "ch-thld1-offset",	  CS35L45_CLASSH_CONFIG3,
+	  CS35L45_CH_THLD1_OFFSET_MASK, CS35L45_CH_THLD1_OFFSET_SHIFT },
+};
+
+/*
+ * The vendor drives CH_OVB_LATCH high and then low immediately after writing
+ * the Class-H configuration, and never at any other time. The bit is named for
+ * latching the OVB thresholds; what it does inside the block has not been
+ * measured here, so this reproduces the vendor's sequence rather than an
+ * explanation of it.
+ *
+ * It cannot be left to the regmap cache. A pulse's resting state is the value
+ * the cache keeps -- zero -- so regcache_sync() restores the configuration
+ * without ever re-issuing the pulse. cs35l45_runtime_suspend() hibernates the
+ * part, so that path is real and not theoretical; the ERROR_RELEASE pulse in
+ * cs35l45_runtime_resume() is the same shape and is handled the same way.
+ */
+static void cs35l45_pulse_classh_ovb_latch(struct cs35l45_private *cs35l45)
+{
+	regmap_update_bits(cs35l45->regmap, CS35L45_CLASSH_CONFIG3,
+			   CS35L45_CH_OVB_LATCH_MASK,
+			   CS35L45_CH_OVB_LATCH_MASK);
+	regmap_update_bits(cs35l45->regmap, CS35L45_CLASSH_CONFIG3,
+			   CS35L45_CH_OVB_LATCH_MASK, 0);
+}
+
+static void cs35l45_apply_power_mode_config(struct cs35l45_private *cs35l45,
+					   struct device_node *node)
+{
+	struct device_node *child;
+
+	child = of_get_child_by_name(node, "cirrus,hvlv-config");
+	if (child) {
+		cs35l45_apply_scalar_props(cs35l45, child, cs35l45_hvlv_props,
+					   ARRAY_SIZE(cs35l45_hvlv_props));
+		of_node_put(child);
+	}
+
+	child = of_get_child_by_name(node, "cirrus,ldpm-config");
+	if (child) {
+		cs35l45_apply_scalar_props(cs35l45, child, cs35l45_ldpm_props,
+					   ARRAY_SIZE(cs35l45_ldpm_props));
+		of_node_put(child);
+	}
+
+	child = of_get_child_by_name(node, "cirrus,classh-config");
+	if (child) {
+		cs35l45_apply_scalar_props(cs35l45, child,
+					   cs35l45_classh_props,
+					   ARRAY_SIZE(cs35l45_classh_props));
+		of_node_put(child);
+
+		cs35l45->classh_configured = true;
+		cs35l45_pulse_classh_ovb_latch(cs35l45);
 	}
 }
 
@@ -1659,6 +1822,7 @@ static int cs35l45_apply_property_config(struct cs35l45_private *cs35l45)
 	}
 
 	cs35l45_apply_bpe_config(cs35l45, node);
+	cs35l45_apply_power_mode_config(cs35l45, node);
 
 	return 0;
 }

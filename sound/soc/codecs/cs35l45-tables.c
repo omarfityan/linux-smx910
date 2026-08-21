@@ -219,6 +219,18 @@ static bool cs35l45_readable_reg(struct device *dev, unsigned int reg)
 	case CS35L45_BPE_INST_RLS_RATE:
 	case CS35L45_BPE_MISC_CONFIG:
 	case CS35L45_BPE_INST_STATUS:
+	/*
+	 * LDPM and Class-H. Same requirement as the BPE registers above.
+	 * CS35L45_LDPM_CONFIG needs it for a subtler reason: it is not in
+	 * cs35l45_defaults either, and although cs35l45_patch[] writes it,
+	 * regmap_register_patch() writes with cache_bypass set, so no cache
+	 * entry is left behind and the first read-modify-write still has to
+	 * reach the hardware.
+	 */
+	case CS35L45_LDPM_CONFIG:
+	case CS35L45_CLASSH_CONFIG1:
+	case CS35L45_CLASSH_CONFIG2:
+	case CS35L45_CLASSH_CONFIG3:
 	case CS35L45_DSP1_YMEM_UNPACK24_0 ... CS35L45_DSP1_YMEM_UNPACK24_2043:
 	case CS35L45_DSP1_PMEM_0 ... CS35L45_DSP1_PMEM_3834:
 		return true;

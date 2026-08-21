@@ -90,6 +90,42 @@
 		bst-bpe-il-lim-thld-del1 = <0x10>;			\
 	};
 
+#define CS35L45_GTS9U_POWER_MODE_CONFIG				\
+	cirrus,hvlv-config {						\
+		hvlv-dly = <0x01>;					\
+		hvlv-thld-hys = <0x00>;					\
+		hvlv-thld = <0x08>;					\
+	};								\
+									\
+	cirrus,ldpm-config {						\
+		ldpm-gp2-pcm-thld = <0x06>;				\
+		ldpm-gp2-delay = <0x06>;				\
+		ldpm-gp2-vmon-sel = <0x01>;				\
+		ldpm-gp2-imon-sel = <0x01>;				\
+		ldpm-gp1-pcm-thld = <0x06>;				\
+		ldpm-gp1-delay = <0x06>;				\
+		ldpm-gp1-amp-sel = <0x01>;				\
+		ldpm-gp1-boost-sel = <0x01>;				\
+	};								\
+									\
+	/*								\
+	 * ch-hdrm is INTENTIONALLY ABSENT. The vendor driver looks it	\
+	 * up in classh_map[], but this device's own stock device tree	\
+	 * does not declare it, so stock leaves CH_HDRM at its power-on	\
+	 * value -- and so must we. Do not "complete" this node by	\
+	 * adding it: that is a deviation from the reference device,	\
+	 * not a fix.							\
+	 */								\
+	cirrus,classh-config {						\
+		ch-thld1-offset = <0x2d>;				\
+		ch-ovb-ratio = <0x01>;					\
+		ch-vdd-bst-max = <0xfa>;				\
+		ch-ovb-thlddelta = <0x28>;				\
+		ch-ovb-thld1 = <0x82>;					\
+		ch-rel-rate = <0x04>;					\
+		ch-ratio = <0x05>;					\
+	};
+
 #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
 #include <dt-bindings/usb/pd.h>
 #include "sm8550.dtsi"
@@ -2013,6 +2049,7 @@
 		};
 
 		CS35L45_GTS9U_BPE_CONFIG
+		CS35L45_GTS9U_POWER_MODE_CONFIG
 	};
 
 	spkr_amp_fl: speaker-amp@31 {
@@ -2048,6 +2085,7 @@
 		};
 
 		CS35L45_GTS9U_BPE_CONFIG
+		CS35L45_GTS9U_POWER_MODE_CONFIG
 	};
 
 	spkr_amp_rr: speaker-amp@32 {
@@ -2083,6 +2121,7 @@
 		};
 
 		CS35L45_GTS9U_BPE_CONFIG
+		CS35L45_GTS9U_POWER_MODE_CONFIG
 	};
 
 	spkr_amp_fr: speaker-amp@33 {
@@ -2118,6 +2157,7 @@
 		};
 
 		CS35L45_GTS9U_BPE_CONFIG
+		CS35L45_GTS9U_POWER_MODE_CONFIG
 	};
 };
 
