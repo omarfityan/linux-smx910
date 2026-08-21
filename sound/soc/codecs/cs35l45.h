@@ -328,6 +328,22 @@
 #define CS35L45_BPE_INST_L2_BYP_MASK		BIT(9)
 #define CS35L45_BPE_INST_L1_BYP_SHIFT		8
 #define CS35L45_BPE_INST_L1_BYP_MASK		BIT(8)
+/*
+ * Bit 15 of BPE_MISC_CONFIG. It has no name in this header, no name in the
+ * vendor's, and no device-tree property feeds it -- so it is named here for
+ * what is known about it and nothing more.
+ *
+ * The vendor's reg_defaults carries { CS35L45_BPE_MISC_CONFIG, 0x00008000 },
+ * so its cache holds bit 15 from init and its read-modify-write for the
+ * device-tree fields writes 0x8600 to the part. Ours has no table entry, so
+ * the identical read-modify-write starts from the part and writes 0x0600.
+ * Bit 15 is the whole of the difference in what the two drivers WRITE.
+ *
+ * Neither part KEEPS it: a bypassed read returns 0x00000600 on all four
+ * amplifiers on both systems. See cs35l45_pulse_bpe_misc_commit() for why that
+ * does not settle whether the write matters.
+ */
+#define CS35L45_BPE_MISC_CONFIG_UNNAMED_BIT15	BIT(15)
 #define CS35L45_BPE_MODE_SEL_SHIFT		4
 #define CS35L45_BPE_MODE_SEL_MASK		GENMASK(5, 4)
 #define CS35L45_BPE_FILT_SEL_SHIFT		0
@@ -750,6 +766,12 @@ struct cs35l45_private {
 	 * board that actually configures Class-H, and only on such a board.
 	 */
 	bool classh_configured;
+	/*
+	 * Set when the device tree carries a "cirrus,bpe-misc-config" node, so
+	 * that the BPE_MISC_CONFIG bit-15 pulse is re-issued after
+	 * regcache_sync(), and only on a board that configures the block.
+	 */
+	bool bpe_misc_configured;
 	bool sysclk_set;
 	u8 slot_width;
 	u8 slot_count;

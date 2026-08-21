@@ -1209,6 +1209,7 @@ static int cs35l45_exit_hibernate(struct cs35l45_private *cs35l45)
 }
 
 static void cs35l45_pulse_classh_ovb_latch(struct cs35l45_private *cs35l45);
+static void cs35l45_pulse_bpe_misc_commit(struct cs35l45_private *cs35l45);
 
 static int cs35l45_runtime_suspend(struct device *dev)
 {
@@ -1256,6 +1257,14 @@ static int cs35l45_runtime_resume(struct device *dev)
 	 */
 	if (cs35l45->classh_configured)
 		cs35l45_pulse_classh_ovb_latch(cs35l45);
+
+	/*
+	 * Same shape, same reason: the BPE_MISC_CONFIG bit-15 pulse rests at
+	 * zero, so regcache_sync() has restored the block's configuration
+	 * without re-issuing it.
+	 */
+	if (cs35l45->bpe_misc_configured)
+		cs35l45_pulse_bpe_misc_commit(cs35l45);
 
 	/* Clear global error status */
 	regmap_clear_bits(cs35l45->regmap, CS35L45_ERROR_RELEASE, CS35L45_GLOBAL_ERR_RLS_MASK);
@@ -1624,6 +1633,8 @@ static void cs35l45_apply_bpe_config(struct cs35l45_private *cs35l45,
 	if (child) {
 		cs35l45_apply_scalar_props(cs35l45, child, cs35l45_bpe_misc_props,
 					   ARRAY_SIZE(cs35l45_bpe_misc_props));
+		cs35l45->bpe_misc_configured = true;
+		cs35l45_pulse_bpe_misc_commit(cs35l45);
 		of_node_put(child);
 	}
 
@@ -1761,6 +1772,59 @@ static void cs35l45_pulse_classh_ovb_latch(struct cs35l45_private *cs35l45)
 			   CS35L45_CH_OVB_LATCH_MASK);
 	regmap_update_bits(cs35l45->regmap, CS35L45_CLASSH_CONFIG3,
 			   CS35L45_CH_OVB_LATCH_MASK, 0);
+}
+
+/*
+ * Reproduce the vendor's BPE_MISC_CONFIG write sequence, which puts bit 15 on
+ * the bus along with the device-tree fields.
+ *
+ * WHY THIS IS A PULSE AND NOT A PLAIN SET. The two are indistinguishable in
+ * the register and very different in the cache.
+ *
+ * Bit 15 is undocumented at this address. Two hypotheses survive every reading
+ * that can be taken, and no register read can separate them, because a
+ * self-clearing latch the part CONSUMES and an unimplemented bit the part DROPS
+ * read back identically:
+ *
+ *   unimplemented  the part ignores it, the write is inert, and reproducing
+ *                  stock's sequence costs one I2C transaction.
+ *   a latch        the part consumes it and clears it -- exactly what BIT(15)
+ *                  does at WAKESRC_CTL and WKI2C_CTL in this same part, where
+ *                  it is documented as UPDT_WKCTL and UPDT_WKI2C. Then the
+ *                  write is what COMMITS this block's configuration, and
+ *                  omitting it leaves the fields written but never applied.
+ *
+ * The stakes are asymmetric: inert under the first, corrective under the
+ * second, and undetectable either way. So issue it.
+ *
+ * Session 329 added this as a plain regmap_set_bits() and it was reverted,
+ * correctly, for a reason that has nothing to do with the hardware: this
+ * project reads the regmap debugfs "registers" file as primary evidence, and
+ * a non-volatile register is served from the cache. A cache asserting 0x8600
+ * over silicon holding 0x0600 makes every future capture of this register wrong
+ * in a way that looks like data.
+ *
+ * The pulse satisfies both. The set writes 0x8600 to the part; the clear writes
+ * 0x0600 and leaves the cache holding 0x0600, which is what the part holds --
+ * measured under cache_bypass on all four amplifiers, on stock and here alike.
+ * Dropping the bit afterwards cannot diverge from stock, because stock's part
+ * does not hold it either.
+ *
+ * Marking the register volatile instead would ALSO keep the cache honest, and
+ * it would be a regression: a volatile register is not cached, so
+ * regcache_sync() would stop replaying the device-tree fields and the block
+ * would be left unconfigured after the first hibernate.
+ *
+ * And like the Class-H latch above, a pulse cannot be replayed from a cache --
+ * its resting state is zero -- so cs35l45_runtime_resume() re-issues it.
+ */
+static void cs35l45_pulse_bpe_misc_commit(struct cs35l45_private *cs35l45)
+{
+	regmap_update_bits(cs35l45->regmap, CS35L45_BPE_MISC_CONFIG,
+			   CS35L45_BPE_MISC_CONFIG_UNNAMED_BIT15,
+			   CS35L45_BPE_MISC_CONFIG_UNNAMED_BIT15);
+	regmap_update_bits(cs35l45->regmap, CS35L45_BPE_MISC_CONFIG,
+			   CS35L45_BPE_MISC_CONFIG_UNNAMED_BIT15, 0);
 }
 
 /*
