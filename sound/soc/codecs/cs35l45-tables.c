@@ -231,6 +231,14 @@ static bool cs35l45_readable_reg(struct device *dev, unsigned int reg)
 	case CS35L45_CLASSH_CONFIG1:
 	case CS35L45_CLASSH_CONFIG2:
 	case CS35L45_CLASSH_CONFIG3:
+	/*
+	 * The two noise-gate channel configs, for the same reason: absent from
+	 * cs35l45_defaults, so regmap_update_bits() must read each one before
+	 * it can modify it. They are NOT volatile -- nothing in the part writes
+	 * them -- so regcache_sync() replays them across a runtime resume.
+	 */
+	case CS35L45_MIXER_NGATE_CH1_CFG:
+	case CS35L45_MIXER_NGATE_CH2_CFG:
 	case CS35L45_DSP1_YMEM_UNPACK24_0 ... CS35L45_DSP1_YMEM_UNPACK24_2043:
 	case CS35L45_DSP1_PMEM_0 ... CS35L45_DSP1_PMEM_3834:
 		return true;

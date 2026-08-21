@@ -126,6 +126,28 @@
 		ch-ratio = <0x05>;					\
 	};
 
+/*
+ * Noise gate. Stock declares a threshold and a hold for both mixer channels,
+ * identically on all four amplifiers, and the vendor driver reads all four
+ * under exactly these names.
+ *
+ * 🔴 THE GATE IS NOT ENABLED BY THESE PROPERTIES, AND MUST NOT BE. The enable
+ * is bit 16 of the same register and is driven from a DAPM switch, which stock
+ * leaves OFF on all four amplifiers in idle and during playback alike. These
+ * four numbers only tune a block that neither system switches on. Adding an
+ * enable control here, or the DAPM widgets and routes that would carry one,
+ * would be a deviation from the reference device rather than a completion of
+ * this block.
+ *
+ * Unlike the blocks above, these are properties on the amplifier node itself,
+ * not a child node, which is why they carry the "cirrus," prefix.
+ */
+#define CS35L45_GTS9U_NOISE_GATE_CONFIG				\
+	cirrus,ngate-ch1-hold = <0x02>;					\
+	cirrus,ngate-ch1-thr = <0x06>;					\
+	cirrus,ngate-ch2-hold = <0x02>;					\
+	cirrus,ngate-ch2-thr = <0x06>;
+
 #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
 #include <dt-bindings/usb/pd.h>
 #include "sm8550.dtsi"
@@ -2040,6 +2062,8 @@
 		cirrus,cal-isc = <410>;
 		cirrus,cal-ambient = <29>;
 
+		CS35L45_GTS9U_NOISE_GATE_CONFIG
+
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
 		};
@@ -2075,6 +2099,8 @@
 		cirrus,cal-vsc = <1765>;
 		cirrus,cal-isc = <101>;
 		cirrus,cal-ambient = <29>;
+
+		CS35L45_GTS9U_NOISE_GATE_CONFIG
 
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
@@ -2112,6 +2138,8 @@
 		cirrus,cal-isc = <0x00FFFF97>;
 		cirrus,cal-ambient = <29>;
 
+		CS35L45_GTS9U_NOISE_GATE_CONFIG
+
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;
 		};
@@ -2147,6 +2175,8 @@
 		cirrus,cal-vsc = <2536>;
 		cirrus,cal-isc = <49>;
 		cirrus,cal-ambient = <29>;
+
+		CS35L45_GTS9U_NOISE_GATE_CONFIG
 
 		cirrus,gpio-ctrl1 {
 			gpio-ctrl = <0x2>;

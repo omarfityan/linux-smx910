@@ -1763,6 +1763,45 @@ static void cs35l45_pulse_classh_ovb_latch(struct cs35l45_private *cs35l45)
 			   CS35L45_CH_OVB_LATCH_MASK, 0);
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Noise gate.
+ *
+ * The gate mutes the mixer channel once the signal sits below a threshold for
+ * a hold time. This device's stock device tree declares a threshold and a hold
+ * for both channels, identically on all four amplifiers, and the vendor driver
+ * reads all four under exactly these names -- checked in both directions, 4 for
+ * 4, so unlike the BPE misc block there is no name mismatch to reproduce here.
+ *
+ * 🔴 THE GATE ITSELF IS LEFT OFF, AND THAT IS THE POINT. The enable is bit 16
+ * of the same register, and neither driver writes it from the device tree: the
+ * vendor drives it from a "NGATE1/2 Enable" DAPM switch whose kcontrol defaults
+ * to off, and stock's mixer state has all eight of those switches Off, in idle
+ * and during playback alike. So porting the DAPM widgets, the source enums, the
+ * enable switches and the routes would add a control surface that stock does
+ * not use, and would be the deviation -- not the omission. Do not "complete"
+ * this block by adding them.
+ *
+ * What this does change: the register goes from its power-on 0x00000303 to
+ * stock's 0x00000206, with the gate still disabled on both sides.
+ *
+ * These properties sit DIRECTLY on the amplifier node, not in a child node like
+ * the BPE, HVLV, LDPM and Class-H blocks, so the names here carry the "cirrus,"
+ * prefix and the node passed to cs35l45_apply_scalar_props() is the amplifier
+ * itself.
+ * ---------------------------------------------------------------------------
+ */
+static const struct cs35l45_scalar_prop cs35l45_ngate_props[] = {
+	{ "cirrus,ngate-ch1-hold", CS35L45_MIXER_NGATE_CH1_CFG,
+	  CS35L45_AUX_NGATE_CH_HOLD_MASK, CS35L45_AUX_NGATE_CH_HOLD_SHIFT },
+	{ "cirrus,ngate-ch1-thr",  CS35L45_MIXER_NGATE_CH1_CFG,
+	  CS35L45_AUX_NGATE_CH_THR_MASK, CS35L45_AUX_NGATE_CH_THR_SHIFT },
+	{ "cirrus,ngate-ch2-hold", CS35L45_MIXER_NGATE_CH2_CFG,
+	  CS35L45_AUX_NGATE_CH_HOLD_MASK, CS35L45_AUX_NGATE_CH_HOLD_SHIFT },
+	{ "cirrus,ngate-ch2-thr",  CS35L45_MIXER_NGATE_CH2_CFG,
+	  CS35L45_AUX_NGATE_CH_THR_MASK, CS35L45_AUX_NGATE_CH_THR_SHIFT },
+};
+
 static void cs35l45_apply_power_mode_config(struct cs35l45_private *cs35l45,
 					   struct device_node *node)
 {
@@ -1792,6 +1831,14 @@ static void cs35l45_apply_power_mode_config(struct cs35l45_private *cs35l45,
 		cs35l45->classh_configured = true;
 		cs35l45_pulse_classh_ovb_latch(cs35l45);
 	}
+
+	/*
+	 * The noise-gate properties live on the amplifier node itself, so the
+	 * node is passed straight through. A device tree that declares none of
+	 * them leaves both registers at their power-on value, exactly as before.
+	 */
+	cs35l45_apply_scalar_props(cs35l45, node, cs35l45_ngate_props,
+				   ARRAY_SIZE(cs35l45_ngate_props));
 }
 
 static int cs35l45_apply_property_config(struct cs35l45_private *cs35l45)

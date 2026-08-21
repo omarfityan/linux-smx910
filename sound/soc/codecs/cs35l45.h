@@ -109,6 +109,8 @@
 #define CS35L45_GPIO1_CTRL1			0x0000F008
 #define CS35L45_GPIO2_CTRL1			0x0000F00C
 #define CS35L45_GPIO3_CTRL1			0x0000F010
+#define CS35L45_MIXER_NGATE_CH1_CFG		0x00010004
+#define CS35L45_MIXER_NGATE_CH2_CFG		0x00010008
 #define CS35L45_DSP_MBOX_1			0x00011000
 #define CS35L45_DSP_MBOX_2			0x00011004
 #define CS35L45_DSP_VIRT1_MBOX_1		0x00011020
@@ -493,10 +495,24 @@
 #define CS35L45_ASP_WL_SHIFT			0
 #define CS35L45_ASP_WL_MASK			GENMASK(5, 0)
 
+/*
+ * Noise gate, per mixer channel. Both channels share this field layout, so one
+ * set of names covers CH1 and CH2.
+ *
+ * CS35L45_AUX_NGATE_CH_EN, bit 16, is DELIBERATELY NOT DEFINED HERE. It is not
+ * written from the device tree on stock or here -- the vendor drives it from a
+ * DAPM switch that its machine driver leaves off. See cs35l45_ngate_props.
+ */
+#define CS35L45_AUX_NGATE_CH_HOLD_SHIFT		8
+#define CS35L45_AUX_NGATE_CH_HOLD_MASK		GENMASK(11, 8)
+#define CS35L45_AUX_NGATE_CH_THR_SHIFT		0
+#define CS35L45_AUX_NGATE_CH_THR_MASK		GENMASK(2, 0)
+
 /* HVLV_CONFIG */
 #define CS35L45_FORCE_LV_OPERATION		0x01
 #define CS35L45_FORCE_HV_OPERATION		0x02
 #define CS35L45_HVLV_OPERATION			0x03
+
 #define CS35L45_HVLV_THLD_HYS_SHIFT		22
 #define CS35L45_HVLV_THLD_HYS_MASK		GENMASK(23, 22)
 #define CS35L45_HVLV_THLD_SHIFT			16
