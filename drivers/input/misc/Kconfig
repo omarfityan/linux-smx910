@@ -1003,4 +1003,19 @@ config INPUT_STPMIC1_ONKEY
 	  To compile this driver as a module, choose M here: the
 	  module will be called stpmic1_onkey.
 
+config INPUT_WACOM_WEZ01_COVER
+	tristate "Wacom WEZ01 digitiser book-cover switch"
+	depends on I2C && OF
+	help
+	  Say Y to report the book-cover open/close state carried in the
+	  notification packets of the Wacom WEZ01 EMR digitiser, as fitted to
+	  the Samsung Galaxy Tab S9 Ultra. On that tablet the cover state is
+	  not a GPIO: it arrives over i2c from the digitiser, and is reported
+	  here as SW_LID so that a cover close suspends the machine.
+
+	  This driver handles only the cover switch, not the pen.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called wacom_wez01_cover.
+
 endif
