@@ -339,11 +339,17 @@
 		 * suspends the tablet. (User-directed; supersedes ADR-0023
 		 * DEC-135, which said a cover close should not suspend.)
 		 *
-		 * wakeup-source mirrors stock, whose hall_ic_suspend() calls
-		 * enable_irq_wake() on every hall so an open can wake the
-		 * device. gpio-keys also re-reports switch state on resume,
-		 * which stock open-codes in hall_ic_resume() because the GPIO
-		 * can change while frozen with no interrupt delivered.
+		 * 🔴 NO wakeup-source, deliberately, and this is a change from
+		 * when the node emitted SW_LID. Stock's hall_ic_suspend() does
+		 * call enable_irq_wake() on every hall -- but stock CONSUMES the
+		 * event this pin produces, and we do not: nothing here acts on
+		 * SW_MACHINE_COVER. Arming a system wake source for an event
+		 * that is then discarded is not matching stock's behaviour, it
+		 * is copying a mechanism without its purpose, and it leaves a
+		 * pin that can wake the tablet with nothing able to explain why.
+		 * That lands on battery life. Waking on cover-open is the
+		 * digitiser's job and it does it: the driver calls
+		 * device_init_wakeup() and arms its own IRQ.
 		 */
 		switch-cover {
 			label = "Book Cover Hall";
@@ -352,7 +358,6 @@
 			gpios = <&tlmm 107 GPIO_ACTIVE_LOW>;
 			debounce-interval = <50>;
 			linux,can-disable;
-			wakeup-source;
 		};
 	};
 
