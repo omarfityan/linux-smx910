@@ -1046,6 +1046,13 @@ struct ath12k_base {
 	unsigned long reset_fail_timeout;
 	struct work_struct update_11d_work;
 	u8 new_alpha2[2];
+
+	/* The country as CONFIGURED (SMBIOS record or the country= module
+	 * parameter), latched once at init. new_alpha2 above is live state and is
+	 * overwritten by 802.11d beacon learning via ath12k_update_11d(), so it
+	 * cannot be used to restore the configured value later. This can.
+	 */
+	u8 cfg_alpha2[2];
 	struct {
 		/* protected by data_lock */
 		u32 fw_crash_counter;

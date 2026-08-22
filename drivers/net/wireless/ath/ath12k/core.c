@@ -66,8 +66,17 @@ EXPORT_SYMBOL(ath12k_ftm_mode);
  *
  * Set it to the country the device is actually IN. It selects permitted
  * frequencies, channel widths and transmit powers.
+ *
+ * It carries a default rather than being left NULL because ath12k is built into
+ * this kernel, so the command line is the only source: a boot image that loses
+ * the argument drops the radio to WORLD, which costs every 5 GHz channel while
+ * the device still associates happily on 2.4 GHz -- so the symptom reads as "the
+ * router moved" rather than as a misconfiguration, and nothing logs an error.
+ * The default is a fallback against that silent failure, NOT a claim about where
+ * this device is; it is deliberately overridable and a command-line value wins.
+ * Anyone operating outside the default's jurisdiction should set their own.
  */
-static char *ath12k_country;
+static char *ath12k_country = "US";
 module_param_named(country, ath12k_country, charp, 0444);
 MODULE_PARM_DESC(country, "ISO 3166-1 alpha-2 regulatory country (e.g. US), used when the platform supplies none");
 
@@ -232,6 +241,54 @@ int ath12k_core_resume_early(struct ath12k_base *ab)
 }
 EXPORT_SYMBOL(ath12k_core_resume_early);
 
+/* The firmware is powered down across a system suspend and comes back at its
+ * own default regulatory domain. The configured country is pushed to it in
+ * exactly two places, and a resume reaches NEITHER:
+ *
+ *   - ath12k_mac_hw_register(), which runs once when the radio is registered
+ *     with mac80211. A resume does not re-register it;
+ *   - ath12k_mac_op_reconfig_complete(), which mac80211 calls only after an
+ *     ieee80211_restart_hw(), and which ath12k_core_restart() only issues when
+ *     ab->is_reset -- that is, on firmware-crash recovery. A resume is not one.
+ *
+ * So nothing re-sends it and the radio silently reverts to WORLD: every 5 GHz
+ * band becomes passive-scan only and the band effectively disappears, while the
+ * interface still associates and routes perfectly well on 2.4 GHz. That is why
+ * it presents as a network problem rather than a driver one.
+ *
+ * Re-push the LATCHED configured country, not ar->alpha2 -- the latter is live
+ * state that ath12k_update_11d() overwrites with whatever 802.11d last learned.
+ */
+static void ath12k_core_reapply_country(struct ath12k_base *ab)
+{
+	struct wmi_set_current_country_arg arg = {};
+	struct ath12k *ar;
+	int i, ret;
+
+	if (!ab->hw_params->current_cc_support || !ab->cfg_alpha2[0])
+		return;
+
+	memcpy(&arg.alpha2, ab->cfg_alpha2, 2);
+
+	for (i = 0; i < ab->num_radios; i++) {
+		ar = ab->pdevs[i].ar;
+		if (!ar)
+			continue;
+
+		memcpy(&ar->alpha2, ab->cfg_alpha2, 2);
+		reinit_completion(&ar->regd_update_completed);
+
+		ret = ath12k_wmi_send_set_current_country_cmd(ar, &arg);
+		if (ret)
+			ath12k_warn(ab,
+				    "pdev %d failed to re-apply country %c%c after resume: %d\n",
+				    i, arg.alpha2[0], arg.alpha2[1], ret);
+		else
+			ath12k_info(ab, "regulatory country %c%c re-applied after resume\n",
+				    arg.alpha2[0], arg.alpha2[1]);
+	}
+}
+
 int ath12k_core_resume(struct ath12k_base *ab)
 {
 	long time_left;
@@ -247,6 +304,8 @@ int ath12k_core_resume(struct ath12k_base *ab)
 		ath12k_warn(ab, "timeout while waiting for restart complete");
 		return -ETIMEDOUT;
 	}
+
+	ath12k_core_reapply_country(ab);
 
 	return 0;
 }
@@ -862,6 +921,15 @@ int ath12k_core_check_smbios(struct ath12k_base *ab)
 			    ab->new_alpha2[0], ab->new_alpha2[1]);
 	} else if (!ab->new_alpha2[0] && ath12k_country) {
 		ath12k_warn(ab, "ignoring malformed country parameter, expected two uppercase letters\n");
+	}
+
+	/* Latch the configured country the first time it is known. This runs on
+	 * every QMI init, including after a resume, by which point new_alpha2 may
+	 * already have been overwritten by 802.11d -- hence the one-shot guard.
+	 */
+	if (!ab->cfg_alpha2[0] && ab->new_alpha2[0]) {
+		ab->cfg_alpha2[0] = ab->new_alpha2[0];
+		ab->cfg_alpha2[1] = ab->new_alpha2[1];
 	}
 
 	if (ab->qmi.target.bdf_ext[0] == '\0')
