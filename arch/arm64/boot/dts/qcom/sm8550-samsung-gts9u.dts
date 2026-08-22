@@ -311,14 +311,32 @@
 		 * linux-event-codes.h defines SW_LID as "set = lid shut". The
 		 * three agree, so closing the cover reports SW_LID=1.
 		 *
-		 * We deliberately emit SW_LID, which is NOT what stock emits
-		 * for this pin. Samsung's own code for it is SW_FLIP (0x15),
-		 * which exceeds upstream's SW_MAX, so hall_ic_parsing_dt()
-		 * remaps it onto SW_MACHINE_COVER (0x10) before registering the
-		 * input device. Nothing in our userspace consumes 0x10 --
-		 * logind's HandleLidSwitch listens for SW_LID and nothing else.
-		 * Matching stock's BEHAVIOUR here means diverging from its
-		 * literal event number. (User-directed; supersedes ADR-0023
+		 * 🔴 THIS PIN REPORTS SW_MACHINE_COVER, NOT SW_LID, AND THAT IS
+		 * DELIBERATE. It emitted SW_LID until the digitiser cover driver
+		 * landed, at which point TWO input devices advertised SW_LID:
+		 * this hall, which the fitted Book Cover Keyboard Slim does not
+		 * actuate, and the Wacom digitiser, which carries the real
+		 * signal.
+		 *
+		 * That collision is not harmless. UPower selects ONE SW_LID
+		 * device and never reconsiders, and it deterministically chose
+		 * THIS one -- verified by reading upowerd's open file
+		 * descriptors, which held only the gpio-keys event node, across
+		 * a restart. So UPower's LidIsClosed never moved, PowerDevil
+		 * (which takes lid state from UPower) never saw a close, and
+		 * closing the cover did nothing at all. A silent hall that
+		 * advertises SW_LID does not merely fail to help; it SHADOWS the
+		 * sensor that works.
+		 *
+		 * SW_MACHINE_COVER is also what stock reports for this exact
+		 * pin: Samsung's code is SW_FLIP (0x15), which exceeds
+		 * upstream's SW_MAX, so hall_ic_parsing_dt() remaps it onto
+		 * SW_MACHINE_COVER (0x10) before registering the input device.
+		 * So this matches stock for this pin AND leaves SW_LID uniquely
+		 * to the digitiser, which is the device that actually knows.
+		 *
+		 * The digitiser node under &i2c3 emits SW_LID, and that is what
+		 * suspends the tablet. (User-directed; supersedes ADR-0023
 		 * DEC-135, which said a cover close should not suspend.)
 		 *
 		 * wakeup-source mirrors stock, whose hall_ic_suspend() calls
@@ -328,9 +346,9 @@
 		 * can change while frozen with no interrupt delivered.
 		 */
 		switch-cover {
-			label = "Book Cover";
+			label = "Book Cover Hall";
 			linux,input-type = <EV_SW>;
-			linux,code = <SW_LID>;
+			linux,code = <SW_MACHINE_COVER>;
 			gpios = <&tlmm 107 GPIO_ACTIVE_LOW>;
 			debounce-interval = <50>;
 			linux,can-disable;
