@@ -1278,9 +1278,17 @@
 		 * boot-on): it enables the discrete panel-power IC that produces
 		 * the panel's VCI/VDDIO/VSP/VSN. This is the only software-
 		 * controlled supply the downstream device tree declares for the
-		 * panel. (vreg_l12b_1p8 / vreg_l13b_3p0 are kept always-on below
-		 * as a defensive guess for the panel's I/O / analog rails,
-		 * pending schematic confirmation.)
+		 * panel.
+		 *
+		 * vreg_l12b_1p8 / vreg_l13b_3p0 are kept always-on below. That
+		 * was originally a defensive guess that they feed the panel's
+		 * I/O and analog rails. For L13B the guess is now known to be
+		 * WRONG: the stock device tree names that rail (pm_humu_l13,
+		 * RPMh resource ldob13) as wacom_avdd-supply -- the AVDD of the
+		 * Wacom EMR digitiser on i2c3 -- and declares no other consumer
+		 * for it. Keeping it on is therefore still correct, but for the
+		 * digitiser, not for the panel. L12B's attribution remains
+		 * unverified.
 		 */
 		power-supply = <&panel_ldo_en>;
 
@@ -1356,6 +1364,39 @@
 };
 
 /*
+ * QUPv3 wrapper-1 SE3 i2c (i2c@a8c000, SDA/SCL = gpio40/41, function
+ * qup1_se3). This is the Wacom EMR digitiser's bus, and the digitiser is
+ * the ONLY device on it: the stock device tree leaves i2c@a8c000 disabled
+ * with no children in its base, and a single overlay fragment enables it
+ * and adds wacom@56.
+ *
+ * The mapping is by ADDRESS, not by name. Downstream labels this bus
+ * qupv3_se3_i2c under "qcom,qupv3_1_geni_se@ac0000" -- one-based wrapper
+ * numbering -- while mainline calls the same wrapper qupv3_id_0. Matching
+ * on the label would land on the wrong controller. reg = 0xa8c000, clock
+ * GCC_QUPV3_WRAP1_S3_CLK and the qup1_se3 pin function all agree, and the
+ * stock pin state (gpio40/41, drive-strength 2, bias-pull-up) matches
+ * mainline's qup_i2c3_data_clk.
+ *
+ * NOTE the name collision: the aliases block above maps the alias "i2c3"
+ * to &i2c_hub_6 (the CS35L45 amp bus), which is DIFFERENT HARDWARE from
+ * this &i2c3 node. This bus is unaliased and gets a dynamic adapter
+ * number; do not read /dev/i2c-3 expecting to find it.
+ *
+ * No child node is declared yet, deliberately. The digitiser needs the
+ * right controller, a powered IC, an address that acks, and a command
+ * sequence that makes packets flow -- four unknowns that a driver would
+ * test all at once and report as one silent failure. Enabling the bus
+ * alone makes each of them separately answerable from userspace over
+ * /dev/i2c-*, and the child node follows once the sequence is proven.
+ *
+ * spi3 shares this address and stays disabled; only one may be enabled.
+ */
+&i2c3 {
+	status = "okay";
+};
+
+/*
  * Goodix gt9916 (Berlin-D) capacitive touchscreen on i2c4 (i2c@a90000),
  * i2c address 0x5d. The bus is confirmed by the stock dtbo's
  * qts,trusted-touch-io-bases = <0xa90000>; the chip identity, GPIOs and
@@ -1413,6 +1454,40 @@
 		function = "gpio";
 		drive-strength = <8>;
 		bias-pull-up;
+	};
+
+	/*
+	 * Wacom EMR digitiser FWE (firmware-write-enable, gpio179) held LOW.
+	 *
+	 * This pin selects the digitiser's operating mode at power-on: LOW is
+	 * normal operation, HIGH puts the WEZ01 into compulsory flash mode,
+	 * where it answers on its bootloader address instead of 0x56. The
+	 * stock driver drives it low unconditionally before powering the IC,
+	 * and if it reads back high at probe it logs "fwe gpio is high,
+	 * change low and reset device" and power-cycles the part.
+	 *
+	 * Mainline has never configured this pin, so until now its level was
+	 * whatever the bootloader happened to leave. That matters more than
+	 * an ordinary uninitialised GPIO: the digitiser's own firmware is the
+	 * one thing on this device that a partition re-flash cannot recover,
+	 * so its mode must be deterministic BEFORE anything addresses the
+	 * bus, not discovered afterwards.
+	 *
+	 * A hog rather than a pinctrl state because there is no wacom device
+	 * node yet to select one; the gpio core applies a hog at tlmm probe
+	 * with no consumer. When a driver takes ownership of this line it
+	 * must claim the GPIO and this hog must be removed -- a hogged line
+	 * cannot be requested by a driver.
+	 *
+	 * Stock declares no pinctrl state for this pin at all (only
+	 * epen-int-active on gpio154 and epen-pdct-active on gpio137), so
+	 * plain GPIO function is the matching configuration.
+	 */
+	wacom_fwe_normal: wacom-fwe-hog {
+		gpio-hog;
+		gpios = <179 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "wacom-fwe-normal-mode";
 	};
 
 	/*
