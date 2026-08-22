@@ -1394,6 +1394,45 @@
  */
 &i2c3 {
 	status = "okay";
+
+	/*
+	 * Wacom WEZ01 EMR digitiser. Bound here only for the book-cover
+	 * switch: this tablet reports cover open/close in a digitiser
+	 * notification packet rather than on a GPIO, because the Book Cover
+	 * Keyboard Slim does not actuate the hall sensor on gpio107.
+	 *
+	 * LEVEL LOW, not an edge. The IC asserts this line while a packet is
+	 * waiting and releases it when the packet is read, so the line carries
+	 * a state and not an event. Under an edge trigger a notification that
+	 * arrived while the line was already low would produce no new edge,
+	 * the line would stay low forever, and the driver would go silently
+	 * deaf. The device's own downstream driver requests it
+	 * IRQF_ONESHOT | IRQF_TRIGGER_LOW for the same reason.
+	 *
+	 * No wakeup-source property, deliberately. It would make the i2c core
+	 * set I2C_CLIENT_WAKE and hand the line to the PM core's wake-irq
+	 * machinery, on top of the driver arming it in its own suspend hook --
+	 * two mechanisms on one line. The driver calls device_init_wakeup()
+	 * itself, so /sys/.../power/wakeup still exposes the knob.
+	 *
+	 * FWE (gpio179) is NOT referenced here. It is held low by the
+	 * wacom-fwe-hog below, which applies at tlmm probe and does not depend
+	 * on this node binding. The digitiser's firmware cannot be restored by
+	 * re-flashing a partition, so its mode must not become contingent on a
+	 * driver probing.
+	 */
+	digitiser@56 {
+		compatible = "wacom,wez01";
+		reg = <0x56>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <154 IRQ_TYPE_LEVEL_LOW>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&wacom_int_n>;
+
+		vdd-supply = <&vreg_l13b_3p0>;
+	};
 };
 
 /*
@@ -1488,6 +1527,21 @@
 		gpios = <179 GPIO_ACTIVE_HIGH>;
 		output-low;
 		line-name = "wacom-fwe-normal-mode";
+	};
+
+	/*
+	 * Wacom EMR digitiser interrupt. Transcribed from this device's own
+	 * stock epen-int-active state (fragment@85): pins "gpio154", function
+	 * "gpio", input-enable, bias-disable -- and nothing else, so no
+	 * drive-strength is set here either. bias-disable is deliberate and
+	 * matches stock: the digitiser drives this line itself, and an
+	 * internal pull would fight it.
+	 */
+	wacom_int_n: wacom-int-n-state {
+		pins = "gpio154";
+		function = "gpio";
+		bias-disable;
+		input-enable;
 	};
 
 	/*
