@@ -279,8 +279,27 @@
 		};
 
 		/*
-		 * Book-cover magnetic hall sensor. Every value here is this
-		 * device's OWN, read out of its downstream DTS hall_ic node:
+		 * 🔴 MEASURED ON STOCK: THIS PIN IS NOT THE BOOK-COVER SENSOR.
+		 *
+		 * TLMM 107 is a real, correctly-wired magnetic hall -- stock
+		 * registers an input device for it and reads the pin live --
+		 * but the Book Cover Keyboard Slim (EF-DX910) fitted to this
+		 * tablet does NOT actuate it. On stock, with getevent watching
+		 * all fifteen input devices through two full close/open cycles,
+		 * every SW_MACHINE_COVER transition came from `sec_e-pen`, the
+		 * WACOM DIGITISER, while stock's own `hall` device on this pin
+		 * emitted nothing and its hall_detect node read OPEN throughout.
+		 *
+		 * The cover state travels in a Wacom I2C notification packet,
+		 * not on any GPIO: wacom_i2c.c matches NOTI_PACKET +
+		 * COVER_DETECT_PACKET and reports (data[3] >> 7) & 1 as SW_FLIP.
+		 * Reproducing cover-close on mainline therefore means bringing
+		 * up wacom@56, not wiring a pin. Samsung ships this hall for
+		 * some cover; it is kept because it is real and correct, but
+		 * nothing has yet been observed to actuate it on this unit.
+		 *
+		 * Everything below is still this device's OWN value, read out
+		 * of its downstream DTS hall_ic node:
 		 * hall { gpios = <&tlmm 0x6b 0x01>; } is TLMM 107 ACTIVE_LOW,
 		 * and hall_ic,debounce-interval = <0x32> is 50 ms.
 		 *
@@ -292,8 +311,8 @@
 		 * linux-event-codes.h defines SW_LID as "set = lid shut". The
 		 * three agree, so closing the cover reports SW_LID=1.
 		 *
-		 * 🔴 WE DELIBERATELY EMIT SW_LID, WHICH IS **NOT** WHAT STOCK
-		 * EMITS. Samsung's own code for this sensor is SW_FLIP (0x15),
+		 * We deliberately emit SW_LID, which is NOT what stock emits
+		 * for this pin. Samsung's own code for it is SW_FLIP (0x15),
 		 * which exceeds upstream's SW_MAX, so hall_ic_parsing_dt()
 		 * remaps it onto SW_MACHINE_COVER (0x10) before registering the
 		 * input device. Nothing in our userspace consumes 0x10 --
