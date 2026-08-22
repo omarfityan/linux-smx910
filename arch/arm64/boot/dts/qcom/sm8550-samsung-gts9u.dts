@@ -266,7 +266,7 @@
 
 	gpio-keys {
 		compatible = "gpio-keys";
-		pinctrl-0 = <&volume_up_n>;
+		pinctrl-0 = <&volume_up_n>, <&hall_cover_n>;
 		pinctrl-names = "default";
 
 		key-volume-up {
@@ -274,6 +274,46 @@
 			linux,code = <KEY_VOLUMEUP>;
 			gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
 			debounce-interval = <15>;
+			linux,can-disable;
+			wakeup-source;
+		};
+
+		/*
+		 * Book-cover magnetic hall sensor. Every value here is this
+		 * device's OWN, read out of its downstream DTS hall_ic node:
+		 * hall { gpios = <&tlmm 0x6b 0x01>; } is TLMM 107 ACTIVE_LOW,
+		 * and hall_ic,debounce-interval = <0x32> is 50 ms.
+		 *
+		 * POLARITY, derived from the downstream driver rather than
+		 * assumed. hall_ic.c sets active_low from the DT flag, then
+		 * reports `state ^ active_low` and logs it as "close"/"open" --
+		 * so a CLOSED cover drives the pin physically LOW. gpio-keys
+		 * with GPIO_ACTIVE_LOW turns that into logical 1, and
+		 * linux-event-codes.h defines SW_LID as "set = lid shut". The
+		 * three agree, so closing the cover reports SW_LID=1.
+		 *
+		 * 🔴 WE DELIBERATELY EMIT SW_LID, WHICH IS **NOT** WHAT STOCK
+		 * EMITS. Samsung's own code for this sensor is SW_FLIP (0x15),
+		 * which exceeds upstream's SW_MAX, so hall_ic_parsing_dt()
+		 * remaps it onto SW_MACHINE_COVER (0x10) before registering the
+		 * input device. Nothing in our userspace consumes 0x10 --
+		 * logind's HandleLidSwitch listens for SW_LID and nothing else.
+		 * Matching stock's BEHAVIOUR here means diverging from its
+		 * literal event number. (User-directed; supersedes ADR-0023
+		 * DEC-135, which said a cover close should not suspend.)
+		 *
+		 * wakeup-source mirrors stock, whose hall_ic_suspend() calls
+		 * enable_irq_wake() on every hall so an open can wake the
+		 * device. gpio-keys also re-reports switch state on resume,
+		 * which stock open-codes in hall_ic_resume() because the GPIO
+		 * can change while frozen with no interrupt delivered.
+		 */
+		switch-cover {
+			label = "Book Cover";
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_LID>;
+			gpios = <&tlmm 107 GPIO_ACTIVE_LOW>;
+			debounce-interval = <50>;
 			linux,can-disable;
 			wakeup-source;
 		};
@@ -1354,6 +1394,23 @@
 		function = "gpio";
 		drive-strength = <8>;
 		bias-pull-up;
+	};
+
+	/*
+	 * Book-cover hall IC interrupt. Transcribed from this device's own
+	 * stock hall_irq pinctrl state (fragment@47): pins "gpio107",
+	 * function "gpio", drive-strength <2>, input-enable, bias-disable.
+	 * bias-disable is deliberate and matches stock -- the hall IC drives
+	 * the line itself, so an internal pull would fight it. Clear of the
+	 * firmware-reserved <36 4> block above. The second hall on gpio203
+	 * (stock hall_wacom, remapped to SW_ROTATE_LOCK) is NOT wired here.
+	 */
+	hall_cover_n: hall-cover-n-state {
+		pins = "gpio107";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		input-enable;
 	};
 
 	/*
