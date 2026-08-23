@@ -2630,21 +2630,41 @@
  * while aosd, cxsd, ddr and all four DDR LPM buckets stayed at exactly 0 against
  * a stock-rate prediction of ~1860 aosd entries.
  *
- * 🔴🔴 PRE-COMMITTED RETIREMENT CONDITION. "Add one more master" is an argument
- * that can always be made again, so it gets exactly ONE more test. If aosd is
- * still 0 with adsp + cdsp + modem all booted and sleeping, the missing-masters
- * hypothesis is REFUTED and must be RETIRED, not extended. If qcom_stats/modem
- * populates and accumulates sleep duration with Count +0, the modem is voting,
- * and that is the whole of what the hypothesis requires -- do not then demand
- * that it also attach to a network. Stock populates no fourth master this port
- * lacks: neither slpi, wpss, gpu nor display, and adsp_island is already here.
+ * 🔴🔴 THE PRE-COMMITTED RETIREMENT CONDITION FIRED. IT IS SETTLED.
+ * The condition was: "if aosd is still 0 with adsp + cdsp + modem all booted AND
+ * SLEEPING, the missing-masters hypothesis is REFUTED and RETIRED, not
+ * extended." It was tested, and it fired.
  *
- * ⭐ sm8550_mpss_resource sets auto_boot = FALSE (the CDSP's is true), so
- * enabling this node does NOT start the modem. It starts only on an explicit
- *     echo start > /sys/class/remoteproc/<the mpss one>/state
- * which is deliberate and useful: the modem becomes a RUNTIME-TOGGLABLE
- * variable, so the modem-off control arm and the modem-on test arm run on the
- * same binary with no reboot between them.
+ * The modem could not sleep until rmtfs served it -- see the rmtfs_mem note in
+ * the reserved-memory block above. Once it could, two arms were run on ONE
+ * binary, 120.32 s untethered screen-off idle each, panel blank verified at the
+ * hardware, no suspend in either, only the modem differing:
+ *
+ *   CONTROL (modem off)  adsp 100.0 % asleep, cdsp 100.0 %, modem frozen
+ *                        cx off 89.5 %, 5760 cluster power-offs, aosd 0
+ *   TEST    (modem on)   adsp 100.0 %, cdsp 100.0 %, modem 99.99 %, 0 crashes
+ *                        cx off 89.3 %, 5897 cluster power-offs, aosd 0
+ *
+ * aosd, cxsd, ddr and all four DDR LPM buckets: exactly 0 in BOTH arms, against
+ * a stock-rate prediction of ~1860 aosd entries.
+ *
+ * ⇒ Zero AOSS deep sleep on mainline is NOT caused by missing subsystem masters.
+ * Do not re-open this by adding a fourth master; stock has no fourth master this
+ * port lacks (neither slpi, wpss, gpu nor display, and adsp_island is already
+ * here). What survives is the CX gap itself: Linux's cx genpd is off ~89 % of an
+ * idle window while cxsd stays at exactly 0, measured across three windows and a
+ * device-tree change, so whatever holds VDD_CX holds it essentially always and
+ * independently of everything Linux does.
+ *
+ * ⭐ sm8550_mpss_resource sets auto_boot = FALSE, and that is still true in the
+ * driver -- but it NO LONGER means the modem stays off. 🔴 rmtfs STARTS THE
+ * MODEM: measured by stopping the modem, holding it offline 15 s, then
+ * `systemctl restart rmtfs` alone and watching it come back `running`. So with
+ * the modem userspace installed the modem starts at every boot, and a modem-OFF
+ * arm must be established by disabling rmtfs.service, not merely by
+ *     echo stop > /sys/class/remoteproc/<the mpss one>/state
+ * which rmtfs will undo. (An `echo stop` was also observed once to return rc=0
+ * without taking effect -- re-read the state, do not trust the write.)
  *
  * The blobs are Samsung's own, out of the AP tarball's modem.bin (partition
  * `modem`) -- a DIFFERENT partition in a DIFFERENT tarball from the adsp/cdsp
