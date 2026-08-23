@@ -2594,6 +2594,51 @@
 };
 
 /*
+ * MPSS (modem) remoteproc -- the LAST of stock's three qcom_sleep_stats masters
+ * (adsp, cdsp, modem) that this port did not run. Enabled for the suspend/idle
+ * power milestone, NOT for cellular: this is the Wi-Fi-only variant and nothing
+ * here uses the modem for connectivity.
+ *
+ * Booting the CDSP took the port to two of the three masters and moved the
+ * endpoint by exactly nothing: over a 120 s untethered screen-off window with no
+ * suspend, both DSPs slept ~100 % of the time with Count +0, the CPU cluster
+ * powered off 5412 times, and Linux's cx vote was down 89.4 % of the window --
+ * while aosd, cxsd, ddr and all four DDR LPM buckets stayed at exactly 0 against
+ * a stock-rate prediction of ~1860 aosd entries.
+ *
+ * 🔴🔴 PRE-COMMITTED RETIREMENT CONDITION. "Add one more master" is an argument
+ * that can always be made again, so it gets exactly ONE more test. If aosd is
+ * still 0 with adsp + cdsp + modem all booted and sleeping, the missing-masters
+ * hypothesis is REFUTED and must be RETIRED, not extended. If qcom_stats/modem
+ * populates and accumulates sleep duration with Count +0, the modem is voting,
+ * and that is the whole of what the hypothesis requires -- do not then demand
+ * that it also attach to a network. Stock populates no fourth master this port
+ * lacks: neither slpi, wpss, gpu nor display, and adsp_island is already here.
+ *
+ * ⭐ sm8550_mpss_resource sets auto_boot = FALSE (the CDSP's is true), so
+ * enabling this node does NOT start the modem. It starts only on an explicit
+ *     echo start > /sys/class/remoteproc/<the mpss one>/state
+ * which is deliberate and useful: the modem becomes a RUNTIME-TOGGLABLE
+ * variable, so the modem-off control arm and the modem-on test arm run on the
+ * same binary with no reboot between them.
+ *
+ * The blobs are Samsung's own, out of the AP tarball's modem.bin (partition
+ * `modem`) -- a DIFFERENT partition in a DIFFERENT tarball from the adsp/cdsp
+ * set, which lives in the BL tarball's NON-HLOS.bin (partition `apnhlos`).
+ * NON-HLOS.bin contains no modem.mdt at all. The signing chain is identical to
+ * the blobs already authenticating here: ECDSA384 ROOT 77 -> CA 77 -> ATTEST 77.
+ *
+ * memory-region resolves to mpss_mem (@0x8a800000 +0x10800000) and
+ * q6_mpss_dtb_mem (@0x9b000000 +0x80000); mpss_mem is already annotated in the
+ * /reserved-memory notes above as matching this device's live stock value.
+ */
+&remoteproc_mpss {
+	status = "okay";
+	firmware-name = "qcom/sm8550/samsung/gts9u/modem.mdt",
+			"qcom/sm8550/samsung/gts9u/modem_dtb.mdt";
+};
+
+/*
  * IRIS video decoder -- the SM8550 hardware codec. Without this node enabled no
  * /dev/video* exists at all and every frame is decoded on the CPU.
  *
