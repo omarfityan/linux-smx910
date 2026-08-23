@@ -163,15 +163,39 @@
  *
  *   adspslpi_mem : mainline +0x4080000 -> gts9u +0x59b4000  (SIZE-DIFF)
  *   hwfence_shbuf: mainline +0x279000  -> gts9u +0x2dd000   (SIZE-DIFF)
- *   rmtfs_mem    : DELETED  (gts9uwifi = WiFi-only; live map has no
- *                  rmtfs region — bidirectional-consistent)
+ *   rmtfs_mem    : RESTORED to the mainline node (@d4a80000 +0x280000).
+ *                  It was previously DELETED here, justified as "gts9uwifi =
+ *                  WiFi-only; live map has no rmtfs region". The observation
+ *                  is true and the inference drawn from it is false, so the
+ *                  deletion is reverted and the reasoning recorded:
+ *                    - kalama.dtsi — and kalama IS SM8550, this SoC — declares
+ *                      qcom,rmtfs_sharedmem@0 { compatible "qcom,sharedmem-uio";
+ *                      reg <0x0 0x280000>; qcom,client-id <1>; }. This device
+ *                      therefore DOES have a 2.5 MiB, client-id-1 rmtfs buffer.
+ *                    - Downstream allocates it DYNAMICALLY (address 0x0) through
+ *                      that different binding, which is exactly why it never
+ *                      appears in a reserved-memory map. Absence from
+ *                      reserved-memory was read as absence from the device.
+ *                    - Size and client-id match the mainline node EXACTLY; only
+ *                      the binding and the allocation strategy differ.
+ *                  The node is load-bearing twice over (rmtfs_mem.c): it creates
+ *                  /dev/qcom_rmtfs_mem<client-id>, AND it calls
+ *                  qcom_scm_assign_mem() to hand the buffer to the modem's TZ
+ *                  VMID. Without it the rmtfs daemon walks its whole fallback
+ *                  chain (mem1 -> uio1 -> /dev/mem) and exits, so the modem
+ *                  never gets its NV data and the MPSS watchdog kills it ~41 s
+ *                  into every boot with "dog_hal_common.c:178:DOG detects
+ *                  stalled initialization".
+ *                  The mainline address lands in a VERIFIED hole: the live
+ *                  boot-time map reserves nothing between splash-region (ends
+ *                  @baafffff) and mpss-dsm-region@d4d00000, and @d4a80000
+ *                  +0x280000 ends exactly where mpss_dsm begins.
  *   trust_ui_vm_*: mainline @f3600000.. -> gts9u @f3800000.. (re-addr)
  *   mpss_mem     : KEPT mainline (@8a800000 +0x10800000 == live; q5q's
  *                  @8b400000 is the OUTDATED Z-Fold5 override — NOT used)
  */
 /delete-node/ &adspslpi_mem;
 /delete-node/ &hwfence_shbuf;
-/delete-node/ &rmtfs_mem;
 /delete-node/ &trust_ui_vm_mem;
 /delete-node/ &trust_ui_vm_dump;
 /delete-node/ &trust_ui_vm_qrtr;
