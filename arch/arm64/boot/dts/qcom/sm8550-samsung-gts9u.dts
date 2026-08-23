@@ -2552,6 +2552,48 @@
 };
 
 /*
+ * CDSP (compute DSP) remoteproc -- enabled for the suspend/idle-power milestone,
+ * NOT for compute offload.
+ *
+ * Stock's qcom_sleep_stats populates exactly two masters mainline does not:
+ * `cdsp` and `modem`. At untethered screen-off idle stock enters AOSS deep sleep
+ * (`aosd`) ~15.5 times a second; mainline enters it ZERO times, and has never
+ * entered it once in any condition. Every Linux-side explanation has been
+ * refuted by measurement -- the lit panel, the qce untagged sleep-bucket DDR
+ * vote, the absence of rail sleep votes (to_active_sleep() makes sleep == wake,
+ * so is_req_valid() skips them by design), and the cluster idle path itself,
+ * which collapses ~2237 times a minute and correctly calls rpmh_flush() on every
+ * one. The surviving hypothesis is that AOSS waits for a sleep vote from every
+ * master it was configured with by the bootloader, and a subsystem that never
+ * boots never votes.
+ *
+ * The blobs are Samsung's own, out of NON-HLOS.bin (partition `apnhlos`), and
+ * carry the identical signing chain to the adsp.mdt already running here:
+ * ECDSA384 ROOT 77 -> CA 77 -> ATTEST 77. Qualcomm's generic cdsp blob is signed
+ * with a "General Use Test Key (for testing only)" chain and cannot authenticate
+ * against this device's fused root -- the same trap documented on &iris below.
+ *
+ * The memory-region phandles (cdsp_mem @0x9c900000 +0x2000000, q6_cdsp_dtb_mem
+ * @0x9e900000 +0x80000) resolve to mainline's sm8550.dtsi values, which were
+ * checked against this device's own stock device tree and match exactly -- no
+ * board override is needed.
+ *
+ * firmware-name index 0 = the CDSP image, index 1 = the CDSP DTB image
+ * (sm8550_cdsp_resource sets dtb_firmware_name; both blobs are required).
+ *
+ * 🔴 NOT-ESTABLISHED, WITH A PRE-REGISTERED NULL. Booting a remoteproc ADDS a
+ * master that must then also sleep, and sm8550_cdsp_resource proxy-votes the CX,
+ * MXC and NSP rails (NSP currently reads off-0). A CDSP that boots and stays
+ * awake, or that pins NSP on, would make idle power WORSE -- and neither outcome
+ * refutes the hypothesis; each would be a new, separate holder to chase.
+ */
+&remoteproc_cdsp {
+	status = "okay";
+	firmware-name = "qcom/sm8550/samsung/gts9u/cdsp.mdt",
+			"qcom/sm8550/samsung/gts9u/cdsp_dtb.mdt";
+};
+
+/*
  * IRIS video decoder -- the SM8550 hardware codec. Without this node enabled no
  * /dev/video* exists at all and every frame is decoded on the CPU.
  *
