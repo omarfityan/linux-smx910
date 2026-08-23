@@ -73,7 +73,15 @@
 
 /* Packet layout. From wacom_dev.h's PACKET_ID / NOTI_SUB_ID enums. */
 #define WACOM_PACKET_LEN		17	/* COM_COORD_NUM + 1 */
-#define WACOM_PACKET_ID_MASK		0x0f	/* high nibble is a scan counter */
+/*
+ * The low nibble of byte 0 is the packet id. The high nibble is NOT a scan
+ * counter: in a COORD packet those bits are status -- 0x80 rdy (in range),
+ * 0x40 eraser, 0x20 side button, 0x10 tip down (wacom_i2c.c:1398-1424 in the
+ * device's own downstream driver). The scan sequence is the high nibble of
+ * byte 2, and only in a NOTI packet (wacom_i2c.c:1595). Masking byte 0 with
+ * 0x0f is still correct for extracting the id; only the explanation was wrong.
+ */
+#define WACOM_PACKET_ID_MASK		0x0f
 #define WACOM_PACKET_ID_NOTI		13	/* NOTI_PACKET */
 #define WACOM_NOTI_COVER_DETECT		10	/* COVER_DETECT_PACKET */
 #define WACOM_COVER_CLOSED		BIT(7)	/* in byte 3 */
