@@ -93,6 +93,31 @@
  */
 #define WACOM_SURVEY_SETTLE_MS		300
 #define WACOM_CMD_SETTLE_MS		50
+
+/*
+ * Query descriptor. The part volunteers sixteen bytes of geometry as bytes
+ * 16..31 of a plain 32-byte read: no register address, and no command. The
+ * vendor defines an opcode for it (COM_QUERY 0x2a) but marks it "not use" and
+ * never sends it, so this asks for a longer read and nothing else.
+ *
+ * WHY THIS IS READ-ONLY AND MUST STAY THAT WAY. The vendor's driver reaches a
+ * firmware flash from a FAILED query: wacom_i2c_query() leaves the version
+ * array zeroed, and wacom_i2c.c:2425 then does
+ *     if (img_version_of_ic[2] == 0 && img_version_of_ic[3] == 0) goto fw_update;
+ * which jumps PAST the MPU/PROJ_ID wrong-image guard at :2429. None of that is
+ * ported here and none of it may be: this device's digitiser has no reset GPIO
+ * (the vendor's reset is a bare AVDD cycle) and its rail is regulator-always-on,
+ * so a mis-flash is not recoverable by re-flashing a partition. A failed query
+ * here logs and returns; it never writes anything, ever.
+ *
+ * Only max_x and max_y come from the descriptor. Pressure, tilt and height are
+ * literal constants in the device's own device tree (wacom,max_pressure 0xfff,
+ * wacom,max_tilt <0x3f 0x3f>, wacom,max_height 0xff), so there is no reason to
+ * decode them from a read that can fail.
+ */
+#define WACOM_QUERY_LEN			32
+#define WACOM_QUERY_POS			16	/* COM_QUERY_POS */
+#define WACOM_QUERY_HEADER		0x0f
 #define WACOM_START_SETTLE_MS		100
 
 #define WACOM_READ_RETRIES		3
@@ -156,6 +181,44 @@ static int wacom_cover_configure(struct wacom_cover *wc)
 		return ret;
 
 	return wacom_cover_send(wc, WACOM_CMD_SURVEY_COVER_ONLY, WACOM_SURVEY_SETTLE_MS);
+}
+
+/*
+ * Read the geometry descriptor and report it. Advisory only: the cover switch
+ * works without it, so a failure is logged and probe continues. Called before
+ * any command byte goes out, which is the closest this driver gets to the
+ * post-reset state the vendor queries in.
+ */
+static void wacom_query_geometry(struct wacom_cover *wc)
+{
+	u8 buf[WACOM_QUERY_LEN];
+	const u8 *q = buf + WACOM_QUERY_POS;
+	int ret, i;
+
+	for (i = 0; i < WACOM_READ_RETRIES; i++) {
+		ret = i2c_master_recv(wc->client, buf, sizeof(buf));
+		if (ret == sizeof(buf) && q[0] == WACOM_QUERY_HEADER)
+			break;
+		if (i + 1 < WACOM_READ_RETRIES)
+			msleep(WACOM_READ_RETRY_MS);
+	}
+
+	if (i == WACOM_READ_RETRIES) {
+		/*
+		 * Deliberately not an error. Nothing downstream depends on the
+		 * geometry yet, and this must never become a reason to do
+		 * anything other than carry on.
+		 */
+		dev_info(&wc->client->dev,
+			 "geometry query did not answer (ret %d); cover switch is unaffected\n",
+			 ret);
+		return;
+	}
+
+	dev_info(&wc->client->dev,
+		 "geometry: max_x=%u max_y=%u fw=%02x%02x mpu=%02x proj=%02x\n",
+		 ((u16)q[1] << 8) | q[2], ((u16)q[3] << 8) | q[4],
+		 q[7], q[8], q[9], q[15]);
 }
 
 static int wacom_cover_read(struct wacom_cover *wc, u8 *buf)
@@ -288,6 +351,9 @@ static int wacom_cover_probe(struct i2c_client *client)
 	ret = devm_regulator_get_enable(dev, "vdd");
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot enable vdd\n");
+
+	/* Before any command byte is sent, and before the interrupt is live. */
+	wacom_query_geometry(wc);
 
 	wc->input = devm_input_allocate_device(dev);
 	if (!wc->input)
