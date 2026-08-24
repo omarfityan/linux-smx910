@@ -229,10 +229,25 @@ static int wacom_cover_send(struct wacom_cover *wc, u8 cmd, unsigned int settle_
 }
 
 /*
- * Put the IC into cover-detection-only. This is the exact sequence that was
- * validated from userspace on this part: leave whatever survey mode it was in,
- * start sampling, then drop to survey/cover-only. Shorter sequences may well
- * work; none has been demonstrated, so none is shipped.
+ * Bring the IC up in the survey mode this driver is in. The sequence is the one
+ * that was validated from userspace on this part: leave whatever survey mode it
+ * was in, start sampling, then select a mode. Shorter sequences may well work;
+ * none has been demonstrated, so none is shipped.
+ *
+ * That last command is the mode in force rather than a literal, because resume
+ * calls this as a fallback when a status request fails. A literal there would
+ * leave the hardware in cover-only while the scan-mode attribute still read
+ * full, and in cover-only the part reports nothing for the pen: the attribute
+ * would disagree with the hardware and the pen would go quiet with nothing
+ * logged and no error returned anywhere. The mode is re-selected unconditionally
+ * rather than skipped when it is already correct, because whether the sample-rate
+ * command above perturbs the survey mode has not been established.
+ *
+ * The flag is read without the mode lock. These are system-sleep pm ops --
+ * DEFINE_SIMPLE_DEV_PM_OPS leaves every runtime slot NULL -- and a resume
+ * callback completes in dpm_resume_end() before suspend_finish() thaws
+ * processes, so no writer of the attribute can be running. Probe is the only
+ * other caller and runs before the attribute exists.
  */
 static int wacom_cover_configure(struct wacom_cover *wc)
 {
@@ -246,7 +261,9 @@ static int wacom_cover_configure(struct wacom_cover *wc)
 	if (ret)
 		return ret;
 
-	return wacom_cover_send(wc, WACOM_CMD_SURVEY_COVER_ONLY, WACOM_SURVEY_SETTLE_MS);
+	return wacom_cover_send(wc, wc->full_scan ? WACOM_CMD_SURVEY_EXIT
+						  : WACOM_CMD_SURVEY_COVER_ONLY,
+				WACOM_SURVEY_SETTLE_MS);
 }
 
 /*
