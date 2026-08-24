@@ -897,6 +897,21 @@
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
+		/*
+		 * Shared 1.8 V camera I/O rail. This device's own stock
+		 * overlay names pm_humu_l4 as cam_vio for every camera entity
+		 * it declares -- both rear sensors, both front sensor nodes,
+		 * the front ultra-wide, all four eeproms and the rear focus
+		 * actuator -- each requesting min = max = 1800000 uV. Live
+		 * stock shows pm_humu_l4 at 1800mV with 10 consumers.
+		 */
+		vreg_l4b_1p8: ldo4 {
+			regulator-name = "vreg_l4b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
 		vreg_l5b_3p1: ldo5 {
 			regulator-name = "vreg_l5b_3p1";
 			regulator-min-microvolt = <3104000>;
@@ -951,10 +966,31 @@
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
-		vreg_l11b_1p2: ldo11 {
-			regulator-name = "vreg_l11b_1p2";
-			regulator-min-microvolt = <1200000>;
-			regulator-max-microvolt = <1504000>;
+		/*
+		 * Camera digital rail. The 1200000/1504000 range this node
+		 * carried until now was inherited verbatim from the upstream
+		 * SM8550 reference boards (mtp/qrd/hdk all declare the same
+		 * pair) and was never a value from this device -- nothing in
+		 * this tree consumed it.
+		 *
+		 * This device's own stock overlay asks for exactly 1.100 V:
+		 * qcom,cam-sensor1, qcom,cam-sensor12 and qcom,cam-sensor8
+		 * each carry rgltr-min-voltage = rgltr-max-voltage =
+		 * <0x10c8e0 ...> for cam_vdig, and __symbols__ names
+		 * pm_humu_l11 as the supply of all three. Live stock agrees:
+		 * regulator_summary shows pm_humu_l11 at 1100mV with those
+		 * three camera consumers and no others.
+		 *
+		 * PM8550 ldo11 is a pmic5_nldo515 (base 320000 uV, step
+		 * 8000 uV), so 1100000 is not representable -- 1096000 and
+		 * 1104000 bracket it. Round UP: the regulator core rounds up
+		 * to satisfy min_uV anyway, and over-volting a digital rail by
+		 * 4 mV is the safe direction.
+		 */
+		vreg_l11b_1p1: ldo11 {
+			regulator-name = "vreg_l11b_1p1";
+			regulator-min-microvolt = <1104000>;
+			regulator-max-microvolt = <1104000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
@@ -2852,5 +2888,129 @@
 			drive-strength = <2>;
 			input-enable;
 		};
+	};
+};
+
+/*
+ * Front main camera -- SK Hynix HI-1337.
+ *
+ * Every value below is transcribed from this device's own stock overlay
+ * (qcom,cam-sensor1 under qcom,cci1@ac16000), not from a sister device:
+ *
+ *   csiphy-sd-index = <0x04>            -> CSIPHY4, camss port@4
+ *   cci-master      = <0x01>            -> CCI1 master 1
+ *   clock-rates     = <0x124f800>       -> MCLK4 at 19.2 MHz
+ *   gpios[0] = 0x68 "CAMIF_MCLK4"       -> gpio104
+ *   gpios[1] = 0x75 "CAM_RESET1"       -> gpio117
+ *   gpios[2] = 0x11 "FCAM_LDO_EN"       -> gpio17
+ *   rgltr-*-voltage = <0x10c8e0 0x1b7740 0x00>
+ *                                       -> cam_vdig 1.100 V, cam_vio 1.800 V
+ *   sensor-position-roll = <0x10e>      -> rotation 270
+ *   sensor-position-yaw  = <0x00>       -> front-facing, orientation 0
+ *
+ * The sensor's I2C address is the one value stock's device tree does NOT
+ * carry -- CamX takes it from com.samsung.sensormodule.1_hynix_hi1337_front,
+ * which gives slaveAddress 0x40, i.e. the 7-bit address 0x20. The halving
+ * convention is corroborated by the front ultra-wide, whose stock node
+ * DOES carry an address: qcom,cam-sensor8 has reg = <0x42> for a part the
+ * same blobs describe as slaveAddress 0x42 / 7-bit 0x21. The address is
+ * arbitrated empirically at probe regardless: hi1337_identify() reads the
+ * model and vendor ID over the bus and returns -ENXIO on a mismatch.
+ *
+ * The front ultra-wide (a second HI-1337, CSIPHY5, gpio55 enable / gpio105
+ * reset, on i2c9 rather than CCI -- stock declares it compatible
+ * "qcom,cam-i2c-sensor" outside any CCI node) is deliberately NOT wired up
+ * here. It shares MCLK4 with the front main, and stock's own comment order
+ * implies a probe-order dependency for the shared pinmux that is not worth
+ * carrying before the single-sensor path is proven.
+ */
+&camss {
+	status = "okay";
+
+	vdda-phy-supply = <&vreg_l1e_0p88>;
+	vdda-pll-supply = <&vreg_l3e_1p2>;
+
+	ports {
+		port@4 {
+			csiphy4_hi1337_front_ep: endpoint {
+				clock-lanes = <4>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&hi1337_front_ep>;
+			};
+		};
+	};
+};
+
+&cci1 {
+	status = "okay";
+
+	/*
+	 * Upstream sm8550.dtsi gives cci1 only i2c-bus@0 and only the
+	 * cci1_0 pinmux. Samsung puts the front camera on master 1, which
+	 * is the AON CCI pair on gpio208/209.
+	 */
+	pinctrl-0 = <&cci1_0_default &cci1_1_default>;
+	pinctrl-1 = <&cci1_0_sleep &cci1_1_sleep>;
+
+	cci1_i2c1: i2c-bus@1 {
+		reg = <1>;
+		clock-frequency = <1000000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&cci1_i2c1 {
+	hi1337_front: camera@20 {
+		compatible = "hynix,hi1337-gts9u-front";
+		reg = <0x20>;
+
+		clocks = <&camcc CAM_CC_MCLK4_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK4_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		vddio-supply = <&vreg_l4b_1p8>;
+		vdig-supply = <&vreg_l11b_1p1>;
+
+		enable-gpios = <&tlmm 17 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&tlmm 117 GPIO_ACTIVE_LOW>;
+
+		pinctrl-0 = <&cam4_default>;
+		pinctrl-1 = <&cam4_sleep>;
+		pinctrl-names = "default", "sleep";
+
+		orientation = <0>;
+		rotation = <270>;
+
+		port {
+			hi1337_front_ep: endpoint {
+				clock-lanes = <4>;
+				data-lanes = <0 1 2 3>;
+				/*
+				 * 288160000 pixels/s * 10 bits/pixel over 4
+				 * lanes, DDR: 288160000 * 10 / (2 * 4).
+				 */
+				link-frequencies = /bits/ 64 <360200000>;
+				remote-endpoint = <&csiphy4_hi1337_front_ep>;
+			};
+		};
+	};
+};
+
+&tlmm {
+	/* CCI1 master 1 -- Samsung's AON CCI pair, gpio208/209. */
+	cci1_1_default: cci1-1-default-state {
+		pins = "gpio208", "gpio209";
+		function = "aon_cci";
+		drive-strength = <4>;
+		bias-pull-up;
+	};
+
+	cci1_1_sleep: cci1-1-sleep-state {
+		pins = "gpio208", "gpio209";
+		function = "aon_cci";
+		drive-strength = <4>;
+		bias-disable;
+		input-enable;
 	};
 };

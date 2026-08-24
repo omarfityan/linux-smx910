@@ -128,6 +128,18 @@ config VIDEO_HI846
 	  To compile this driver as a module, choose M here: the
 	  module will be called hi846.
 
+config VIDEO_HI1337_GTS9U
+	tristate "SK Hynix HI-1337 sensor support (Galaxy Tab S9 Ultra)"
+	help
+	  This is a Video4Linux2 sensor driver for the SK Hynix HI-1337
+	  camera as fitted to the Samsung Galaxy Tab S9 Ultra (SM-X910).
+	  The register tables are transcribed from the tablet's own stock
+	  camera firmware, so this driver is specific to that module set
+	  rather than a generic HI-1337 driver.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called hi1337_gts9u.
+
 config VIDEO_HI847
         tristate "Hynix Hi-847 sensor support"
         help
