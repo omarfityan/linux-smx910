@@ -61,6 +61,7 @@
 #include <linux/interrupt.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pm.h>
 #include <linux/pm_wakeup.h>
 #include <linux/regulator/consumer.h>
@@ -134,9 +135,74 @@
  */
 #define WACOM_WAKE_HOLD_MS		2000
 
+/*
+ * Coordinate packet. Layout transcribed from wacom_i2c.c:1398-1424 in the
+ * device's own downstream driver and checked against it field by field.
+ *
+ * The vendor's local names for two of the status bits describe neither what
+ * they read nor what they drive, and must not be copied: what it calls "prox"
+ * is bit 4 and it drives pen_pressed -> BTN_TOUCH, i.e. the TIP; what it calls
+ * "stylus" is bit 5 and it drives side_pressed -> BTN_STYLUS, i.e. the SIDE
+ * BUTTON. The names below say what the bits do.
+ */
+#define WACOM_PACKET_ID_COORD		1	/* COORD_PACKET */
+#define WACOM_COORD_IN_RANGE		BIT(7)	/* the vendor's "rdy" */
+#define WACOM_COORD_ERASER		BIT(6)
+#define WACOM_COORD_SIDE_BUTTON		BIT(5)
+#define WACOM_COORD_TIP_DOWN		BIT(4)
+#define WACOM_COORD_PRESSURE_MASK	0x0f	/* high nibble, in byte 5 */
+
+/*
+ * Maxima that are literals in this device's own dtbo (overlay0.dts:10864):
+ * wacom,max_pressure = <0xfff>, wacom,max_tilt = <0x3f 0x3f>,
+ * wacom,max_height = <0xff>. Only max_x/max_y are absent from the device tree,
+ * which is the whole reason the geometry query exists.
+ */
+#define WACOM_MAX_PRESSURE		0xfff
+#define WACOM_MAX_TILT			0x3f
+#define WACOM_MAX_HEIGHT		0xff
+
+/*
+ * Sensor resolution, in units per millimetre. NOT a guess and not derived from
+ * the panel at runtime: the queried maxima divided by the display's active area
+ * (2960x1848 over 14.6in => 314.6 x 196.4 mm) give 99.7 on BOTH axes, and
+ * 99.7 x 25.4 = 2532, i.e. 2540 LPI -- the standard Wacom EMR resolution. Two
+ * axes agreeing on a standard value is what makes this a transcription rather
+ * than a fit.
+ *
+ * input_abs_set_res() is mandatory, not decorative: libinput rejects a tablet
+ * whose axes carry no resolution, and there is no vendor value to copy.
+ */
+#define WACOM_RESOLUTION		100	/* units/mm */
+
 struct wacom_cover {
 	struct i2c_client *client;
 	struct input_dev *input;
+	/*
+	 * A SECOND input device for the pen. The vendor reports the cover as
+	 * SW_FLIP on the same node as the pen; we deliberately do not. logind
+	 * watches SW_LID, and libinput mishandles a tablet that also carries a
+	 * switch, so the cover keeps its own device and this one is added
+	 * beside it. NULL when the geometry query did not answer.
+	 */
+	struct input_dev *pen;
+	u16 max_x, max_y;
+	bool pen_in_range;
+	/*
+	 * The scan-mode knob. false is SURVEY_COVER_ONLY, which is exactly what
+	 * shipped before this existed, so an untouched knob leaves the driver
+	 * behaviourally identical to the deployed one.
+	 *
+	 * It exists because the part reports only what its survey mode surveys
+	 * for: in cover-only it emits NOTHING for the pen -- measured, not
+	 * assumed, with a pen in range and the cover cycle as the positive
+	 * control on the same interrupt line. Reaching the pen therefore means
+	 * leaving cover-only, and that is precisely the change that risks the
+	 * shipped cover suspend/wake path. A runtime knob lets both arms of
+	 * that experiment share ONE binary instead of two flashes.
+	 */
+	bool full_scan;
+	struct mutex mode_lock;
 	/*
 	 * Held un-completed only while the system is suspended. A wake
 	 * interrupt can reach the threaded handler before the QUP i2c
@@ -215,10 +281,127 @@ static void wacom_query_geometry(struct wacom_cover *wc)
 		return;
 	}
 
+	wc->max_x = ((u16)q[1] << 8) | q[2];
+	wc->max_y = ((u16)q[3] << 8) | q[4];
+
 	dev_info(&wc->client->dev,
 		 "geometry: max_x=%u max_y=%u fw=%02x%02x mpu=%02x proj=%02x\n",
-		 ((u16)q[1] << 8) | q[2], ((u16)q[3] << 8) | q[4],
-		 q[7], q[8], q[9], q[15]);
+		 wc->max_x, wc->max_y, q[7], q[8], q[9], q[15]);
+}
+
+/*
+ * Register the pen. Skipped entirely, and without failing probe, when the
+ * geometry query did not answer: the vendor's own coordinate validation drops
+ * every packet once the maxima are zero, and libinput would reject the device
+ * anyway. The cover switch -- the function that actually ships -- is unaffected
+ * either way, and must never be taken down by the pen.
+ */
+static int wacom_pen_register(struct wacom_cover *wc)
+{
+	struct input_dev *pen;
+	int ret;
+
+	if (!wc->max_x || !wc->max_y) {
+		dev_info(&wc->client->dev,
+			 "no geometry, pen input not registered (cover unaffected)\n");
+		return 0;
+	}
+
+	pen = devm_input_allocate_device(&wc->client->dev);
+	if (!pen)
+		return -ENOMEM;
+
+	pen->name = "Wacom WEZ01 Pen";
+	pen->id.bustype = BUS_I2C;
+
+	input_set_capability(pen, EV_KEY, BTN_TOOL_PEN);
+	input_set_capability(pen, EV_KEY, BTN_TOOL_RUBBER);
+	input_set_capability(pen, EV_KEY, BTN_TOUCH);
+	input_set_capability(pen, EV_KEY, BTN_STYLUS);
+
+	/*
+	 * Reported in the SENSOR's native orientation, which is what this
+	 * device's own dtbo asks for: wacom,invert = <0 0 0>, whose third cell
+	 * the vendor parses as xy_switch -- so the vendor does not swap either.
+	 * The sensor's x spans the panel's short side and its y the long one,
+	 * so on a landscape display the pen is rotated 90 degrees; that is a
+	 * libinput calibration matrix in userspace, not a kernel transform.
+	 */
+	input_set_abs_params(pen, ABS_X, 0, wc->max_x, 0, 0);
+	input_set_abs_params(pen, ABS_Y, 0, wc->max_y, 0, 0);
+	input_set_abs_params(pen, ABS_PRESSURE, 0, WACOM_MAX_PRESSURE, 0, 0);
+	input_set_abs_params(pen, ABS_DISTANCE, 0, WACOM_MAX_HEIGHT, 0, 0);
+	input_set_abs_params(pen, ABS_TILT_X, -WACOM_MAX_TILT, WACOM_MAX_TILT, 0, 0);
+	input_set_abs_params(pen, ABS_TILT_Y, -WACOM_MAX_TILT, WACOM_MAX_TILT, 0, 0);
+
+	input_abs_set_res(pen, ABS_X, WACOM_RESOLUTION);
+	input_abs_set_res(pen, ABS_Y, WACOM_RESOLUTION);
+
+	ret = input_register_device(pen);
+	if (ret)
+		return ret;
+
+	wc->pen = pen;
+	dev_info(&wc->client->dev,
+		 "pen input registered: %ux%u at %u units/mm\n",
+		 wc->max_x, wc->max_y, WACOM_RESOLUTION);
+	return 0;
+}
+
+/*
+ * Decode and report one coordinate packet. Never called for a cover
+ * notification, and never touches the cover input device.
+ */
+static void wacom_pen_report(struct wacom_cover *wc, const u8 *buf)
+{
+	u16 x, y, pressure;
+
+	if (!wc->pen)
+		return;
+
+	if (!(buf[0] & WACOM_COORD_IN_RANGE)) {
+		/* Out of range: retract everything exactly once. */
+		if (wc->pen_in_range) {
+			input_report_abs(wc->pen, ABS_PRESSURE, 0);
+			input_report_abs(wc->pen, ABS_DISTANCE, 0);
+			input_report_key(wc->pen, BTN_TOUCH, 0);
+			input_report_key(wc->pen, BTN_STYLUS, 0);
+			input_report_key(wc->pen, BTN_TOOL_PEN, 0);
+			input_report_key(wc->pen, BTN_TOOL_RUBBER, 0);
+			input_sync(wc->pen);
+			wc->pen_in_range = false;
+		}
+		return;
+	}
+
+	x = ((u16)buf[1] << 8) | buf[2];
+	y = ((u16)buf[3] << 8) | buf[4];
+
+	/*
+	 * The vendor validates against the maxima and DROPS the packet rather
+	 * than clamping (wacom_i2c.c:1414). Same here, and for the same reason:
+	 * a coordinate outside the sensor is a corrupt read, and clamping would
+	 * launder it into a plausible stroke at the edge of the screen.
+	 */
+	if (x > wc->max_x || y > wc->max_y) {
+		dev_dbg(&wc->client->dev, "coord out of range x=%u y=%u\n", x, y);
+		return;
+	}
+
+	pressure = ((u16)(buf[5] & WACOM_COORD_PRESSURE_MASK) << 8) | buf[6];
+
+	input_report_key(wc->pen, (buf[0] & WACOM_COORD_ERASER) ?
+			 BTN_TOOL_RUBBER : BTN_TOOL_PEN, 1);
+	input_report_abs(wc->pen, ABS_X, x);
+	input_report_abs(wc->pen, ABS_Y, y);
+	input_report_abs(wc->pen, ABS_PRESSURE, pressure);
+	input_report_abs(wc->pen, ABS_DISTANCE, buf[7]);
+	input_report_abs(wc->pen, ABS_TILT_X, (s8)buf[8]);
+	input_report_abs(wc->pen, ABS_TILT_Y, (s8)buf[9]);
+	input_report_key(wc->pen, BTN_TOUCH,  !!(buf[0] & WACOM_COORD_TIP_DOWN));
+	input_report_key(wc->pen, BTN_STYLUS, !!(buf[0] & WACOM_COORD_SIDE_BUTTON));
+	input_sync(wc->pen);
+	wc->pen_in_range = true;
 }
 
 static int wacom_cover_read(struct wacom_cover *wc, u8 *buf)
@@ -323,11 +506,72 @@ static irqreturn_t wacom_cover_irq(int irq, void *data)
 		return IRQ_HANDLED;
 	}
 
+	/*
+	 * The cover branch is evaluated first and is untouched. The pen branch
+	 * is strictly additive: it runs only for packets the cover decode has
+	 * already declined, and it reports on a different input device, so it
+	 * cannot alter the behaviour of the path that ships.
+	 */
 	if (wacom_cover_decode(wc, buf, &closed))
 		wacom_cover_report(wc, closed);
+	else if ((buf[0] & WACOM_PACKET_ID_MASK) == WACOM_PACKET_ID_COORD)
+		wacom_pen_report(wc, buf);
 
 	return IRQ_HANDLED;
 }
+
+/*
+ * Switch scan mode. SURVEY_EXIT (0x2d) is the vendor's EPEN_SURVEY_MODE_NONE,
+ * which its own log calls "normal mode" and which it selects whenever the
+ * screen is on with the pen out; SURVEY_COVER_ONLY (0x3b) is what we ship.
+ */
+static int wacom_set_scan_mode(struct wacom_cover *wc, bool full)
+{
+	int ret;
+
+	mutex_lock(&wc->mode_lock);
+	ret = wacom_cover_send(wc, full ? WACOM_CMD_SURVEY_EXIT
+					: WACOM_CMD_SURVEY_COVER_ONLY,
+			       WACOM_SURVEY_SETTLE_MS);
+	if (!ret)
+		wc->full_scan = full;
+	mutex_unlock(&wc->mode_lock);
+
+	dev_info(&wc->client->dev, "scan mode -> %s (%d)\n",
+		 full ? "full" : "cover-only", ret);
+	return ret;
+}
+
+static ssize_t full_scan_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct wacom_cover *wc = i2c_get_clientdata(to_i2c_client(dev));
+
+	return sysfs_emit(buf, "%d\n", wc->full_scan ? 1 : 0);
+}
+
+static ssize_t full_scan_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct wacom_cover *wc = i2c_get_clientdata(to_i2c_client(dev));
+	bool full;
+	int ret;
+
+	ret = kstrtobool(buf, &full);
+	if (ret)
+		return ret;
+
+	ret = wacom_set_scan_mode(wc, full);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(full_scan);
+
+static struct attribute *wacom_cover_attrs[] = {
+	&dev_attr_full_scan.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(wacom_cover);
 
 static int wacom_cover_probe(struct i2c_client *client)
 {
@@ -347,6 +591,7 @@ static int wacom_cover_probe(struct i2c_client *client)
 
 	init_completion(&wc->resumed);
 	complete_all(&wc->resumed);
+	mutex_init(&wc->mode_lock);
 
 	ret = devm_regulator_get_enable(dev, "vdd");
 	if (ret)
@@ -366,6 +611,15 @@ static int wacom_cover_probe(struct i2c_client *client)
 	ret = input_register_device(wc->input);
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot register input device\n");
+
+	/*
+	 * Registered after the cover device and before the interrupt is live.
+	 * A failure here is NOT fatal: the cover switch is the shipped
+	 * function and must survive anything the pen does.
+	 */
+	ret = wacom_pen_register(wc);
+	if (ret)
+		dev_warn(dev, "pen input unavailable: %d\n", ret);
 
 	ret = wacom_cover_configure(wc);
 	if (ret)
@@ -466,6 +720,7 @@ MODULE_DEVICE_TABLE(i2c, wacom_cover_id);
 static struct i2c_driver wacom_cover_driver = {
 	.driver = {
 		.name = "wacom-wez01-cover",
+		.dev_groups = wacom_cover_groups,
 		.of_match_table = wacom_cover_of_match,
 		.pm = pm_sleep_ptr(&wacom_cover_pm_ops),
 	},
