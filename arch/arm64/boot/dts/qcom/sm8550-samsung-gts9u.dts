@@ -290,7 +290,7 @@
 
 	gpio-keys {
 		compatible = "gpio-keys";
-		pinctrl-0 = <&volume_up_n>, <&hall_cover_n>;
+		pinctrl-0 = <&volume_up_n>, <&hall_cover_n>, <&pen_garage>;
 		pinctrl-names = "default";
 
 		key-volume-up {
@@ -381,6 +381,63 @@
 			linux,code = <SW_MACHINE_COVER>;
 			gpios = <&tlmm 107 GPIO_ACTIVE_LOW>;
 			debounce-interval = <50>;
+			linux,can-disable;
+		};
+
+		/*
+		 * The S Pen garage -- the magnetised slot in the tablet's edge
+		 * that holds the pen and charges it. This device's own stock
+		 * tree names the pin: wacom@56 carries wacom,use_garage and
+		 * wacom,pdct-gpio = <&tlmm 137>, and the downstream driver
+		 * reads it with gpio_get_value() and reports it as a switch.
+		 * Nothing on this system had ever looked at the pin.
+		 *
+		 * MEASURED HERE, not assumed. Watching gpio137 through five
+		 * dock/undock cycles gave ten alternating edges tracking the
+		 * pen with no bounce and no drops.
+		 *
+		 * POLARITY IS HIGH = PEN IN THE SLOT, and it is inverted from
+		 * the vendor's expression rather than copied from it. The
+		 * downstream driver clears its PEN_OUT bit when the pin reads
+		 * high and logs it as "IN", and its own header documents that
+		 * bit as "0: IN / 1: OUT" -- yet it then reports Samsung's
+		 * SW_PEN_INSERT with the value of PEN_OUT, so its switch is set
+		 * when the pen is ABSENT. Upstream defines SW_PEN_INSERTED as
+		 * "set = pen inserted", which is the opposite convention.
+		 * Transcribing the vendor's expression would ship dock and
+		 * undock backwards. GPIO_ACTIVE_HIGH puts the polarity in this
+		 * property, so a correction is an edit here and not in code.
+		 *
+		 * Reverse insertion is not reported. Stock distinguishes it
+		 * with SW_PEN_REVERSE_INSERT, whose value collides with
+		 * upstream's SW_LINEIN_INSERT, and there is no upstream code
+		 * for it. It costs nothing: the vendor only checks orientation
+		 * AFTER this pin says the pen is in, so the pin carries dock
+		 * and undock either way round.
+		 *
+		 * THE STATE IS ON THE PIN AND NOWHERE ELSE. The digitiser's
+		 * interrupt was counted beside it through all ten transitions
+		 * and did not advance once, so no i2c packet carries this and a
+		 * driver could not read it off the bus. gpio-keys is how
+		 * upstream reports a pen garage -- sc7180-trogdor and four
+		 * other boards do exactly this -- so no driver code is needed.
+		 *
+		 * No debounce-interval: stock takes the bare GPIO interrupt
+		 * with no debounce at all, and gpio-keys already applies 5 ms
+		 * by default, which is more filtering than stock asks for.
+		 *
+		 * No wakeup-source, for the reason given for the hall above:
+		 * nothing consumes this switch yet, and arming a system wake
+		 * source for an event that is then discarded copies a mechanism
+		 * without its purpose and spends battery to do it. Waking the
+		 * tablet when the pen is drawn is a deliberate behaviour to add
+		 * once something acts on the switch, not a default to inherit.
+		 */
+		switch-pen-garage {
+			label = "Pen Garage";
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_PEN_INSERTED>;
+			gpios = <&tlmm 137 GPIO_ACTIVE_HIGH>;
 			linux,can-disable;
 		};
 	};
@@ -1640,6 +1697,25 @@
 		pins = "gpio107";
 		function = "gpio";
 		drive-strength = <2>;
+		bias-disable;
+		input-enable;
+	};
+
+	/*
+	 * S Pen garage detect. Transcribed from this device's own stock
+	 * epen-pdct-active state: pins "gpio137", function "gpio",
+	 * input-enable, bias-disable. bias-disable is stock's value and is
+	 * kept for the same reason it is kept on the hall -- the sensor
+	 * drives the line itself, so an internal pull would fight it. The pin
+	 * currently sits in tlmm's reset configuration, which happens to be
+	 * an input with a pull-down, and the ten measured edges were read in
+	 * that state; naming the state here stops that from being luck.
+	 * Stock sets no drive-strength on this pin and neither do we, because
+	 * it is an input. Clear of the firmware-reserved <36 4> block.
+	 */
+	pen_garage: pen-garage-state {
+		pins = "gpio137";
+		function = "gpio";
 		bias-disable;
 		input-enable;
 	};
