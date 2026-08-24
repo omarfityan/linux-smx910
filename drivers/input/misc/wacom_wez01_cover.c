@@ -320,15 +320,26 @@ static int wacom_pen_register(struct wacom_cover *wc)
 	input_set_capability(pen, EV_KEY, BTN_STYLUS);
 
 	/*
-	 * Reported in the SENSOR's native orientation, which is what this
-	 * device's own dtbo asks for: wacom,invert = <0 0 0>, whose third cell
-	 * the vendor parses as xy_switch -- so the vendor does not swap either.
-	 * The sensor's x spans the panel's short side and its y the long one,
-	 * so on a landscape display the pen is rotated 90 degrees; that is a
-	 * libinput calibration matrix in userspace, not a kernel transform.
+	 * ROTATED IN THE DRIVER, and deliberately not in userspace.
+	 *
+	 * The sensor's x spans the panel's SHORT side and its y the long one,
+	 * so raw coordinates arrive 90 degrees off a landscape desktop. The
+	 * obvious fix is a libinput calibration matrix of "0 1 0 -1 0 1" --
+	 * and on this stack that matrix is BROKEN: KWin 6 / libinput-1.31.3
+	 * drop the off-diagonal cross-term and collapse the rotated X axis to
+	 * zero. The touchscreen hit this first and its driver now rotates
+	 * in-kernel for exactly this reason (goodix_berlin_report_state():
+	 * rx = y, ry = RAW_MAX_X - x); see 61-goodix-rotate.rules, which
+	 * pointedly installs an IDENTITY matrix. This reproduces that
+	 * transform so the compositor has to apply no rotation at all.
+	 *
+	 * Hence the swapped ranges: ABS_X spans the sensor's y and vice versa.
+	 * Verified against a pen held at the panel's top-left corner, which
+	 * read raw x=19387 (of 19589) y=280 (of 31376) and maps to (0.009,
+	 * 0.010) -- top-left.
 	 */
-	input_set_abs_params(pen, ABS_X, 0, wc->max_x, 0, 0);
-	input_set_abs_params(pen, ABS_Y, 0, wc->max_y, 0, 0);
+	input_set_abs_params(pen, ABS_X, 0, wc->max_y, 0, 0);
+	input_set_abs_params(pen, ABS_Y, 0, wc->max_x, 0, 0);
 	input_set_abs_params(pen, ABS_PRESSURE, 0, WACOM_MAX_PRESSURE, 0, 0);
 	input_set_abs_params(pen, ABS_DISTANCE, 0, WACOM_MAX_HEIGHT, 0, 0);
 	input_set_abs_params(pen, ABS_TILT_X, -WACOM_MAX_TILT, WACOM_MAX_TILT, 0, 0);
@@ -392,12 +403,14 @@ static void wacom_pen_report(struct wacom_cover *wc, const u8 *buf)
 
 	input_report_key(wc->pen, (buf[0] & WACOM_COORD_ERASER) ?
 			 BTN_TOOL_RUBBER : BTN_TOOL_PEN, 1);
-	input_report_abs(wc->pen, ABS_X, x);
-	input_report_abs(wc->pen, ABS_Y, y);
+	/* The 90-degree rotation described at wacom_pen_register(). */
+	input_report_abs(wc->pen, ABS_X, y);
+	input_report_abs(wc->pen, ABS_Y, wc->max_x - x);
 	input_report_abs(wc->pen, ABS_PRESSURE, pressure);
 	input_report_abs(wc->pen, ABS_DISTANCE, buf[7]);
-	input_report_abs(wc->pen, ABS_TILT_X, (s8)buf[8]);
-	input_report_abs(wc->pen, ABS_TILT_Y, (s8)buf[9]);
+	/* Tilt rides the same rotation as the coordinates it describes. */
+	input_report_abs(wc->pen, ABS_TILT_X, (s8)buf[9]);
+	input_report_abs(wc->pen, ABS_TILT_Y, -(s8)buf[8]);
 	input_report_key(wc->pen, BTN_TOUCH,  !!(buf[0] & WACOM_COORD_TIP_DOWN));
 	input_report_key(wc->pen, BTN_STYLUS, !!(buf[0] & WACOM_COORD_SIDE_BUTTON));
 	input_sync(wc->pen);
