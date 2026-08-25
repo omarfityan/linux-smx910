@@ -9,9 +9,17 @@
  * packet on i2c: packet id 13 (NOTI) in the low nibble of byte 0, sub-id 10
  * (COVER_DETECT) in byte 1, and the state in bit 7 of byte 3.
  *
- * This driver is deliberately only the cover switch. It does not do pen
- * coordinates, pressure, tilt, the garage, or firmware update. Those need the
- * query handshake and the panel-data tables; the cover bit needs none of it.
+ * The driver began as only the cover switch and has grown two things the same
+ * bus carries: pen coordinates, and the garage charging coil. It still does NOT
+ * do firmware update, and must not -- see the query-descriptor note below.
+ *
+ * The garage sense pin is not here either. It is a plain GPIO that no i2c
+ * packet carries, so gpio-keys reports it as SW_PEN_INSERTED from the device
+ * tree, which is how upstream boards report a pen garage. That split is why
+ * charging POLICY cannot live in this driver: the trigger it needs is on
+ * another input device entirely. What lives here is the mechanism -- the
+ * commands, the state read, and the one safety rule that must not depend on a
+ * userspace process still being alive.
  *
  * PROTOCOL, transcribed from the device's own downstream driver
  * (drivers/input/wacom/{wacom_i2c.c,wacom_reg.h,wacom_dev.h}) and then
@@ -59,18 +67,125 @@
 #include <linux/i2c.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
+#include <linux/ktime.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pm.h>
 #include <linux/pm_wakeup.h>
 #include <linux/regulator/consumer.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+#include <linux/sysfs.h>
 
 /* Commands. Names and values are the vendor's, from wacom_reg.h. */
 #define WACOM_CMD_SURVEY_EXIT		0x2d	/* COM_SURVEY_EXIT */
 #define WACOM_CMD_SAMPLERATE_START	0x31	/* COM_SAMPLERATE_START */
 #define WACOM_CMD_SURVEY_COVER_ONLY	0x3b	/* COM_SURVEY_GARAGE_ONLY */
 #define WACOM_CMD_COVER_CHECK_STATUS	0x88	/* COM_KBDCOVER_CHECK_STATUS */
+
+/*
+ * GARAGE CHARGING. The slot that holds the pen is a charging coil, and the
+ * digitiser drives it on command -- nothing happens on its own. Measured on
+ * this part before any of this was written: a fresh re-dock sat in
+ * BLE_C_OFF_KEEP_2 for 95 consecutive samples over 2m12s and never left the
+ * OFF family. A docked pen on this system was simply never charged.
+ *
+ * The commands are the vendor's, from wacom_reg.h. Only four of its nine are
+ * named here, and the omissions are the point:
+ *
+ *   0xE8 DISABLE and 0xE9 ENABLE are policy flags, not charge commands, and
+ *        the vendor's own shipping path rewrites DISABLE into KEEP_OFF before
+ *        it can reach the bus (wacom_i2c_sec.c:1319-1323).
+ *   0xEA RESET is redundant with START here and untested on this part.
+ *   0xEF FORCE_RESET resets the pen's DSP. 0xF3 FULL is documented "depend on
+ *        fw". 0xFF COM_FLASH puts the IC into firmware-flash mode, and this
+ *        digitiser has no reset GPIO and an always-on rail, so a mis-flash is
+ *        not recoverable by re-flashing a partition.
+ *
+ * Those bytes are not defined in this file and no code path can construct
+ * one. The attribute takes WORDS, never an index: the vendor's sysfs surface
+ * takes an integer and range-checks it, which means a userspace typo of "7"
+ * emits FORCE_RESET. There is no integer here to mistype.
+ */
+#define WACOM_CMD_BLE_START		0xeb	/* COM_BLE_C_START */
+#define WACOM_CMD_BLE_KEEP_ON		0xec	/* COM_BLE_C_KEEP_ON */
+#define WACOM_CMD_BLE_KEEP_OFF		0xed	/* COM_BLE_C_KEEP_OFF */
+#define WACOM_CMD_BLE_MODE_RETURN	0xee	/* COM_BLE_C_MODE_RETURN */
+
+/*
+ * A charge bout is KEEP_OFF, then START, and it is one operation rather than
+ * two writes a caller sequences itself.
+ *
+ * WHY THE PAIR. START's own vendor comment reads "make start patter[n] + 1m
+ * charge": the pen is woken by a PATTERN driven onto the coil, which needs a
+ * de-energised coil to start from. Every sequence captured from stock on this
+ * hardware is the pair -- 05,ED then 03,EB, twice in one capture -- and stock
+ * never sends a bare START. A bare START does work from an idle part, which is
+ * why probing found one sufficient; it is exactly when the coil is already on
+ * that it would quietly do nothing, and that is the state a re-arm hits.
+ *
+ * The 600 ms floor is stock's, measured on the wire at 602 ms between the two
+ * writes. It lives here rather than in the caller so that no caller can skip
+ * it.
+ */
+#define WACOM_CHARGE_FLOOR_MS		600
+
+/*
+ * How long a bout can still be running. The part expires a bare START on its
+ * own, measured on this hardware at t+91 s -- charging at t+89, off at t+91 --
+ * so beyond this the coil is off whatever the host believes. The margin is
+ * deliberate and one-sided: erring long costs a redundant stop command, erring
+ * short would skip a stop that was needed.
+ */
+#define WACOM_CHARGE_BOUT_MS		120000
+
+/*
+ * Packet classes carrying charge information. From the vendor's PACKET_ID,
+ * NOTI_SUB_ID and REPLY_SUB_ID enums in wacom_dev.h.
+ *
+ * REPLY(14)/GARAGE_CHARGE(6) is the solicited answer to MODE_RETURN, and its
+ * byte 2 low nibble is the charge state. NOTI(13)/OOK(4) is accepted as an
+ * equivalent answer because the vendor accepts either (wacom_i2c_sec.c:1237).
+ *
+ * NOTI(13)/CHARGE_FINISHED(7) is the vendor's GCF_PACKET, "Garage Charging
+ * Finished". It is UNSOLICITED, it arrives on i2c, and the vendor's driver
+ * clears its charging state on it (wacom_i2c.c:1193-1198). It is decoded here
+ * only to record that it happened: whether this part's firmware emits it at
+ * all has never been observed on this system, and a policy may not be built on
+ * a packet nobody has seen. Recording it is how that changes.
+ */
+#define WACOM_PACKET_ID_REPLY		14	/* REPLY_PACKET */
+#define WACOM_REPLY_GARAGE_CHARGE	6	/* GARAGE_CHARGE_PACKET */
+#define WACOM_NOTI_OOK			4	/* OOK_PACKET */
+#define WACOM_NOTI_CHARGE_FINISHED	7	/* GCF_PACKET */
+#define WACOM_OOK_FAIL			BIT(7)	/* in byte 4 */
+#define WACOM_CHARGE_STATE_MASK		0x0f	/* in byte 2 */
+
+/*
+ * The charge-state enum, from the vendor's epen_ble_charge_state. The vendor
+ * groups it into two verdicts and one error (wacom_i2c_sec.c:1254-1271); the
+ * grouping is transcribed with it, because the individual state names are
+ * ambiguous in a way the grouping is not -- AFTER_RESET is a CHARGING state
+ * despite reading like a stopped one, and this part answers AFTER_RESET to a
+ * START rather than the AFTER_START its name would suggest.
+ */
+enum wacom_charge_state {
+	WACOM_BLE_C_OFF		= 0,
+	WACOM_BLE_C_START,
+	WACOM_BLE_C_TRANSIT,
+	WACOM_BLE_C_RESET,
+	WACOM_BLE_C_AFTER_START,
+	WACOM_BLE_C_AFTER_RESET,
+	WACOM_BLE_C_ON_KEEP_1,
+	WACOM_BLE_C_OFF_KEEP_1,
+	WACOM_BLE_C_ON_KEEP_2,
+	WACOM_BLE_C_OFF_KEEP_2,
+	WACOM_BLE_C_FULL,
+};
+
+/* Ring of what was actually SENT and what actually ARRIVED, newest last. */
+#define WACOM_CHARGE_LOG_ENTRIES	16
 
 /* Packet layout. From wacom_dev.h's PACKET_ID / NOTI_SUB_ID enums. */
 #define WACOM_PACKET_LEN		17	/* COM_COORD_NUM + 1 */
@@ -212,6 +327,64 @@ struct wacom_cover {
 	 * complete(): it pins the completion so every later interrupt passes.
 	 */
 	struct completion resumed;
+
+	/*
+	 * Charge command serialisation. Deliberately NOT mode_lock: a charge
+	 * bout holds its lock across the 600 ms floor, and mode_lock is held
+	 * across a 300 ms survey settle, so sharing one would make each wait on
+	 * the other for no reason. The i2c core already serialises the bus
+	 * itself, so the two never corrupt each other -- this only keeps two
+	 * concurrent bouts from interleaving their KEEP_OFF and START.
+	 */
+	struct mutex charge_lock;
+	/*
+	 * Whether a bout has been STARTED and not stopped. Deliberately not
+	 * "the last byte written": the state read writes MODE_RETURN, so a
+	 * mere read of this device's charge state would otherwise erase the
+	 * record that a bout was running and silently defeat the suspend rule
+	 * below. Only the commands that arm or disarm the coil touch it.
+	 */
+	bool charge_armed;
+	/*
+	 * Whether the running bout was LATCHED with KEEP_ON, which has no
+	 * expiry of its own, and the boottime at which the bout was armed.
+	 *
+	 * WHY THE TIMESTAMP EXISTS. A bare START is expired by the part itself
+	 * at about t+91 s, and nothing tells the host that it happened. Without
+	 * a window, charge_armed stays set for the rest of uptime after the
+	 * first top-up, and every later suspend -- on a machine that suspends
+	 * constantly -- sends a pointless KEEP_OFF and writes a ring entry. The
+	 * ring is sixteen deep, so within an hour the execution record would
+	 * contain nothing but suspend noise, and the instrument built to show
+	 * what an unattended policy actually did would have destroyed exactly
+	 * that.
+	 */
+	bool charge_latched;
+	u64 charge_started_ms;
+
+	/*
+	 * The execution record. Stock's policy layer and this hardware can
+	 * disagree silently: a capture on stock showed a full command sequence
+	 * logged by the policy that never reached the bus at all. A log of
+	 * INTENT is not evidence about a coil. This ring is what was SENT, with
+	 * its return code, plus every charging-finished notification that
+	 * ARRIVED -- so an unattended policy can be audited against the wire
+	 * rather than against its own opinion of itself.
+	 *
+	 * Timestamps are ktime_get_boottime(), which INCLUDES suspended time.
+	 * The vendor uses local_clock(), which does not, and correlating one of
+	 * those against wall time is wrong by the whole sleep -- on this device
+	 * that has already meant an eighteen-hour error.
+	 */
+	spinlock_t log_lock;
+	struct {
+		u64 stamp_ms;
+		u8 byte;
+		s16 ret;
+		bool received;
+	} log[WACOM_CHARGE_LOG_ENTRIES];
+	unsigned int log_head;
+	unsigned int log_count;
 };
 
 static int wacom_cover_send(struct wacom_cover *wc, u8 cmd, unsigned int settle_ms)
@@ -226,6 +399,135 @@ static int wacom_cover_send(struct wacom_cover *wc, u8 cmd, unsigned int settle_
 
 	msleep(settle_ms);
 	return 0;
+}
+
+static void wacom_charge_log(struct wacom_cover *wc, u8 byte, int ret, bool received)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&wc->log_lock, flags);
+	i = wc->log_head;
+	wc->log[i].stamp_ms = ktime_to_ms(ktime_get_boottime());
+	wc->log[i].byte = byte;
+	wc->log[i].ret = ret;
+	wc->log[i].received = received;
+	wc->log_head = (i + 1) % WACOM_CHARGE_LOG_ENTRIES;
+	if (wc->log_count < WACOM_CHARGE_LOG_ENTRIES)
+		wc->log_count++;
+	spin_unlock_irqrestore(&wc->log_lock, flags);
+}
+
+/* One charge command byte, recorded whether it succeeded or not. */
+static int wacom_charge_send(struct wacom_cover *wc, u8 cmd)
+{
+	int ret;
+
+	ret = i2c_master_send(wc->client, &cmd, 1);
+	if (ret == 1)
+		ret = 0;
+	else if (ret >= 0)
+		ret = -EIO;
+
+	wacom_charge_log(wc, cmd, ret, false);
+	if (ret)
+		dev_err(&wc->client->dev, "charge command 0x%02x failed: %d\n",
+			cmd, ret);
+	return ret;
+}
+
+/*
+ * Start one bounded charge bout, or stop one.
+ *
+ * THE STOP IS THE HARDWARE'S, and that is the whole reason this is the shipped
+ * form. A bare START energises the coil and the part expires it on its own:
+ * measured on this hardware at t+91 s, with a control arm that stayed latched
+ * past t+146 s when KEEP_ON was sent, so the expiry is the part's behaviour and
+ * not a timeout of ours. Nothing here has to remember to stop it, no timer has
+ * to survive a suspend, and a policy daemon that dies mid-bout leaves a coil
+ * that switches itself off.
+ *
+ * That matters more than it sounds. An energised coil costs 52 mA, measured;
+ * this device draws about 6 mA asleep on the vendor's own software. A latch
+ * that outlived its owner would cost roughly nine times the entire idle budget
+ * of the machine, indefinitely.
+ */
+static int wacom_charge_start(struct wacom_cover *wc)
+{
+	int ret;
+
+	if (!wait_for_completion_timeout(&wc->resumed,
+					 msecs_to_jiffies(WACOM_RESUME_TIMEOUT_MS)))
+		return -EAGAIN;
+
+	mutex_lock(&wc->charge_lock);
+	ret = wacom_charge_send(wc, WACOM_CMD_BLE_KEEP_OFF);
+	if (!ret) {
+		msleep(WACOM_CHARGE_FLOOR_MS);
+		ret = wacom_charge_send(wc, WACOM_CMD_BLE_START);
+		if (!ret) {
+			wc->charge_armed = true;
+			wc->charge_latched = false;
+			wc->charge_started_ms = ktime_to_ms(ktime_get_boottime());
+		}
+	}
+	mutex_unlock(&wc->charge_lock);
+
+	return ret;
+}
+
+static int wacom_charge_stop(struct wacom_cover *wc)
+{
+	int ret;
+
+	if (!wait_for_completion_timeout(&wc->resumed,
+					 msecs_to_jiffies(WACOM_RESUME_TIMEOUT_MS)))
+		return -EAGAIN;
+
+	mutex_lock(&wc->charge_lock);
+	ret = wacom_charge_send(wc, WACOM_CMD_BLE_KEEP_OFF);
+	/*
+	 * Cleared only on a write that reached the bus. A failed stop leaves
+	 * the coil in an unknown state, so the flag stays set and the next
+	 * suspend tries again.
+	 */
+	if (!ret) {
+		wc->charge_armed = false;
+		wc->charge_latched = false;
+	}
+	mutex_unlock(&wc->charge_lock);
+
+	return ret;
+}
+
+/*
+ * Hold a bout open past the part's own expiry.
+ *
+ * NOT USED BY ANY POLICY HERE, and exposed only so the one open question about
+ * this hardware can be answered: the vendor's driver acts on a "garage charging
+ * finished" notification that nothing on this system has ever seen, and a
+ * latched bout is the state in which it would have to arrive. Until it is
+ * observed, a latch has no stop that survives losing its owner, so nothing
+ * arms one automatically -- and suspend forces it off regardless.
+ */
+static int wacom_charge_hold(struct wacom_cover *wc)
+{
+	int ret;
+
+	if (!wait_for_completion_timeout(&wc->resumed,
+					 msecs_to_jiffies(WACOM_RESUME_TIMEOUT_MS)))
+		return -EAGAIN;
+
+	mutex_lock(&wc->charge_lock);
+	ret = wacom_charge_send(wc, WACOM_CMD_BLE_KEEP_ON);
+	if (!ret) {
+		wc->charge_armed = true;
+		wc->charge_latched = true;
+		wc->charge_started_ms = ktime_to_ms(ktime_get_boottime());
+	}
+	mutex_unlock(&wc->charge_lock);
+
+	return ret;
 }
 
 /*
@@ -460,6 +762,25 @@ static bool wacom_cover_decode(struct wacom_cover *wc, const u8 *buf, bool *clos
 	u8 id = buf[0] & WACOM_PACKET_ID_MASK;
 
 	if (id != WACOM_PACKET_ID_NOTI || buf[1] != WACOM_NOTI_COVER_DETECT) {
+		/*
+		 * One notification class is recorded rather than merely logged.
+		 * The vendor's driver treats NOTI sub 7 as "garage charging
+		 * finished" and clears its charging state on it, which would be
+		 * a stop condition arriving on i2c with no radio involved. It
+		 * has never been seen on this system -- and it never could have
+		 * been, because nothing on this system had ever started a charge
+		 * for it to finish. Now that something does, this is the only
+		 * place the answer can appear.
+		 */
+		if (id == WACOM_PACKET_ID_NOTI &&
+		    buf[1] == WACOM_NOTI_CHARGE_FINISHED) {
+			wacom_charge_log(wc, buf[1], 0, true);
+			dev_info(&wc->client->dev,
+				 "garage charging finished (%*ph)\n",
+				 WACOM_PACKET_LEN, buf);
+			return false;
+		}
+
 		dev_dbg(&wc->client->dev,
 			"ignoring packet id %u sub %u (%*ph)\n",
 			id, buf[1], WACOM_PACKET_LEN, buf);
@@ -595,10 +916,202 @@ static ssize_t full_scan_store(struct device *dev,
 	ret = wacom_set_scan_mode(wc, full);
 	return ret ? ret : count;
 }
+/*
+ * Ask the IC what the coil is actually doing.
+ *
+ * This is a real hardware read, not a replay of what was last written, and the
+ * distinction is the point: a command that was accepted by the bus and did
+ * nothing at the coil is a failure mode this device has already produced. The
+ * round trip is the vendor's own (wacom_i2c_sec.c:1206-1271) -- send
+ * MODE_RETURN, read a packet, accept either REPLY/GARAGE_CHARGE or NOTI/OOK as
+ * the answer, and take the charge state from byte 2's low nibble.
+ *
+ * The interrupt is disabled across it because the reply is SOLICITED and the
+ * threaded handler would otherwise consume it, leaving this read to time out
+ * against a packet that arrived and was thrown away. The vendor disables its
+ * interrupt here for the same reason.
+ *
+ * One transcription is deliberately not literal: the vendor rejects a reply on
+ * `buff[4] & 80` -- decimal 80, i.e. 0x50, where every other use of that byte
+ * in its own tree tests 0x80 for an OOK failure. That is a missing 0x, so the
+ * bit it means is used rather than the bit it wrote.
+ */
+static int wacom_charge_state_read(struct wacom_cover *wc)
+{
+	u8 buf[WACOM_PACKET_LEN];
+	bool covered;
+	int ret, i;
+	u8 id;
+
+	if (!wait_for_completion_timeout(&wc->resumed,
+					 msecs_to_jiffies(WACOM_RESUME_TIMEOUT_MS)))
+		return -EAGAIN;
+
+	mutex_lock(&wc->charge_lock);
+	disable_irq(wc->client->irq);
+
+	ret = wacom_charge_send(wc, WACOM_CMD_BLE_MODE_RETURN);
+	if (ret)
+		goto out;
+
+	for (i = 0; i < WACOM_READ_RETRIES; i++) {
+		ret = wacom_cover_read(wc, buf);
+		if (ret)
+			continue;
+
+		id = buf[0] & WACOM_PACKET_ID_MASK;
+		if (!((id == WACOM_PACKET_ID_REPLY &&
+		       buf[1] == WACOM_REPLY_GARAGE_CHARGE) ||
+		      (id == WACOM_PACKET_ID_NOTI &&
+		       buf[1] == WACOM_NOTI_OOK))) {
+			/*
+			 * NOT the reply we asked for -- so it is a packet the
+			 * interrupt handler would have processed, and this read
+			 * has just taken it with the interrupt disabled.
+			 *
+			 * DISCARDING IT IS NOT HARMLESS. The IC releases its
+			 * interrupt line when a packet is READ, so a cover
+			 * notification consumed here and thrown away produces no
+			 * further edge: SW_LID stays stale, and this driver
+			 * already documents what that costs -- logind acts on a
+			 * stale "closed" and puts the machine straight back to
+			 * sleep. The policy reads this attribute after every
+			 * top-up, so the window is routine rather than exotic.
+			 *
+			 * Hand it to the same decode the handler would have run.
+			 */
+			if (wacom_cover_decode(wc, buf, &covered))
+				wacom_cover_report(wc, covered);
+			msleep(WACOM_READ_RETRY_MS);
+			continue;
+		}
+
+		if (buf[4] & WACOM_OOK_FAIL) {
+			dev_warn(&wc->client->dev,
+				 "charge state reply flags OOK failure (0x%02x)\n",
+				 buf[4]);
+			msleep(WACOM_READ_RETRY_MS);
+			continue;
+		}
+
+		ret = buf[2] & WACOM_CHARGE_STATE_MASK;
+		goto out;
+	}
+
+	ret = -ENODATA;
+out:
+	enable_irq(wc->client->irq);
+	mutex_unlock(&wc->charge_lock);
+	return ret;
+}
+
+/*
+ * The vendor's own grouping of the state enum, not a per-state name. Its state
+ * names mislead -- this part answers AFTER_RESET (5) to a START, and every
+ * KEEP-suffixed value has both an ON and an OFF member -- so what is reported
+ * is the verdict the vendor derives, which is unambiguous.
+ */
+static const char *wacom_charge_state_name(int state)
+{
+	switch (state) {
+	case WACOM_BLE_C_AFTER_START:
+	case WACOM_BLE_C_AFTER_RESET:
+	case WACOM_BLE_C_ON_KEEP_1:
+	case WACOM_BLE_C_ON_KEEP_2:
+	case WACOM_BLE_C_FULL:
+		return "charging";
+	case WACOM_BLE_C_OFF:
+	case WACOM_BLE_C_OFF_KEEP_1:
+	case WACOM_BLE_C_OFF_KEEP_2:
+		return "idle";
+	default:
+		return "transient";
+	}
+}
+
+static ssize_t pen_charge_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct wacom_cover *wc = i2c_get_clientdata(to_i2c_client(dev));
+	int state;
+
+	state = wacom_charge_state_read(wc);
+	if (state < 0)
+		return state;
+
+	return sysfs_emit(buf, "%s %d\n", wacom_charge_state_name(state), state);
+}
+
+/*
+ * WORDS, NOT INDICES, and that is a safety property rather than a style
+ * choice. The vendor's equivalent attribute takes an integer into a command
+ * table whose entry 7 is FORCE_RESET and whose entry 8 is a firmware-dependent
+ * full-charge command; a single mistyped digit from userspace reaches the pen's
+ * DSP. No integer is parsed here, and the bytes those indices select are not
+ * defined in this file at all.
+ *
+ * "top-up" is the only one a policy should ever need. "hold" and "off" exist
+ * for the charging-finished question described above, and hold is never armed
+ * by anything automatic.
+ *
+ * There is no docked-pen check here, and there cannot be: the garage sense pin
+ * is claimed by gpio-keys, which reports it as SW_PEN_INSERTED on its own input
+ * device, so this driver cannot read it. Energising an empty slot wastes
+ * current and harms nothing, and the check belongs with the policy that can
+ * actually see the switch.
+ */
+static ssize_t pen_charge_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct wacom_cover *wc = i2c_get_clientdata(to_i2c_client(dev));
+	int ret;
+
+	if (sysfs_streq(buf, "top-up"))
+		ret = wacom_charge_start(wc);
+	else if (sysfs_streq(buf, "hold"))
+		ret = wacom_charge_hold(wc);
+	else if (sysfs_streq(buf, "off"))
+		ret = wacom_charge_stop(wc);
+	else
+		return -EINVAL;
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(pen_charge);
+
+/* What reached the bus, and what came back. Newest last. */
+static ssize_t pen_charge_log_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct wacom_cover *wc = i2c_get_clientdata(to_i2c_client(dev));
+	unsigned long flags;
+	unsigned int i, n, idx;
+	int len = 0;
+
+	spin_lock_irqsave(&wc->log_lock, flags);
+	n = wc->log_count;
+	for (i = 0; i < n; i++) {
+		idx = (wc->log_head + WACOM_CHARGE_LOG_ENTRIES - n + i) %
+			WACOM_CHARGE_LOG_ENTRIES;
+		len += sysfs_emit_at(buf, len, "%llu.%03llu %s %02x %d\n",
+				     wc->log[idx].stamp_ms / 1000,
+				     wc->log[idx].stamp_ms % 1000,
+				     wc->log[idx].received ? "recv" : "sent",
+				     wc->log[idx].byte, wc->log[idx].ret);
+	}
+	spin_unlock_irqrestore(&wc->log_lock, flags);
+
+	return len;
+}
+static DEVICE_ATTR_RO(pen_charge_log);
+
 static DEVICE_ATTR_RW(full_scan);
 
 static struct attribute *wacom_cover_attrs[] = {
 	&dev_attr_full_scan.attr,
+	&dev_attr_pen_charge.attr,
+	&dev_attr_pen_charge_log.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(wacom_cover);
@@ -622,6 +1135,8 @@ static int wacom_cover_probe(struct i2c_client *client)
 	init_completion(&wc->resumed);
 	complete_all(&wc->resumed);
 	mutex_init(&wc->mode_lock);
+	mutex_init(&wc->charge_lock);
+	spin_lock_init(&wc->log_lock);
 
 	ret = devm_regulator_get_enable(dev, "vdd");
 	if (ret)
@@ -686,6 +1201,39 @@ static int wacom_cover_suspend(struct device *dev)
 {
 	struct wacom_cover *wc = dev_get_drvdata(dev);
 	int ret;
+
+	/*
+	 * NEVER CARRY AN ENERGISED COIL INTO SUSPEND. This is the only hard
+	 * safety rule the charging path has, and it is enforced here rather
+	 * than by the policy that started the bout, because the whole hazard is
+	 * a policy that is no longer running.
+	 *
+	 * The part's own expiry cannot be relied on across a sleep: it is the
+	 * digitiser's timer, on an always-on rail, and it keeps its state while
+	 * the machine is frozen -- but a HELD bout has no expiry at all, and a
+	 * held coil costs 52 mA against a device that should be drawing about
+	 * 6 mA asleep. Every path out of here that suspends with the coil on is
+	 * an order-of-magnitude battery regression that nothing would report.
+	 *
+	 * Sent unconditionally when the last command started or held a bout,
+	 * before the gate closes, so it goes out while the bus is still up. The
+	 * cost when a bout was legitimately running is the remainder of a 90 s
+	 * top-up, which the next trigger repeats.
+	 */
+	if (wc->charge_armed &&
+	    (wc->charge_latched ||
+	     ktime_to_ms(ktime_get_boottime()) - wc->charge_started_ms <
+			WACOM_CHARGE_BOUT_MS)) {
+		dev_dbg(dev, "stopping the charge coil before suspend\n");
+		wacom_charge_stop(wc);
+	} else {
+		/*
+		 * Outside the window and not latched: the part has already
+		 * expired the bout. Forget it rather than stopping it, so the
+		 * next suspend does not do this again.
+		 */
+		wc->charge_armed = false;
+	}
 
 	/*
 	 * Close the gate before the i2c controller goes down, so a wake
