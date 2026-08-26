@@ -262,20 +262,64 @@ EXPORT_SYMBOL(ath12k_core_resume_early);
 static void ath12k_core_reapply_country(struct ath12k_base *ab)
 {
 	struct wmi_set_current_country_arg arg = {};
+	const char *src;
 	struct ath12k *ar;
 	int i, ret;
 
-	if (!ab->hw_params->current_cc_support || !ab->cfg_alpha2[0])
+	if (!ab->hw_params->current_cc_support)
 		return;
 
-	memcpy(&arg.alpha2, ab->cfg_alpha2, 2);
+	/* Prefer the country 802.11d actually LEARNED over the configured
+	 * fallback, and prefer it for a reason that costs real time when it is
+	 * ignored.
+	 *
+	 * cfg_alpha2 is the ath12k.country= default. Its own documentation says
+	 * it is "NOT a claim about where this device is" -- it exists only so a
+	 * boot that supplies no country does not sit at WORLD and lose 5 GHz.
+	 * new_alpha2 is what the SMBIOS record or the 802.11d country event
+	 * reported, i.e. where the radio actually is. Once 11d has spoken, the
+	 * fallback is strictly worse information.
+	 *
+	 * Pushing the fallback here does not merely mislabel the regdomain, it
+	 * makes the first scan after every resume far slower, because the
+	 * regdomain sets the channel list and the scan pays for every channel in
+	 * it. Measured on this device, in JO, with the US default:
+	 *
+	 *   scan 1, US list : 98 channels, 13.61 s  (139 ms/channel)
+	 *   scan 2, JO list : 48 channels,  5.72 s  (119 ms/channel)
+	 *
+	 * US adds the 16 5 GHz DFS channels -- which must be scanned PASSIVELY,
+	 * the slowest kind -- and 36 more 6 GHz channels than JO permits. 802.11d
+	 * corrects the domain about six seconds in, but a scan already in flight
+	 * keeps the channel list it started with, so the correction arrives too
+	 * late to help and the user waits out the long sweep on every resume.
+	 *
+	 * ar->alpha2 is deliberately NOT used: that is per-radio live state.
+	 * new_alpha2 is validated rather than trusted -- ath12k_wmi_11d_new_cc_event()
+	 * copies whatever the firmware sends, and the SMBIOS worldwide branch
+	 * stores a literal "00". Accepting either would push WORLD on resume and
+	 * cause exactly the 5 GHz loss this function exists to prevent.
+	 */
+	spin_lock_bh(&ab->base_lock);
+	if (ab->new_alpha2[0] >= 'A' && ab->new_alpha2[0] <= 'Z' &&
+	    ab->new_alpha2[1] >= 'A' && ab->new_alpha2[1] <= 'Z') {
+		memcpy(&arg.alpha2, ab->new_alpha2, 2);
+		src = "learned";
+	} else {
+		memcpy(&arg.alpha2, ab->cfg_alpha2, 2);
+		src = "configured";
+	}
+	spin_unlock_bh(&ab->base_lock);
+
+	if (!arg.alpha2[0])
+		return;
 
 	for (i = 0; i < ab->num_radios; i++) {
 		ar = ab->pdevs[i].ar;
 		if (!ar)
 			continue;
 
-		memcpy(&ar->alpha2, ab->cfg_alpha2, 2);
+		memcpy(&ar->alpha2, arg.alpha2, 2);
 		reinit_completion(&ar->regd_update_completed);
 
 		ret = ath12k_wmi_send_set_current_country_cmd(ar, &arg);
@@ -284,8 +328,8 @@ static void ath12k_core_reapply_country(struct ath12k_base *ab)
 				    "pdev %d failed to re-apply country %c%c after resume: %d\n",
 				    i, arg.alpha2[0], arg.alpha2[1], ret);
 		else
-			ath12k_info(ab, "regulatory country %c%c re-applied after resume\n",
-				    arg.alpha2[0], arg.alpha2[1]);
+			ath12k_info(ab, "regulatory country %c%c re-applied after resume (%s)\n",
+				    arg.alpha2[0], arg.alpha2[1], src);
 	}
 }
 
