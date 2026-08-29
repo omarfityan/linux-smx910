@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# v4l2loopback -- vendored from Ubuntu's v4l2loopback-dkms packaging.
+#
+# WHY THIS IS IN THE TREE RATHER THAN BUILT OUT OF TREE
+# This kernel has CONFIG_MODVERSIONS unset, so a module is accepted on vermagic
+# alone -- essentially the release string, which embeds `git describe`. An
+# out-of-tree .ko is therefore keyed to ONE commit and stops loading at the next
+# kernel change. That is a dated failure, not a risk: the camera would simply
+# disappear on the next boot flash. As an ordinary =m symbol the module is built
+# and installed with the rest of the module tree and cannot fall out of step.
+#
+# PROVENANCE -- Ubuntu's packaging, NOT upstream's tarball
+# Upstream's release does not carry the client-usage event that the userspace
+# bridge depends on for consumer detection; Ubuntu's does, as a v4l2-relayd
+# compatibility patch. Taking upstream would silently remove it.
+#
+#   source  : v4l2loopback-dkms 0.15.3-1ubuntu2  (apt-get download)
+#   files   : v4l2loopback.c, v4l2loopback.h, v4l2loopback_formats.h, PRISTINE
+#   dropped : Kbuild (one line, obj-m), Makefile and dkms.conf -- packaging only
+#
+# The revision matters and the version string cannot express it: 0.15.3-1ubuntu2
+# added fix-buffer-queue-management.patch for V4L2 spec compliance, and both
+# revisions report `version: 0.15.3` to modinfo. This source was confirmed
+# byte-identical to the out-of-tree module it replaces by comparing `srcversion`,
+# an MD5 over the source files: 7B773B9EB594AD896DAD368 for both, with identical
+# disassembly across all 6158 lines.
+#
+# To re-vendor: apt-get download v4l2loopback-dkms, copy the three files over,
+# and diff. Do not edit them here.
+
+config VIDEO_V4L2LOOPBACK
+	tristate "V4L2 loopback device"
+	depends on VIDEO_DEV
+	help
+	  A virtual V4L2 capture device that presents whatever a producer
+	  writes into it as an ordinary camera.
+
+	  On this device it is the only mechanism that makes the camera
+	  reachable by every application. Mainline qcom-camss is RDI-only, so
+	  the real capture nodes hand out raw Bayer that nothing can display,
+	  and a picture only exists after libcamera's software ISP -- which
+	  leaves the camera visible solely as a PipeWire node. Browsers can opt
+	  in to that; ordinary V4L2 applications cannot, and neither can a snap
+	  or a flatpak, because the opt-in lives in host userspace that a
+	  sandbox cannot see. A genuine kernel device node is what crosses the
+	  sandbox boundary.
+
+	  The userspace half is camera-bridge, installed by the rootfs recipe.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called v4l2loopback.

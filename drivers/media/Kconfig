@@ -234,6 +234,10 @@ if MEDIA_TEST_SUPPORT
 source "drivers/media/test-drivers/Kconfig"
 endif
 
+# Deliberately NOT under MEDIA_TEST_SUPPORT: v4l2loopback is the production
+# camera path on this device, not a test driver.
+source "drivers/media/v4l2loopback/Kconfig"
+
 source "drivers/media/firewire/Kconfig"
 
 # Common driver options
