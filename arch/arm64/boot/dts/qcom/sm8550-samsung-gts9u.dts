@@ -2981,8 +2981,12 @@
  *   gpios[2] = 0x11 "FCAM_LDO_EN"       -> gpio17
  *   rgltr-*-voltage = <0x10c8e0 0x1b7740 0x00>
  *                                       -> cam_vdig 1.100 V, cam_vio 1.800 V
- *   sensor-position-roll = <0x10e>      -> rotation 270
  *   sensor-position-yaw  = <0x00>       -> front-facing, orientation 0
+ *
+ * The ONE value below that is deliberately NOT transcribed from stock is
+ * `rotation`, and the reasoning is recorded at the property itself. Stock's
+ * sensor-position-roll = <0x10e> is 270 degrees, which is correct for Android's
+ * portrait-natural orientation and wrong for ours.
  *
  * The sensor's I2C address is the one value stock's device tree does NOT
  * carry -- CamX takes it from com.samsung.sensormodule.1_hynix_hi1337_front,
@@ -3056,7 +3060,44 @@
 		pinctrl-names = "default", "sleep";
 
 		orientation = <0>;
-		rotation = <270>;
+
+		/*
+		 * DELIBERATELY NOT stock's value. Stock's
+		 * sensor-position-roll = <0x10e> is 270 degrees; this is 0.
+		 *
+		 * `rotation` is an ENVIRONMENT-RELATIVE CONVENTION, not a fact
+		 * about the silicon. video-interface-devices.yaml defines it as
+		 * the angular difference between the sensor's pixel array and a
+		 * reference system "defined on the external world scene", whose
+		 * top, bottom, left and right are "intentionally not defined and
+		 * depend on the environment in which the camera is used". The
+		 * value therefore encodes which way up the SYSTEM considers the
+		 * world to be, and that differs between the two systems:
+		 * Android's natural orientation is portrait, ours is
+		 * landscape-native 2960x1848.
+		 *
+		 * MEASURED, not reasoned: a frame captured straight off the
+		 * sensor path, against a physical reference held in front of the
+		 * camera with the tablet in its natural landscape orientation,
+		 * shows the scene UPRIGHT AND UNMIRRORED. Of the eight rigid
+		 * transforms of that frame, only the identity is correct. The
+		 * angular difference between the pixel array and the scene as
+		 * this system presents it is therefore zero.
+		 *
+		 * The value is pure metadata: this driver only publishes it as a
+		 * read-only V4L2 control (min == max == the DT value), nothing
+		 * in the kernel rotates a pixel because of it, and no userspace
+		 * lever can override it. Consumers that honour the metadata --
+		 * the PipeWire libcamera plugin turns it into a per-buffer
+		 * videotransform -- were rotating an already-correct image.
+		 *
+		 * This does NOT weaken the rule that hardware values come from
+		 * the device's own downstream source. That rule governs facts
+		 * about silicon: init sequences, gamma, DSC, register values.
+		 * A convention defined against the display environment is not
+		 * one of them.
+		 */
+		rotation = <0>;
 
 		port {
 			hi1337_front_ep: endpoint {
