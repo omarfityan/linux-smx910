@@ -20,6 +20,7 @@
 #include <linux/kernel.h>
 #include <linux/limits.h>
 #include <linux/init.h>
+#include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_pci.h>
 #include <linux/pci.h>
@@ -2025,6 +2026,30 @@ err_pm_runtime_put:
 	return ret;
 }
 
+/*
+ * At system suspend mainline votes a 1 kBps floor on the PCIe->DDR interconnect path
+ * to "keep the data path functional". That floor is not a small vote: the DDR ACV BCM
+ * (bcm_acv, .enable_mask) is aggregated by bcm_aggregate_mask(), which tests
+ * `sum_avg[bucket] || max_peak[bucket]` and does NOT distinguish average from peak --
+ * so any non-zero peak asserts ACV in full and keeps DDR out of self-refresh. The
+ * vendor driver for this SoC votes a true zero here instead
+ * (qcom_pcie_icc_bw_update(dev, 0, 0), "Speed == 0 implies to vote for '0' bandwidth").
+ *
+ * This is deliberately scoped to the noirq phase of a SYSTEM suspend, where every
+ * other driver has already suspended and the endpoint is going down too. It must NOT
+ * be done by retagging the path QCOM_ICC_TAG_ACTIVE_ONLY: the RPMh sleep set is also
+ * armed from rpmh_rsc_cpu_pm_callback() on every deep cluster-idle entry (~32/s at
+ * plain idle), so retagging withdraws DDR from a bus master that can DMA autonomously
+ * while the AP merely idles. That was measured to hard-stop this device.
+ *
+ * Default keeps the existing mainline behaviour; the knob exists so both arms of the
+ * measurement share one binary and one boot.
+ */
+static bool suspend_ddr_vote_zero;
+module_param(suspend_ddr_vote_zero, bool, 0644);
+MODULE_PARM_DESC(suspend_ddr_vote_zero,
+	"At system suspend vote 0 DDR bandwidth on the PCIe-MEM path instead of a 1 kBps floor, letting DDR reach self-refresh (default: 0, mainline behaviour)");
+
 static int qcom_pcie_suspend_noirq(struct device *dev)
 {
 	struct qcom_pcie *pcie;
@@ -2039,13 +2064,16 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
 	 * suspend.
 	 */
 	if (pcie->icc_mem) {
-		ret = icc_set_bw(pcie->icc_mem, 0, kBps_to_icc(1));
+		u32 peak = suspend_ddr_vote_zero ? 0 : kBps_to_icc(1);
+
+		ret = icc_set_bw(pcie->icc_mem, 0, peak);
 		if (ret) {
 			dev_err(dev,
 				"Failed to set bandwidth for PCIe-MEM interconnect path: %d\n",
 				ret);
 			return ret;
 		}
+		dev_info(dev, "pcie-mem suspend vote: avg 0 peak %u\n", peak);
 	}
 
 	/*
