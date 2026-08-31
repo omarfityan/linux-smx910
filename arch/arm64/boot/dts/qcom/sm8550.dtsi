@@ -4306,6 +4306,17 @@
 			qcom,qmp = <&aoss_qmp>;
 		};
 
+		/*
+		 * AOP message-RAM window into which the always-on processor
+		 * records which DRVs are blocking a system low-power mode,
+		 * once armed over QMP. Vendor calls this "sys-pm-vx".
+		 */
+		lpm_violators: sram@c320000 {
+			compatible = "qcom,sm8550-lpm-violators";
+			reg = <0 0x0c320000 0 0x400>;
+			qcom,qmp = <&aoss_qmp>;
+		};
+
 		spmi_bus: spmi@c400000 {
 			compatible = "qcom,spmi-pmic-arb";
 			reg = <0 0x0c400000 0 0x3000>,
