@@ -3934,12 +3934,19 @@ err_dcodec:
 static void rx_macro_remove(struct platform_device *pdev)
 {
 	struct rx_macro *rx = dev_get_drvdata(&pdev->dev);
+	struct device *dev = &pdev->dev;
 
-	clk_disable_unprepare(rx->mclk);
-	clk_disable_unprepare(rx->npl);
-	clk_disable_unprepare(rx->fsgen);
-	clk_disable_unprepare(rx->macro);
-	clk_disable_unprepare(rx->dcodec);
+	/* the clocks are only still held if runtime PM has not suspended us */
+	pm_runtime_disable(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	if (!pm_runtime_status_suspended(dev)) {
+		clk_disable_unprepare(rx->fsgen);
+		clk_disable_unprepare(rx->npl);
+		clk_disable_unprepare(rx->mclk);
+		clk_disable_unprepare(rx->dcodec);
+		clk_disable_unprepare(rx->macro);
+	}
+	pm_runtime_set_suspended(dev);
 }
 
 static const struct of_device_id rx_macro_dt_match[] = {
@@ -3976,6 +3983,9 @@ static int rx_macro_runtime_suspend(struct device *dev)
 	clk_disable_unprepare(rx->fsgen);
 	clk_disable_unprepare(rx->npl);
 	clk_disable_unprepare(rx->mclk);
+	/* release the ADSP-side LPASS core/dcodec votes last */
+	clk_disable_unprepare(rx->dcodec);
+	clk_disable_unprepare(rx->macro);
 
 	return 0;
 }
@@ -3985,10 +3995,28 @@ static int rx_macro_runtime_resume(struct device *dev)
 	struct rx_macro *rx = dev_get_drvdata(dev);
 	int ret;
 
+	/*
+	 * "macro" and "dcodec" are votes to the ADSP (PRM_CMD_REQUEST_HW_RSC) to keep
+	 * LPASS core hardware powered, not ordinary clocks. Held from probe to remove
+	 * they make the AUDIO RPMh DRV block CX power collapse for the whole uptime,
+	 * suspend included. Scope them to runtime PM, as the vendor driver does.
+	 */
+	ret = clk_prepare_enable(rx->macro);
+	if (ret) {
+		dev_err(dev, "unable to prepare macro\n");
+		return ret;
+	}
+
+	ret = clk_prepare_enable(rx->dcodec);
+	if (ret) {
+		dev_err(dev, "unable to prepare dcodec\n");
+		goto err_dcodec;
+	}
+
 	ret = clk_prepare_enable(rx->mclk);
 	if (ret) {
 		dev_err(dev, "unable to prepare mclk\n");
-		return ret;
+		goto err_mclk;
 	}
 
 	ret = clk_prepare_enable(rx->npl);
@@ -4010,11 +4038,17 @@ err_fsgen:
 	clk_disable_unprepare(rx->npl);
 err_npl:
 	clk_disable_unprepare(rx->mclk);
+err_mclk:
+	clk_disable_unprepare(rx->dcodec);
+err_dcodec:
+	clk_disable_unprepare(rx->macro);
 
 	return ret;
 }
 
 static const struct dev_pm_ops rx_macro_pm_ops = {
+	/* a macro left runtime-ACTIVE at suspend entry would keep its votes */
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	RUNTIME_PM_OPS(rx_macro_runtime_suspend, rx_macro_runtime_resume, NULL)
 };
 

@@ -2656,7 +2656,13 @@ static int wsa_macro_register_mclk_output(struct wsa_macro *wsa)
 	init.num_parents = 1;
 	wsa->hw.init = &init;
 	hw = &wsa->hw;
-	ret = clk_hw_register(wsa->dev, hw);
+	/*
+	 * devm_ here, not clk_hw_register(): rx/tx/va all use the devm form and
+	 * this was the lone outlier. Without it an unbind leaves a registered
+	 * clk_core whose ->hw points into devm-freed memory, with live
+	 * .is_enabled/.prepare callbacks. This device instantiates the driver twice.
+	 */
+	ret = devm_clk_hw_register(wsa->dev, hw);
 	if (ret)
 		return ret;
 
@@ -2841,12 +2847,25 @@ err:
 static void wsa_macro_remove(struct platform_device *pdev)
 {
 	struct wsa_macro *wsa = dev_get_drvdata(&pdev->dev);
+	struct device *dev = &pdev->dev;
 
-	clk_disable_unprepare(wsa->macro);
-	clk_disable_unprepare(wsa->dcodec);
-	clk_disable_unprepare(wsa->mclk);
-	clk_disable_unprepare(wsa->npl);
-	clk_disable_unprepare(wsa->fsgen);
+	/*
+	 * probe() enabled the clocks and marked the device active, so the clocks
+	 * are only still held if runtime PM has not already suspended it. Dropping
+	 * them unconditionally would underflow the enable count on a device that
+	 * autosuspended. pm_runtime_disable() also fixes a standing imbalance:
+	 * probe() called pm_runtime_enable() and nothing ever disabled it.
+	 */
+	pm_runtime_disable(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	if (!pm_runtime_status_suspended(dev)) {
+		clk_disable_unprepare(wsa->fsgen);
+		clk_disable_unprepare(wsa->npl);
+		clk_disable_unprepare(wsa->mclk);
+		clk_disable_unprepare(wsa->dcodec);
+		clk_disable_unprepare(wsa->macro);
+	}
+	pm_runtime_set_suspended(dev);
 }
 
 static int wsa_macro_runtime_suspend(struct device *dev)
@@ -2859,6 +2878,9 @@ static int wsa_macro_runtime_suspend(struct device *dev)
 	clk_disable_unprepare(wsa->fsgen);
 	clk_disable_unprepare(wsa->npl);
 	clk_disable_unprepare(wsa->mclk);
+	/* release the ADSP-side LPASS core/dcodec votes last */
+	clk_disable_unprepare(wsa->dcodec);
+	clk_disable_unprepare(wsa->macro);
 
 	return 0;
 }
@@ -2868,10 +2890,32 @@ static int wsa_macro_runtime_resume(struct device *dev)
 	struct wsa_macro *wsa = dev_get_drvdata(dev);
 	int ret;
 
+	/*
+	 * "macro" and "dcodec" are not ordinary clocks: they are votes sent to the
+	 * ADSP (PRM_CMD_REQUEST_HW_RSC) asking it to keep LPASS core hardware
+	 * powered. Holding them from probe to remove -- as this driver used to --
+	 * makes the AUDIO RPMh DRV block CX power collapse for the entire uptime,
+	 * including across system suspend. The device's own downstream scopes them
+	 * to runtime PM instead, so take them here and release them in
+	 * runtime_suspend(), which is also what makes the register accesses below
+	 * legal.
+	 */
+	ret = clk_prepare_enable(wsa->macro);
+	if (ret) {
+		dev_err(dev, "unable to prepare macro\n");
+		return ret;
+	}
+
+	ret = clk_prepare_enable(wsa->dcodec);
+	if (ret) {
+		dev_err(dev, "unable to prepare dcodec\n");
+		goto err_dcodec;
+	}
+
 	ret = clk_prepare_enable(wsa->mclk);
 	if (ret) {
 		dev_err(dev, "unable to prepare mclk\n");
-		return ret;
+		goto err_mclk;
 	}
 
 	ret = clk_prepare_enable(wsa->npl);
@@ -2894,11 +2938,21 @@ err_fsgen:
 	clk_disable_unprepare(wsa->npl);
 err_npl:
 	clk_disable_unprepare(wsa->mclk);
+err_mclk:
+	clk_disable_unprepare(wsa->dcodec);
+err_dcodec:
+	clk_disable_unprepare(wsa->macro);
 
 	return ret;
 }
 
 static const struct dev_pm_ops wsa_macro_pm_ops = {
+	/*
+	 * Without the system-sleep pair a macro that is runtime-ACTIVE at suspend
+	 * entry (PCM open, or autosuspend not yet elapsed) keeps its ADSP votes
+	 * across the whole suspend, which is the defect this patch exists to fix.
+	 */
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	RUNTIME_PM_OPS(wsa_macro_runtime_suspend, wsa_macro_runtime_resume, NULL)
 };
 

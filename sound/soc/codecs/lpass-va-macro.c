@@ -1697,13 +1697,19 @@ err:
 static void va_macro_remove(struct platform_device *pdev)
 {
 	struct va_macro *va = dev_get_drvdata(&pdev->dev);
+	struct device *dev = &pdev->dev;
 
-	if (va->has_npl_clk)
-		clk_disable_unprepare(va->npl);
-
-	clk_disable_unprepare(va->mclk);
-	clk_disable_unprepare(va->dcodec);
-	clk_disable_unprepare(va->macro);
+	/* the clocks are only still held if runtime PM has not suspended us */
+	pm_runtime_disable(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	if (!pm_runtime_status_suspended(dev)) {
+		if (va->has_npl_clk)
+			clk_disable_unprepare(va->npl);
+		clk_disable_unprepare(va->mclk);
+		clk_disable_unprepare(va->dcodec);
+		clk_disable_unprepare(va->macro);
+	}
+	pm_runtime_set_suspended(dev);
 
 	lpass_macro_pds_exit(va->pds);
 }
@@ -1719,6 +1725,9 @@ static int va_macro_runtime_suspend(struct device *dev)
 		clk_disable_unprepare(va->npl);
 
 	clk_disable_unprepare(va->mclk);
+	/* release the ADSP-side LPASS core/dcodec votes last */
+	clk_disable_unprepare(va->dcodec);
+	clk_disable_unprepare(va->macro);
 
 	return 0;
 }
@@ -1728,9 +1737,30 @@ static int va_macro_runtime_resume(struct device *dev)
 	struct va_macro *va = dev_get_drvdata(dev);
 	int ret;
 
+	/*
+	 * "macro" and "dcodec" are votes to the ADSP (PRM_CMD_REQUEST_HW_RSC) to keep
+	 * LPASS core hardware powered, not ordinary clocks. Held from probe to remove
+	 * they make the AUDIO RPMh DRV block CX power collapse for the whole uptime,
+	 * suspend included. Scope them to runtime PM, as the vendor driver does.
+	 */
+	ret = clk_prepare_enable(va->macro);
+	if (ret) {
+		dev_err(va->dev, "unable to prepare macro\n");
+		return ret;
+	}
+
+	ret = clk_prepare_enable(va->dcodec);
+	if (ret) {
+		dev_err(va->dev, "unable to prepare dcodec\n");
+		clk_disable_unprepare(va->macro);
+		return ret;
+	}
+
 	ret = clk_prepare_enable(va->mclk);
 	if (ret) {
 		dev_err(va->dev, "unable to prepare mclk\n");
+		clk_disable_unprepare(va->dcodec);
+		clk_disable_unprepare(va->macro);
 		return ret;
 	}
 
@@ -1738,6 +1768,8 @@ static int va_macro_runtime_resume(struct device *dev)
 		ret = clk_prepare_enable(va->npl);
 		if (ret) {
 			clk_disable_unprepare(va->mclk);
+			clk_disable_unprepare(va->dcodec);
+			clk_disable_unprepare(va->macro);
 			dev_err(va->dev, "unable to prepare npl\n");
 			return ret;
 		}
@@ -1751,6 +1783,8 @@ static int va_macro_runtime_resume(struct device *dev)
 
 
 static const struct dev_pm_ops va_macro_pm_ops = {
+	/* a macro left runtime-ACTIVE at suspend entry would keep its votes */
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	RUNTIME_PM_OPS(va_macro_runtime_suspend, va_macro_runtime_resume, NULL)
 };
 

@@ -2389,12 +2389,19 @@ err:
 static void tx_macro_remove(struct platform_device *pdev)
 {
 	struct tx_macro *tx = dev_get_drvdata(&pdev->dev);
+	struct device *dev = &pdev->dev;
 
-	clk_disable_unprepare(tx->macro);
-	clk_disable_unprepare(tx->dcodec);
-	clk_disable_unprepare(tx->mclk);
-	clk_disable_unprepare(tx->npl);
-	clk_disable_unprepare(tx->fsgen);
+	/* the clocks are only still held if runtime PM has not suspended us */
+	pm_runtime_disable(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	if (!pm_runtime_status_suspended(dev)) {
+		clk_disable_unprepare(tx->fsgen);
+		clk_disable_unprepare(tx->npl);
+		clk_disable_unprepare(tx->mclk);
+		clk_disable_unprepare(tx->dcodec);
+		clk_disable_unprepare(tx->macro);
+	}
+	pm_runtime_set_suspended(dev);
 
 	lpass_macro_pds_exit(tx->pds);
 }
@@ -2409,6 +2416,9 @@ static int tx_macro_runtime_suspend(struct device *dev)
 	clk_disable_unprepare(tx->fsgen);
 	clk_disable_unprepare(tx->npl);
 	clk_disable_unprepare(tx->mclk);
+	/* release the ADSP-side LPASS core/dcodec votes last */
+	clk_disable_unprepare(tx->dcodec);
+	clk_disable_unprepare(tx->macro);
 
 	return 0;
 }
@@ -2418,10 +2428,28 @@ static int tx_macro_runtime_resume(struct device *dev)
 	struct tx_macro *tx = dev_get_drvdata(dev);
 	int ret;
 
+	/*
+	 * "macro" and "dcodec" are votes to the ADSP (PRM_CMD_REQUEST_HW_RSC) to keep
+	 * LPASS core hardware powered, not ordinary clocks. Held from probe to remove
+	 * they make the AUDIO RPMh DRV block CX power collapse for the whole uptime,
+	 * suspend included. Scope them to runtime PM, as the vendor driver does.
+	 */
+	ret = clk_prepare_enable(tx->macro);
+	if (ret) {
+		dev_err(dev, "unable to prepare macro\n");
+		return ret;
+	}
+
+	ret = clk_prepare_enable(tx->dcodec);
+	if (ret) {
+		dev_err(dev, "unable to prepare dcodec\n");
+		goto err_dcodec;
+	}
+
 	ret = clk_prepare_enable(tx->mclk);
 	if (ret) {
 		dev_err(dev, "unable to prepare mclk\n");
-		return ret;
+		goto err_mclk;
 	}
 
 	ret = clk_prepare_enable(tx->npl);
@@ -2444,11 +2472,17 @@ err_fsgen:
 	clk_disable_unprepare(tx->npl);
 err_npl:
 	clk_disable_unprepare(tx->mclk);
+err_mclk:
+	clk_disable_unprepare(tx->dcodec);
+err_dcodec:
+	clk_disable_unprepare(tx->macro);
 
 	return ret;
 }
 
 static const struct dev_pm_ops tx_macro_pm_ops = {
+	/* a macro left runtime-ACTIVE at suspend entry would keep its votes */
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	RUNTIME_PM_OPS(tx_macro_runtime_suspend, tx_macro_runtime_resume, NULL)
 };
 

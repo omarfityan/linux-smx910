@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/seq_file.h>
 
 #include <linux/pinctrl/pinconf-generic.h>
@@ -38,23 +39,62 @@ struct lpi_pinctrl {
 	const struct lpi_pinctrl_variant_data *data;
 };
 
+/*
+ * THE LPI TLMM REGISTERS LIVE INSIDE THE LPASS DOMAIN.
+ *
+ * This driver's "core" and "audio" clocks are votes to the ADSP asking it to keep
+ * that domain powered. They used to be taken in probe() and released only in
+ * remove(), which is why these accessors could get away with a bare ioread32():
+ * the domain was simply never allowed to collapse. That permanent vote is also
+ * what made the AUDIO RPMh DRV block CX power collapse for the entire uptime.
+ *
+ * Now that the votes are scoped to runtime PM, the domain CAN be down when a pin
+ * operation arrives, and an access to an unpowered LPASS block is a bus error --
+ * not a garbage read. So every access takes a runtime-PM reference first, exactly
+ * as the vendor driver does, and refuses the access rather than issuing it blind
+ * if the vote cannot be obtained.
+ *
+ * The gpio_chip sets can_sleep, and all callers are process context, so sleeping
+ * here is legal.
+ */
 static int lpi_gpio_read(struct lpi_pinctrl *state, unsigned int pin,
 			 unsigned int addr)
 {
 	u32 pin_offset;
+	int val, ret;
+
+	ret = pm_runtime_resume_and_get(state->dev);
+	if (ret < 0) {
+		dev_err_ratelimited(state->dev,
+				    "cannot read pin %u without the LPASS core vote\n", pin);
+		return 0;
+	}
 
 	if (state->data->flags & LPI_FLAG_USE_PREDEFINED_PIN_OFFSET)
 		pin_offset = state->data->groups[pin].pin_offset;
 	else
 		pin_offset = LPI_TLMM_REG_OFFSET * pin;
 
-	return ioread32(state->tlmm_base + pin_offset + addr);
+	val = ioread32(state->tlmm_base + pin_offset + addr);
+
+	pm_runtime_mark_last_busy(state->dev);
+	pm_runtime_put_autosuspend(state->dev);
+
+	return val;
 }
 
 static int lpi_gpio_write(struct lpi_pinctrl *state, unsigned int pin,
 			  unsigned int addr, unsigned int val)
 {
 	u32 pin_offset;
+	int ret;
+
+	ret = pm_runtime_resume_and_get(state->dev);
+	if (ret < 0) {
+		dev_err_ratelimited(state->dev,
+				    "cannot write pin %u without the LPASS core vote\n", pin);
+		return ret;
+	}
 
 	if (state->data->flags & LPI_FLAG_USE_PREDEFINED_PIN_OFFSET)
 		pin_offset = state->data->groups[pin].pin_offset;
@@ -62,6 +102,9 @@ static int lpi_gpio_write(struct lpi_pinctrl *state, unsigned int pin,
 		pin_offset = LPI_TLMM_REG_OFFSET * pin;
 
 	iowrite32(val, state->tlmm_base + pin_offset + addr);
+
+	pm_runtime_mark_last_busy(state->dev);
+	pm_runtime_put_autosuspend(state->dev);
 
 	return 0;
 }
@@ -207,6 +250,7 @@ static int lpi_config_set_slew_rate(struct lpi_pinctrl *pctrl,
 	unsigned long sval;
 	void __iomem *reg;
 	int slew_offset;
+	int ret;
 
 	if (slew > LPI_SLEW_RATE_MAX) {
 		dev_err(pctrl->dev, "invalid slew rate %u for pin: %d\n",
@@ -223,6 +267,14 @@ static int lpi_config_set_slew_rate(struct lpi_pinctrl *pctrl,
 	else
 		reg = pctrl->slew_base + LPI_SLEW_RATE_CTL_REG;
 
+	/* this touches the LPASS block directly, bypassing the accessors above */
+	ret = pm_runtime_resume_and_get(pctrl->dev);
+	if (ret < 0) {
+		dev_err_ratelimited(pctrl->dev,
+				    "cannot set slew rate without the LPASS core vote\n");
+		return ret;
+	}
+
 	mutex_lock(&pctrl->lock);
 
 	sval = ioread32(reg);
@@ -231,6 +283,9 @@ static int lpi_config_set_slew_rate(struct lpi_pinctrl *pctrl,
 	iowrite32(sval, reg);
 
 	mutex_unlock(&pctrl->lock);
+
+	pm_runtime_mark_last_busy(pctrl->dev);
+	pm_runtime_put_autosuspend(pctrl->dev);
 
 	return 0;
 }
@@ -503,6 +558,17 @@ int lpi_pinctrl_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "Can't enable clocks\n");
 
+	/*
+	 * From here the clocks -- i.e. the ADSP LPASS core/dcodec votes -- belong to
+	 * runtime PM. The device starts ACTIVE because probe() just enabled them, so
+	 * the first autosuspend releases them and the ADSP can collapse LPASS.
+	 */
+	pm_runtime_set_autosuspend_delay(dev, 3000);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
+
 	pctrl->desc.pctlops = &lpi_gpio_pinctrl_ops;
 	pctrl->desc.pmxops = &lpi_gpio_pinmux_ops;
 	pctrl->desc.confops = &lpi_gpio_pinconf_ops;
@@ -539,8 +605,11 @@ int lpi_pinctrl_probe(struct platform_device *pdev)
 	return 0;
 
 err_pinctrl:
+	pm_runtime_disable(dev);
+	pm_runtime_dont_use_autosuspend(dev);
 	mutex_destroy(&pctrl->lock);
 	clk_bulk_disable_unprepare(MAX_LPI_NUM_CLKS, pctrl->clks);
+	pm_runtime_set_suspended(dev);
 
 	return ret;
 }
@@ -549,15 +618,42 @@ EXPORT_SYMBOL_GPL(lpi_pinctrl_probe);
 void lpi_pinctrl_remove(struct platform_device *pdev)
 {
 	struct lpi_pinctrl *pctrl = platform_get_drvdata(pdev);
+	struct device *dev = &pdev->dev;
 	int i;
 
+	pm_runtime_disable(dev);
+	pm_runtime_dont_use_autosuspend(dev);
 	mutex_destroy(&pctrl->lock);
-	clk_bulk_disable_unprepare(MAX_LPI_NUM_CLKS, pctrl->clks);
+	/* only still held if runtime PM has not already released them */
+	if (!pm_runtime_status_suspended(dev))
+		clk_bulk_disable_unprepare(MAX_LPI_NUM_CLKS, pctrl->clks);
+	pm_runtime_set_suspended(dev);
 
 	for (i = 0; i < pctrl->data->npins; i++)
 		pinctrl_generic_remove_group(pctrl->ctrl, i);
 }
 EXPORT_SYMBOL_GPL(lpi_pinctrl_remove);
+
+static int lpi_pinctrl_runtime_suspend(struct device *dev)
+{
+	struct lpi_pinctrl *pctrl = dev_get_drvdata(dev);
+
+	clk_bulk_disable_unprepare(MAX_LPI_NUM_CLKS, pctrl->clks);
+
+	return 0;
+}
+
+static int lpi_pinctrl_runtime_resume(struct device *dev)
+{
+	struct lpi_pinctrl *pctrl = dev_get_drvdata(dev);
+
+	return clk_bulk_prepare_enable(MAX_LPI_NUM_CLKS, pctrl->clks);
+}
+
+EXPORT_GPL_DEV_PM_OPS(lpi_pinctrl_dev_pm_ops) = {
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	RUNTIME_PM_OPS(lpi_pinctrl_runtime_suspend, lpi_pinctrl_runtime_resume, NULL)
+};
 
 MODULE_DESCRIPTION("QTI LPI GPIO pin control driver");
 MODULE_LICENSE("GPL");
