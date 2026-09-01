@@ -280,6 +280,7 @@ struct qcom_pcie {
 	union qcom_pcie_resources res;
 	struct icc_path *icc_mem;
 	struct icc_path *icc_cpu;
+	struct icc_path *icc_cpu_keepalive;
 	const struct qcom_pcie_cfg *cfg;
 	struct dentry *debugfs;
 	struct list_head ports;
@@ -1966,6 +1967,28 @@ static int qcom_pcie_probe(struct platform_device *pdev)
 		}
 
 		pcie->use_pm_opp = true;
+
+		/*
+		 * A second, independent request on the CPU-PCIe path, so that
+		 * releasing the OPP at suspend cannot take register access with
+		 * it.  Held unconditionally rather than under the module
+		 * parameter, so that both arms of an A/B share this baseline
+		 * and the parameter remains the only variable.  1 kBps matches
+		 * what qcom_pcie_icc_init() votes on non-OPP platforms.
+		 */
+		pcie->icc_cpu_keepalive = devm_of_icc_get(dev, "cpu-pcie");
+		if (IS_ERR(pcie->icc_cpu_keepalive)) {
+			ret = PTR_ERR(pcie->icc_cpu_keepalive);
+			pcie->icc_cpu_keepalive = NULL;
+			dev_err_probe(dev, ret, "Failed to get CPU-PCIe interconnect path\n");
+			goto err_pm_runtime_put;
+		}
+
+		ret = icc_set_bw(pcie->icc_cpu_keepalive, 0, kBps_to_icc(1));
+		if (ret) {
+			dev_err_probe(dev, ret, "Failed to set CPU-PCIe keepalive bandwidth\n");
+			goto err_pm_runtime_put;
+		}
 	} else {
 		/* Skip ICC init if OPP is supported as it is handled by OPP */
 		ret = qcom_pcie_icc_init(pcie);
@@ -2045,10 +2068,34 @@ err_pm_runtime_put:
  * Default keeps the existing mainline behaviour; the knob exists so both arms of the
  * measurement share one binary and one boot.
  */
-static bool suspend_ddr_vote_zero;
-module_param(suspend_ddr_vote_zero, bool, 0644);
-MODULE_PARM_DESC(suspend_ddr_vote_zero,
-	"At system suspend vote 0 DDR bandwidth on the PCIe-MEM path instead of a 1 kBps floor, letting DDR reach self-refresh (default: 0, mainline behaviour)");
+/*
+ * At a deep (S2RAM) suspend this controller keeps requesting the link's full
+ * active DDR bandwidth, and that request is written into the RPMh sleep set, so
+ * DDR never reaches a low-power state while the AP is asleep.  Both of the
+ * driver's existing release paths miss it:
+ *
+ *   - the icc_set_bw() below is guarded on pcie->icc_mem, which is assigned
+ *     only by qcom_pcie_icc_init() -- and probe() skips that whenever an OPP
+ *     table is present, because the bandwidth is then voted by the OPP core;
+ *   - the dev_pm_opp_set_opp(dev, NULL) release further down is gated on
+ *     pm_suspend_target_state != PM_SUSPEND_MEM, so it does not run at S2RAM.
+ *
+ * Measured on SM8550 (Galaxy Tab S9 Ultra): the last RPMh flush before power
+ * down carries the DDR bandwidth BCM with a valid sleep command of ~500 MB/s
+ * peak, which is exactly this device's opp-peak-kBps for the active link speed.
+ *
+ * Releasing the OPP drops every interconnect path the OPP table describes,
+ * CPU-PCIe included -- and keeping CPU-PCIe alive is precisely what the S2RAM
+ * guard exists for, since DBI access can happen very late in S2RAM.  So the
+ * driver holds that path up independently, and only the PCIe-MEM (DDR) vote is
+ * allowed to fall.
+ *
+ * Default off: this is the behaviour change under test, not the shipped one.
+ */
+static bool suspend_ddr_release;
+module_param(suspend_ddr_release, bool, 0644);
+MODULE_PARM_DESC(suspend_ddr_release,
+	"Release the PCIe-MEM DDR bandwidth vote at S2RAM on OPP-driven platforms, holding CPU-PCIe up separately (default: 0, mainline behaviour)");
 
 static int qcom_pcie_suspend_noirq(struct device *dev)
 {
@@ -2064,17 +2111,24 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
 	 * suspend.
 	 */
 	if (pcie->icc_mem) {
-		u32 peak = suspend_ddr_vote_zero ? 0 : kBps_to_icc(1);
-
-		ret = icc_set_bw(pcie->icc_mem, 0, peak);
+		ret = icc_set_bw(pcie->icc_mem, 0, kBps_to_icc(1));
 		if (ret) {
 			dev_err(dev,
 				"Failed to set bandwidth for PCIe-MEM interconnect path: %d\n",
 				ret);
 			return ret;
 		}
-		dev_info(dev, "pcie-mem suspend vote: avg 0 peak %u\n", peak);
 	}
+
+	/*
+	 * The OPP-driven equivalent of the release above, which the guard at the
+	 * end of this function does not reach at S2RAM.  icc_cpu_keepalive holds
+	 * the CPU-PCIe path up across it; that path is tagged ACTIVE_ONLY, so it
+	 * contributes nothing to the sleep set and cannot hold DDR awake.
+	 */
+	if (suspend_ddr_release && pcie->use_pm_opp &&
+	    pm_suspend_target_state == PM_SUSPEND_MEM)
+		dev_pm_opp_set_opp(pcie->pci->dev, NULL);
 
 	/*
 	 * Turn OFF the resources only for controllers without active PCIe
