@@ -974,10 +974,11 @@
 			regulator-min-microvolt = <3104000>;
 			regulator-max-microvolt = <3104000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
-			/* PTN3222 eUSB2 repeater vdd3v3: kept on with no driver
-			 * consumer (the repeater is brought up in hardware --
-			 * see the USB section). */
-			regulator-always-on;
+			/* PTN3222 eUSB2 repeater vdd3v3.  Enabled on demand by the
+			 * ptn3222 driver's phy_init/phy_exit, which is what stock
+			 * does -- stock holds no enable vote on this rail while USB
+			 * is idle.  It was previously always-on because the repeater
+			 * had no driver; see the USB section for why that changed. */
 		};
 
 		vreg_l6b_1p8: ldo6 {
@@ -1839,24 +1840,43 @@
  * data path itself does not depend on that.
  *
  * The NXP PTN3222 eUSB2 repeater conditions the 1.2V eUSB2 signal up to 3.3V
- * USB2 for the connector, so it is electrically required. It sits on SE6 i2c
- * (@898000) -- but that SE is firmware-provisioned as UART on this device, and
- * mainline geni-i2c refuses to re-provision a non-blank SE ("Invalid proto 2"),
- * so the i2c control path is unavailable. The mainline ptn3222 driver issues
- * NO i2c transactions -- it only enables vdd3v3/vdd1v8 and deasserts the reset
- * GPIO -- so the repeater is brought up purely in hardware here: its supplies
- * are kept always-on (see vreg_l5b_3p1 below; vreg_l15b_1p8 is already
- * always-on) and its active-low RESETN (pm8550vs_d gpio4) is held deasserted
- * (driven high) by a gpio-hog. The eUSB2 phy then runs with no repeater
- * sub-phy (phys=<&ptn3222> dropped; the snps-eusb2 driver treats the repeater
- * as optional and no-ops phy_init on a NULL repeater).
+ * USB2 for the connector, so it is electrically required.  It is an i2c client
+ * at address 0x4f.
+ *
+ * This was previously brought up in hardware -- supplies pinned always-on and
+ * RESETN held deasserted by a gpio-hog -- on the belief that the repeater's i2c
+ * bus was firmware-provisioned as UART and could not be used.  That belief came
+ * from a probe of 898000.i2c which returned "Invalid proto 2", and it was the
+ * correct answer to the wrong question: 0x898000 is QUP wrapper 2 SE6, which on
+ * this device is the BLUETOOTH UART, so GENI_SE_UART (2) is exactly what it
+ * should report.
+ *
+ * The repeater is on a different serial engine.  The stock board device tree
+ * attaches eusb2_repeater@4f to qupv3_se6_i2c, which the SoC dtsi for this
+ * silicon defines as i2c@a98000 -- QUP wrapper 1 SE6, pins gpio48/gpio49.
+ * Mainline already describes that same controller, with the same register,
+ * clock and interrupt, as &i2c6.  The two buses share only the label fragment
+ * "se6".
+ *
+ * So the repeater is driven the way it was designed to be.  &i2c6 is enabled
+ * below and the device is instantiated on it; the ptn3222 driver issues no i2c
+ * transactions of its own, but it must bind as an i2c client to exist at all.
+ * Binding it is what buys the power management: phy_init enables vdd3v3/vdd1v8
+ * and deasserts RESETN, phy_exit reverses both, so the repeater is powered only
+ * while USB is in use -- matching stock, which holds no enable vote on
+ * vreg_l5b_3p1 while the port is idle.  phys=<&ptn3222> is restored on the
+ * eUSB2 phy so the phy core actually calls those.
  */
-&pm8550vs_d_gpios {
-	ptn3222_reset_deassert: ptn3222-reset-hog {
-		gpio-hog;
-		gpios = <4 GPIO_ACTIVE_HIGH>;
-		output-high;
-		line-name = "ptn3222-resetn-deassert";
+&i2c6 {
+	status = "okay";
+
+	ptn3222: redriver@4f {
+		compatible = "nxp,ptn3222";
+		reg = <0x4f>;
+		#phy-cells = <0>;
+		vdd3v3-supply = <&vreg_l5b_3p1>;
+		vdd1v8-supply = <&vreg_l15b_1p8>;
+		reset-gpios = <&pm8550vs_d_gpios 4 GPIO_ACTIVE_LOW>;
 	};
 };
 
@@ -1889,6 +1909,10 @@
 &usb_1_hsphy {
 	vdd-supply = <&vreg_l1e_0p88>;
 	vdda12-supply = <&vreg_l3e_1p2>;
+	/* The repeater sub-phy.  snps-eusb2 takes it as optional and no-ops
+	 * phy_init on a NULL repeater, which is what it did while the
+	 * repeater had no driver. */
+	phys = <&ptn3222>;
 	status = "okay";
 };
 
