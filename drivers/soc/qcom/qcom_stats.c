@@ -33,12 +33,28 @@
 #define DDR_STATS_NUM_MODES_ADDR	0x4
 #define DDR_STATS_ENTRY_START_ADDR	0x8
 
+/*
+ * The AOP keeps a per-DRV DDR vote book in the same MSG RAM window, immediately
+ * after the LPM/Freq entries. It is populated ONLY in response to an explicit
+ * QMP request, so it must be asked for on every read -- an unrequested read is
+ * indistinguishable from "no DRV votes DDR".
+ * Layout and constants from the vendor's own reader,
+ * msm-kernel/drivers/soc/qcom/soc_sleep_stats.c ddr_stats_get_ss_vote_info(),
+ * and the port count from kalama.dtsi's `qcom,drv-max`.
+ */
+#define DDR_STATS_DRV_MAX		0x14
+#define DDR_STATS_DRV_ABSENT		0xdeaddead
+#define DDR_STATS_DRV_INVALID		0xffffdead
+#define DDR_STATS_VOTE_MASK		0x3fff
+#define DDR_STATS_VOTE_X_SHIFT		14
+
 #define DDR_STATS_CP_IDX(data)		FIELD_GET(GENMASK(4, 0), data)
 #define DDR_STATS_LPM_NAME(data)	FIELD_GET(GENMASK(7, 0), data)
 #define DDR_STATS_TYPE(data)		FIELD_GET(GENMASK(15, 8), data)
 #define DDR_STATS_FREQ(data)		FIELD_GET(GENMASK(31, 16), data)
 
 static struct qmp *qcom_stats_qmp;
+static u32 qcom_stats_ddr_drv_max;
 
 struct subsystem_data {
 	const char *name;
@@ -65,6 +81,7 @@ static const struct subsystem_data subsystems[] = {
 struct stats_config {
 	size_t stats_offset;
 	size_t ddr_stats_offset;
+	u32 ddr_drv_max;
 	size_t num_records;
 	bool appended_stats_avail;
 	bool dynamic_offset;
@@ -222,9 +239,68 @@ static int qcom_ddr_stats_show(struct seq_file *s, void *d)
 	return 0;
 }
 
+/*
+ * Who does the AOP think is voting for DDR bandwidth? The apps side answers only
+ * for itself; this answers for all `drv_max` voting ports, out of the AOP's own
+ * book. `ab`/`ib` are the average and instantaneous bandwidth votes.
+ *
+ * The two sentinel values are the instrument's positive control: a port the AOP
+ * does not implement reads ABSENT. An all-zero array with NO sentinel means the
+ * AOP did not answer, and must not be read as "nobody votes".
+ */
+static int qcom_ddr_drv_votes_show(struct seq_file *s, void *d)
+{
+	void __iomem *reg = (void __iomem *)s->private;
+	int i, ret, sentinels = 0, nonzero = 0;
+	size_t vote_offset;
+	u32 entry_count, w;
+
+	if (!qcom_stats_qmp)
+		return -ENODEV;
+	if (!qcom_stats_ddr_drv_max)
+		return -EOPNOTSUPP;
+
+	entry_count = readl_relaxed(reg + DDR_STATS_NUM_MODES_ADDR);
+	if (!entry_count || entry_count > DDR_STATS_MAX_NUM_MODES)
+		return -EINVAL;
+
+	ret = qmp_send(qcom_stats_qmp, "{class: ddr, res: drvs_ddr_votes}");
+	if (ret)
+		return ret;
+
+	vote_offset = DDR_STATS_ENTRY_START_ADDR +
+		      entry_count * sizeof(struct ddr_stats_entry);
+
+	seq_printf(s, "entry_count:%u\tvote_offset:0x%zx\tdrv_max:%u\n",
+		   entry_count, vote_offset, qcom_stats_ddr_drv_max);
+
+	for (i = 0; i < qcom_stats_ddr_drv_max; i++) {
+		w = readl_relaxed(reg + vote_offset + i * sizeof(u32));
+		if (w)
+			nonzero++;
+
+		if (w == DDR_STATS_DRV_ABSENT) {
+			sentinels++;
+			seq_printf(s, "DRV %2d:\traw:0x%08x\tABSENT\n", i, w);
+		} else if (w == DDR_STATS_DRV_INVALID) {
+			sentinels++;
+			seq_printf(s, "DRV %2d:\traw:0x%08x\tINVALID\n", i, w);
+		} else {
+			seq_printf(s, "DRV %2d:\traw:0x%08x\tab:%u\tib:%u\n", i, w,
+				   (w >> DDR_STATS_VOTE_X_SHIFT) & DDR_STATS_VOTE_MASK,
+				   w & DDR_STATS_VOTE_MASK);
+		}
+	}
+
+	seq_printf(s, "sentinels:%d\tnonzero:%d\n", sentinels, nonzero);
+
+	return 0;
+}
+
 DEFINE_SHOW_ATTRIBUTE(qcom_soc_sleep_stats);
 DEFINE_SHOW_ATTRIBUTE(qcom_subsystem_sleep_stats);
 DEFINE_SHOW_ATTRIBUTE(qcom_ddr_stats);
+DEFINE_SHOW_ATTRIBUTE(qcom_ddr_drv_votes);
 
 static void qcom_create_ddr_stat_files(struct dentry *root, void __iomem *reg,
 				       const struct stats_config *config)
@@ -235,10 +311,18 @@ static void qcom_create_ddr_stat_files(struct dentry *root, void __iomem *reg,
 		return;
 
 	key = readl_relaxed(reg + config->ddr_stats_offset + DDR_STATS_MAGIC_KEY_ADDR);
-	if (key == DDR_STATS_MAGIC_KEY)
-		debugfs_create_file("ddr_stats", 0400, root,
+	if (key != DDR_STATS_MAGIC_KEY)
+		return;
+
+	debugfs_create_file("ddr_stats", 0400, root,
+			    (__force void *)reg + config->ddr_stats_offset,
+			    &qcom_ddr_stats_fops);
+
+	qcom_stats_ddr_drv_max = config->ddr_drv_max;
+	if (qcom_stats_ddr_drv_max)
+		debugfs_create_file("ddr_drv_votes", 0400, root,
 				    (__force void *)reg + config->ddr_stats_offset,
-				    &qcom_ddr_stats_fops);
+				    &qcom_ddr_drv_votes_fops);
 }
 
 static void qcom_create_soc_sleep_stat_files(struct dentry *root, void __iomem *reg,
@@ -387,6 +471,7 @@ static const struct stats_config rpmh_data_sdm845 = {
 static const struct stats_config rpmh_data = {
 	.stats_offset = 0x48,
 	.ddr_stats_offset = 0xb8,
+	.ddr_drv_max = DDR_STATS_DRV_MAX,
 	.num_records = 3,
 	.appended_stats_avail = false,
 	.dynamic_offset = false,
