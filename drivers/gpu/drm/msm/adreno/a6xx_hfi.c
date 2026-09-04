@@ -4,6 +4,7 @@
 #include <linux/completion.h>
 #include <linux/circ_buf.h>
 #include <linux/list.h>
+#include <linux/moduleparam.h>
 
 #include <soc/qcom/cmd-db.h>
 #include <soc/qcom/tcs.h>
@@ -919,14 +920,102 @@ int a6xx_hfi_set_freq(struct a6xx_gmu *gmu, u32 freq_index, u32 bw_index)
 		sizeof(msg), NULL, 0);
 }
 
+/*
+ * What the GPU should hold on the DDR port while it sleeps.
+ *
+ * Upstream sends zero for both fields and says so in a TODO. This chip's own
+ * vendor driver does not: adreno_gen7_gmu.c:1439 sends a computed slumber
+ * level, .bw taken from the bus_freq of the DT's qcom,initial-pwrlevel. Index 0
+ * is the "off" entry in both of the GMU's tables -- a6xx_gmu_build_bw_table()
+ * and a6xx_gmu_build_freq_table() install a zero at [0] ahead of the ascending
+ * OPP entries -- so upstream is asking the GMU to release the vote outright.
+ *
+ * These are knobs rather than a hardcoded value so that the control arm (0/0,
+ * identical to upstream) and any test arm share ONE binary, and so the level
+ * can be swept without a reflash. The defaults preserve upstream behaviour
+ * exactly.
+ */
+static int slumber_bw_index;
+module_param(slumber_bw_index, int, 0600);
+MODULE_PARM_DESC(slumber_bw_index,
+	"DDR bandwidth level for the GPU to hold at slumber (0 = release, the upstream default)");
+
+static int slumber_freq_index;
+module_param(slumber_freq_index, int, 0600);
+MODULE_PARM_DESC(slumber_freq_index,
+	"GPU frequency level to request at slumber (0 = off, the upstream default)");
+
+/*
+ * Read-only witnesses of what was actually put on the wire. Without these, an
+ * index silently clamped away -- nr_gpu_bws is zero on parts with no .bcms --
+ * would look exactly like firmware declining to act on the field, and a broken
+ * instrument would be graded as a result.
+ */
+static int slumber_sent_bw = -1;
+module_param(slumber_sent_bw, int, 0444);
+MODULE_PARM_DESC(slumber_sent_bw,
+	"read-only: bw index on the wire at the last PREPARE_SLUMBER (-1 = never sent)");
+
+static int slumber_sent_freq = -1;
+module_param(slumber_sent_freq, int, 0444);
+MODULE_PARM_DESC(slumber_sent_freq,
+	"read-only: freq index on the wire at the last PREPARE_SLUMBER (-1 = never sent)");
+
+static int slumber_sent_ret = -1;
+module_param(slumber_sent_ret, int, 0444);
+MODULE_PARM_DESC(slumber_sent_ret,
+	"read-only: return code of the last PREPARE_SLUMBER send (0 = accepted)");
+
+/*
+ * PREPARE_SLUMBER's bw field cannot ask for the off level in a way that is
+ * distinguishable from asking for nothing: upstream already sends index 0 and
+ * the port keeps its level. The one message the GMU demonstrably acts on is
+ * GX_BW_PERF_VOTE, and index 0 is a legitimate value there -- a6xx_gmu_set_freq()
+ * has an explicit !bw_index branch. So the only identified route to releasing
+ * the vote is to issue that vote at the off level while the GMU is still up,
+ * immediately before telling it to slumber.
+ *
+ * Off by default, and a module parameter rather than a build-time choice so a
+ * reboot restores the default on its own -- no reflash is needed to back out.
+ */
+static int slumber_release_bw;
+module_param(slumber_release_bw, int, 0600);
+MODULE_PARM_DESC(slumber_release_bw,
+	"before slumbering, vote the off DDR level via GX_BW_PERF_VOTE (0 = do not, the upstream behaviour)");
+
+static int slumber_release_ret = -2;
+module_param(slumber_release_ret, int, 0444);
+MODULE_PARM_DESC(slumber_release_ret,
+	"read-only: return code of the last release vote (-2 = never attempted)");
+
 int a6xx_hfi_send_prep_slumber(struct a6xx_gmu *gmu)
 {
 	struct a6xx_hfi_prep_slumber_cmd msg = { 0 };
+	int ret;
 
-	/* TODO: should freq and bw fields be non-zero ? */
+	if (slumber_release_bw && gmu->nr_gpu_bws > 1)
+		slumber_release_ret = a6xx_hfi_set_freq(gmu,
+				gmu->current_perf_index, 0);
 
-	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_PREPARE_SLUMBER, &msg,
+	/* Clamped against the tables the GMU was actually handed, so a bad
+	 * write to a knob can never put an out-of-range index on the wire.
+	 */
+	if (gmu->nr_gpu_bws > 1)
+		msg.bw = clamp(slumber_bw_index, 0, gmu->nr_gpu_bws - 1);
+	if (gmu->nr_gpu_freqs > 1)
+		msg.freq = clamp(slumber_freq_index, 0, gmu->nr_gpu_freqs - 1);
+
+	ret = a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_PREPARE_SLUMBER, &msg,
 		sizeof(msg), NULL, 0);
+
+	/* Recorded after the send, with its return code, so a message that was
+	 * rejected cannot be read back as one that landed.
+	 */
+	slumber_sent_bw = msg.bw;
+	slumber_sent_freq = msg.freq;
+	slumber_sent_ret = ret;
+
+	return ret;
 }
 
 static int a6xx_hfi_start_v1(struct a6xx_gmu *gmu, int boot_state)
