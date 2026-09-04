@@ -240,6 +240,32 @@ static int qcom_ddr_stats_show(struct seq_file *s, void *d)
 }
 
 /*
+ * DRV names are SoC-specific and positional: index i names the port whose word
+ * sits at offset i of the vote book. Verbatim from the vendor's own
+ * drv_names_kalama[] (msm-kernel drivers/soc/qcom/sys_pm_vx.c) -- SM8550 is
+ * "kalama". Printed with each row so a capture is self-describing: the row and
+ * the name it belongs to must never live in two different files again.
+ */
+static const char * const ddr_drv_names_sm8550[] = {
+	"TZ", "HYP", "HLOS", "L3", "SECPROC", "AUDIO", "AOP", "DEBUG",
+	"GPU", "DISPLAY", "COMPUTE_DSP", "TME_SW", "TME_HW", "MDM SW",
+	"MDM HW", "WLAN RF", "WLAN BB", "CAM_IFE0", "CAM_IFE1", "CAM_IFE2",
+	"DDR AUX", "ARC CPRF",
+};
+
+/*
+ * The board's `qcom,drv-max` is 20, so the vendor reads ports 0-19 and the two
+ * ports the name table ends with -- "DDR AUX" (20) and "ARC CPRF" (21) -- fall
+ * outside the book by construction. DDR AUX is the port this project has spent
+ * the longest staring at, so read a few words past the end as well. Those words
+ * are NOT part of the vendor's contract: they may be the AOP's own continuation
+ * of the book, or they may be whatever else lives next in MSG RAM. They are
+ * printed as BEYOND, excluded from the counters, and prove nothing on their own
+ * -- the point is to see whether they carry vote-shaped words at all.
+ */
+#define DDR_STATS_DRV_PROBE_EXTRA	4
+
+/*
  * Who does the AOP think is voting for DDR bandwidth? The apps side answers only
  * for itself; this answers for all `drv_max` voting ports, out of the AOP's own
  * book. `ab`/`ib` are the average and instantaneous bandwidth votes.
@@ -274,25 +300,41 @@ static int qcom_ddr_drv_votes_show(struct seq_file *s, void *d)
 	seq_printf(s, "entry_count:%u\tvote_offset:0x%zx\tdrv_max:%u\n",
 		   entry_count, vote_offset, qcom_stats_ddr_drv_max);
 
-	for (i = 0; i < qcom_stats_ddr_drv_max; i++) {
+	for (i = 0; i < qcom_stats_ddr_drv_max + DDR_STATS_DRV_PROBE_EXTRA; i++) {
+		const char *name = i < ARRAY_SIZE(ddr_drv_names_sm8550) ?
+				   ddr_drv_names_sm8550[i] : "?";
+		bool in_book = i < qcom_stats_ddr_drv_max;
+
 		w = readl_relaxed(reg + vote_offset + i * sizeof(u32));
-		if (w)
+
+		/*
+		 * Counters cover the vendor's book only, so they stay directly
+		 * comparable with captures taken before the probe existed.
+		 */
+		if (in_book && w)
 			nonzero++;
 
 		if (w == DDR_STATS_DRV_ABSENT) {
-			sentinels++;
-			seq_printf(s, "DRV %2d:\traw:0x%08x\tABSENT\n", i, w);
+			if (in_book)
+				sentinels++;
+			seq_printf(s, "DRV %2d %-12s raw:0x%08x\tABSENT%s\n",
+				   i, name, w, in_book ? "" : "\tBEYOND");
 		} else if (w == DDR_STATS_DRV_INVALID) {
-			sentinels++;
-			seq_printf(s, "DRV %2d:\traw:0x%08x\tINVALID\n", i, w);
+			if (in_book)
+				sentinels++;
+			seq_printf(s, "DRV %2d %-12s raw:0x%08x\tINVALID%s\n",
+				   i, name, w, in_book ? "" : "\tBEYOND");
 		} else {
-			seq_printf(s, "DRV %2d:\traw:0x%08x\tab:%u\tib:%u\n", i, w,
+			seq_printf(s, "DRV %2d %-12s raw:0x%08x\tab:%u\tib:%u%s\n",
+				   i, name, w,
 				   (w >> DDR_STATS_VOTE_X_SHIFT) & DDR_STATS_VOTE_MASK,
-				   w & DDR_STATS_VOTE_MASK);
+				   w & DDR_STATS_VOTE_MASK,
+				   in_book ? "" : "\tBEYOND");
 		}
 	}
 
-	seq_printf(s, "sentinels:%d\tnonzero:%d\n", sentinels, nonzero);
+	seq_printf(s, "sentinels:%d\tnonzero:%d\t(over ports 0-%u; BEYOND rows excluded)\n",
+		   sentinels, nonzero, qcom_stats_ddr_drv_max - 1);
 
 	return 0;
 }
