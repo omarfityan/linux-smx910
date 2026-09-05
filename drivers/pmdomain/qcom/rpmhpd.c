@@ -847,12 +847,51 @@ static int rpmhpd_send_corner(struct rpmhpd *pd, int state,
 		return rpmh_write_async(pd->dev, state, &cmd, 1);
 }
 
+/*
+ * Release the rail's corner in the SLEEP set, instead of carrying the active
+ * corner into it.
+ *
+ * WHAT THIS TESTS. rpmh.c's is_req_valid() requires sleep_val != wake_val and
+ * rpmh_flush() silently skips any cached request that fails it. For a domain
+ * that is not active_only, to_active_sleep() sets the sleep corner equal to the
+ * active corner, so as soon as anything holds a nonzero corner the two match and
+ * the request is dropped -- the AOP is never asked to lower the rail at sleep.
+ *
+ * Measured on this device (SM8550, Galaxy Tab S9 Ultra) by tracing
+ * rpmh:rpmh_send_msg across a deep suspend with both DDR votes released and the
+ * Bluetooth UART's CX pin released: 388 ARC commands in the [active] bracket and
+ * ZERO in [sleep] or [wake], while BCM interconnect resources appear in all
+ * three. cx.lvl is written with the level index only while awake. cxsd and aosd
+ * have read 0 across every arm ever run.
+ *
+ * Every active-only peer is empty here -- cx_ao, mx_ao, mxc_ao and mmcx_ao each
+ * have zero devices -- while cx carries ten consumers, so nothing ever supplies
+ * the differing value the peer split exists to provide. The device's own
+ * downstream kernel carries an identical is_req_valid() and an identical
+ * to_active_sleep(), and reaches cxsd 727 times, so the rule is not the
+ * difference; its device tree attaches these devices to no rail domain at all.
+ *
+ * Default off, and runtime-writable, so both arms of the measurement share one
+ * binary and one boot. It is consulted when a corner is next aggregated, so a
+ * corner has to MOVE after the knob is set for it to take effect -- setting it
+ * against an idle domain changes nothing until something votes.
+ *
+ * 🔴 HAZARD. This lowers every non-active_only rail in the sleep set, so a
+ * consumer that genuinely needs its rail held across suspend would lose it and
+ * fail on resume. That is why it defaults off: a wedge is cleared by a reboot
+ * rather than a reflash.
+ */
+static bool release_sleep_corner;
+module_param(release_sleep_corner, bool, 0644);
+MODULE_PARM_DESC(release_sleep_corner,
+	"Vote corner 0 in the RPMh sleep set for domains that are not active-only, so the request is not dropped for having sleep == wake (default: 0, mainline behaviour)");
+
 static void to_active_sleep(struct rpmhpd *pd, unsigned int corner,
 			    unsigned int *active, unsigned int *sleep)
 {
 	*active = corner;
 
-	if (pd->active_only)
+	if (pd->active_only || release_sleep_corner)
 		*sleep = 0;
 	else
 		*sleep = *active;
