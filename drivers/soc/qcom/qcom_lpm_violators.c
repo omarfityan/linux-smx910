@@ -55,17 +55,46 @@
  * dur=1000/flush=10 the record timestamps are 192,000,000 ticks apart, which is
  * 10.000000 s at the 19.2 MHz XO, uniform to +/-2 ticks over 17 intervals.
  *
- * Usage:
- *      echo bcm_resc_high > /sys/kernel/debug/qcom_lpm_violators/type
- *      echo 1000 > /sys/kernel/debug/qcom_lpm_violators/dur_ms  # AOP sample period
- *      echo 10   > /sys/kernel/debug/qcom_lpm_violators/flush   # samples per record
- *      echo 1 > /sys/kernel/debug/qcom_lpm_violators/monitor   # arm the AOP
- *      ... let the system go idle / suspend ...
- *      cat   /sys/kernel/debug/qcom_lpm_violators/violators    # read the log
+ * *** ACROSS A SUSPEND THE AOP KEEPS 'flush' AND DROPS 'dur'. ***
+ * The paragraph above describes an AWAKE window. Measured on three arms (two sleep
+ * modes, two suspend lengths): any window containing a suspend comes back at
+ * dur=10 -- the AOP's own default -- while 'flush' is honoured exactly. So the
+ * record period across a suspend is 10 x flush ms, NOT dur x flush.
+ *
+ * That makes 'flush' the only knob that sizes a suspend window, and the ring is
+ * 36 records deep:
+ *
+ *      flush=10    ->  100 ms/record  ->   3.6 s window   (cannot reach a suspend)
+ *      flush=255   ->  2.55 s/record  ->  89.25 s window  (holds a full 20 s cycle)
+ *
+ * !! 'Duration (ms)' in the header is NOT a report of the live rate. It is decoded
+ * from the AOP's own message RAM and still reads the requested 1000 while records
+ * are 100 ms apart, so 'Record Period' -- computed from it -- is wrong by the same
+ * factor. Verify the period from the timestamp step, or by counting records against
+ * a wall clock. Never from either header field.
+ *
+ * Usage -- the recipe that reaches a suspend:
+ *      echo cxpc > /sys/kernel/debug/qcom_lpm_violators/type
+ *      echo 1000 > /sys/kernel/debug/qcom_lpm_violators/dur_ms  # awake period only
+ *      echo 255  > /sys/kernel/debug/qcom_lpm_violators/flush   # THIS sizes the window
+ *      echo 1 > /sys/kernel/debug/qcom_lpm_violators/monitor   # arm; this CLEARS the ring
+ *      ... suspend, and keep the whole arm-to-read span under the window ...
+ *      cat   /sys/kernel/debug/qcom_lpm_violators/violators    # read BEFORE disarming
  *      echo 0 > /sys/kernel/debug/qcom_lpm_violators/monitor   # disarm
  *
+ * Read the window BEFORE disarming: a disarm sends a further log_once message that
+ * zeroes the window and writes a record at the AOP's 10 ms default.
+ *
+ * A ring that comes back short of 'Max Log Entries' is the good case -- it never
+ * wrapped, so it is gapless from the arm and nothing was overwritten. A full ring
+ * holds only the most recent window and its head is unobserved.
+ *
+ * Vote cells are counts capped at 'flush', so a cell above 10 proves 'flush' was
+ * honoured, independently of any header field or timestamp arithmetic.
+ *
  * type/dur_ms/flush/ts_adj take effect at the next arm; they are the AOP's settings,
- * not ours, and only an arm message conveys them.
+ * not ours, and only an arm message conveys them. 'dur' additionally does not
+ * survive a suspend, per the note above.
  *
  * mainline's qmp_send() formats into a 64-byte buffer (QMP_MSG_LEN) where the vendor
  * driver uses 96 (MAX_QMP_MSG_SIZE). Four of the seven type tokens do not fit
