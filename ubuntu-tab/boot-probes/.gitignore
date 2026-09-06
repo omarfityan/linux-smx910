@@ -1,0 +1,13 @@
+# Samsung proprietary firmware blobs staged for boot probes — NEVER commit.
+#
+# These are extracted from the device's own firmware and are redistributable to
+# nobody. They live here because the probe initramfs needs them at build time,
+# not because they belong in history.
+#
+# This rule exists because a `git add -A` run from inside the kernel tree staged
+# 8.3 MB of them (a740_sqe.fw, a740_zap.mbn, regulatory.db) in one go. It was
+# caught by reading the staged list before committing — which is not a control,
+# it is luck. The parent repo's .gitignore has a "Firmware blobs — Samsung
+# proprietary, NEVER commit" block, but its rules do not reach inside this
+# nested repository, so the policy was unenforced exactly here.
+firmware/
