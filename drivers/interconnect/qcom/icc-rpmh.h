@@ -121,6 +121,10 @@ struct qcom_icc_node {
  * @aux_data: auxiliary data used when calculating threshold values and
  * communicating with RPMh
  * @list: used to link to other bcms when compiling lists for commit
+ * @vote_active_only: this BCM signals "a master is actively using the resource",
+ *	which is false by construction once the AP is asleep. Its vote must not be
+ *	carried into the sleep set: the sleep bucket is forced to zero so the AOP
+ *	sees the flag withdrawn rather than stuck at its last active value.
  * @ws_list: used to keep track of bcms that may transition between wake/sleep
  * @num_nodes: total number of @num_nodes
  * @nodes: list of qcom_icc_nodes that this BCM encapsulates
@@ -135,6 +139,7 @@ struct qcom_icc_bcm {
 	u32 enable_mask;
 	bool dirty;
 	bool keepalive;
+	bool vote_active_only;
 	struct bcm_db aux_data;
 	struct list_head list;
 	struct list_head ws_list;

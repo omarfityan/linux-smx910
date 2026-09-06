@@ -86,6 +86,23 @@ static void bcm_aggregate_mask(struct qcom_icc_bcm *bcm)
 		bcm->vote_y[QCOM_ICC_BUCKET_AMC] = bcm->enable_mask;
 		bcm->vote_y[QCOM_ICC_BUCKET_WAKE] = bcm->enable_mask;
 	}
+
+	/*
+	 * An active-only enable flag must be withdrawn for the sleep set.
+	 * Consumers that do not pass a tag are aggregated with
+	 * QCOM_ICC_TAG_ALWAYS, which credits identical bandwidth to the wake and
+	 * sleep buckets. Because an enable_mask BCM quantises any nonzero bucket
+	 * to the same constant, its wake and sleep votes then come out equal --
+	 * and qcom_icc_bcm_voter_commit() emits wake/sleep commands only for BCMs
+	 * whose two votes DIFFER. The flag is therefore never written to the
+	 * sleep TCS at all, and the AOP keeps replaying the last active value
+	 * (asserted) for the whole time the AP is asleep.
+	 */
+	if (bcm->vote_active_only) {
+		pr_info_once("bcm-voter: active-only BCM sleep-set vote cleared\n");
+		bcm->vote_x[QCOM_ICC_BUCKET_SLEEP] = 0;
+		bcm->vote_y[QCOM_ICC_BUCKET_SLEEP] = 0;
+	}
 }
 
 static void bcm_aggregate(struct qcom_icc_bcm *bcm)

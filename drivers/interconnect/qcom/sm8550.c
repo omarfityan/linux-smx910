@@ -1065,6 +1065,7 @@ static struct qcom_icc_node qns_gemnoc_sf = {
 static struct qcom_icc_bcm bcm_acv = {
 	.name = "ACV",
 	.enable_mask = 0x8,
+	.vote_active_only = true,
 	.num_nodes = 1,
 	.nodes = { &ebi },
 };
