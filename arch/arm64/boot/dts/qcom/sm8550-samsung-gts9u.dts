@@ -2748,7 +2748,7 @@
  * refutes the hypothesis; each would be a new, separate holder to chase.
  */
 &remoteproc_cdsp {
-	status = "okay";
+	status = "disabled";
 	firmware-name = "qcom/sm8550/samsung/gts9u/cdsp.mdt",
 			"qcom/sm8550/samsung/gts9u/cdsp_dtb.mdt";
 };
@@ -2813,7 +2813,7 @@
  * /reserved-memory notes above as matching this device's live stock value.
  */
 &remoteproc_mpss {
-	status = "okay";
+	status = "disabled";
 	firmware-name = "qcom/sm8550/samsung/gts9u/modem.mdt",
 			"qcom/sm8550/samsung/gts9u/modem_dtb.mdt";
 };
