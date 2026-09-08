@@ -1584,9 +1584,35 @@
  * fragment@19) and agree with the sm8550-qrd reference (gpio25 IRQ /
  * gpio24 reset / avdd = L14B). Mainline goodix_berlin_i2c binds
  * "goodix,gt9916"; firmware is factory-flashed in-IC (no request_firmware).
- * vddio (downstream iovdd = L12B) is omitted to match qrd — that rail is
- * already kept always-on for the panel, so the driver's dummy regulator
- * suffices.
+ *
+ * vddio = L12B, and it is DECLARED here rather than left to the dummy
+ * regulator. The previous note said the omission matched qrd and that the
+ * driver's dummy sufficed "because that rail is already kept always-on for the
+ * panel". That was true in effect and circular in reasoning: the rail is
+ * always-on precisely because nothing declares it, so the omission is what
+ * makes the always-on permanent. The device's own stock device tree names
+ * L12B's consumers explicitly --
+ *
+ *   L12B = goodix-berlin@5d:iovdd-supply
+ *          qcom,dsi-display-primary:vddio-supply
+ *          qcom,dsi-display-secondary:vddio-supply
+ *          regulator-ocp-notifier:periph-1cc-supply
+ *
+ * -- so the touchscreen's iovdd IS this rail, and the driver asks for it by
+ * name (goodix_berlin_core.c: devm_regulator_get(dev, "vddio")). Declaring it
+ * replaces a silent "supply vddio not found, using dummy regulator" with a real
+ * supply relationship, and makes goodix_berlin_suspend()'s power_off actually
+ * release a reference on the rail it is really using.
+ *
+ * ⚠️ regulator-always-on is deliberately KEPT on L12B for now. Stock also names
+ * the rail as the DSI display's vddio, and our panel driver requests only a
+ * single "power" supply (panel-samsung-ana38407-amsa46as02.c: ana38407_supplies
+ * = { "power" }), so the panel cannot yet hold this rail itself. Removing the
+ * flag before the panel declares it would drop VDDIO out from under the display.
+ * That is a separate change and must not be bundled with this one.
+ *
+ * This edit cannot strand the panel: a consumer's enable/disable moves the
+ * reference count above the always-on floor and never below it.
  */
 &i2c4 {
 	status = "okay";
@@ -1601,6 +1627,7 @@
 		reset-gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
 
 		avdd-supply = <&vreg_l14b_3p2>;
+		vddio-supply = <&vreg_l12b_1p8>;
 
 		pinctrl-names = "default";
 		pinctrl-0 = <&ts_irq>, <&ts_reset>;
