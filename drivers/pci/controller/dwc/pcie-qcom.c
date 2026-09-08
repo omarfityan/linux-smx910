@@ -2065,8 +2065,8 @@ err_pm_runtime_put:
  * plain idle), so retagging withdraws DDR from a bus master that can DMA autonomously
  * while the AP merely idles. That was measured to hard-stop this device.
  *
- * Default keeps the existing mainline behaviour; the knob exists so both arms of the
- * measurement share one binary and one boot.
+ * The knob exists so both arms of the measurement share one binary and one boot.
+ * It now DEFAULTS ON -- see the rationale above the definition.
  */
 /*
  * At a deep (S2RAM) suspend this controller keeps requesting the link's full
@@ -2090,12 +2090,38 @@ err_pm_runtime_put:
  * driver holds that path up independently, and only the PCIe-MEM (DDR) vote is
  * allowed to fall.
  *
- * Default off: this is the behaviour change under test, not the shipped one.
+ * DEFAULT ON, and the reason it changed.
+ *
+ * This was "default off: the behaviour change under test, not the shipped one",
+ * which was right while it was a hypothesis.  It is no longer one.  With it
+ * armed, this device reached all three SoC low-power states -- ddr, aosd and
+ * cxsd -- and HELD THEM for a 12 h window at ~100 % residency (43200.7 s of a
+ * 43201 s sleep, 18 entries across 3 suspends).  Without it, every one of those
+ * counters had read 0 in every session ever recorded.
+ *
+ * It is a module parameter, so it reset to N on every reboot: the measured
+ * behaviour was NOT the shipped behaviour, and a normal boot silently kept a
+ * device that could not reach deep sleep.  Defaulting it on closes that gap.
+ *
+ * WHAT THIS IS NOT.  It is not the correct long-term fix, and it should be
+ * removed when that lands.  Mainline never registers a sleep vote for these
+ * BCMs at all: bcm-voter.c only commits a BCM when its wake and sleep votes
+ * differ, and rpmh.c's is_req_valid() independently drops any cached request
+ * whose sleep and wake values match -- or whose wake was never written.  The
+ * vendor's own driver sidesteps both by registering a zero-bandwidth sleep vote
+ * PAIRED with a different wake value at probe (dcvs_fp.c:199 and :207).  Until
+ * mainline does something equivalent, releasing the vote here is the only lever
+ * this platform has.
+ *
+ * NOT YET ESTABLISHED, said plainly so nobody infers it: whether this saves
+ * MILLIAMPS.  The 12 h window that proved the residency measured 62 mA, and no
+ * control arm without the release has ever been run, so the deep-sleep states
+ * are demonstrated and the power benefit is not.
  */
-static bool suspend_ddr_release;
+static bool suspend_ddr_release = true;
 module_param(suspend_ddr_release, bool, 0644);
 MODULE_PARM_DESC(suspend_ddr_release,
-	"Release the PCIe-MEM DDR bandwidth vote at S2RAM on OPP-driven platforms, holding CPU-PCIe up separately (default: 0, mainline behaviour)");
+	"Release the PCIe-MEM DDR bandwidth vote at S2RAM on OPP-driven platforms, holding CPU-PCIe up separately (default: 1; set 0 for stock mainline behaviour)");
 
 static int qcom_pcie_suspend_noirq(struct device *dev)
 {
