@@ -221,6 +221,54 @@
 	qcom,msm-id = <0x218 0x20000 0x207 0x20000 0x207 0x10000 0x218 0x10000>;
 	qcom,board-id = <0x10008 0x03>;
 
+	/*
+	 * WHICH DEVICE TREE IS ON THIS DEVICE -- answered in one line.
+	 *
+	 * The device tree does NOT live in boot.img on this device; it lives in
+	 * vendor_boot. So a kernel-only flash (repack-boot.sh -> sda21) leaves the
+	 * running tree completely untouched, and `uname -r` reports the Image's
+	 * release string, which does not track the tree at all. A session lost real
+	 * time discovering the running tree was two commits behind the source, and
+	 * detecting it required comparing node presence by hand, node by node.
+	 *
+	 *     cat /proc/device-tree/ubuntu-tab,dt-revision
+	 *
+	 * The value is written into the COMPILED dtb by
+	 * utilities/kernel/stamp-dtb-revision.sh, using the kernel's own
+	 * scripts/setlocalversion -- the SAME generator that produces `uname -r`.
+	 * Using that generator rather than re-deriving the format is the point: the
+	 * two strings cannot drift apart, so they compare literally.
+	 *
+	 *     uname -r                                      7.0.6-...-00254-g2c4754ccd0b8
+	 *     cat /proc/device-tree/ubuntu-tab,dt-revision  7.0.6-...-00255-g1fc076a55110
+	 *
+	 * Equal  -> Image and device tree were built from one commit.
+	 * Differ -> read off which one is behind, and by how many commits.
+	 *
+	 * THE "unstamped" SENTINEL IS LOAD-BEARING, not a placeholder. It keeps
+	 * three states distinguishable:
+	 *     property absent  -- the running tree predates this property
+	 *     "unstamped"      -- the dtb was built but never stamped
+	 *     a release string -- stamped, and this is the build it came from
+	 * A property that only ever exists because a tool created it collapses the
+	 * first two into "no such file", and a version marker that cannot report
+	 * "I do not know" lies by omission.
+	 *
+	 * This is a PROPERTY, not a node: adding a node renumbers every later
+	 * phandle, adding a root property renumbers nothing.
+	 *
+	 * Root properties declared in this base tree survive ABL's dtbo merge --
+	 * model, compatible, chassis-type, qcom,msm-id and qcom,board-id are all
+	 * declared here and all appear under /proc/device-tree on the running
+	 * device. The mainline kernel ignores root properties it does not know,
+	 * exactly as noted for qcom,msm-id above.
+	 *
+	 * The string is .config-dependent (setlocalversion reads CONFIG_LOCALVERSION
+	 * from include/config/auto.conf), so it identifies the BUILD, not the commit
+	 * alone. That is deliberate -- comparability with `uname -r` is the purpose.
+	 */
+	ubuntu-tab,dt-revision = "unstamped";
+
 	aliases {
 		/*
 		 * A "serial" alias is REQUIRED for every enabled GENI UART:
