@@ -231,7 +231,15 @@
 	 * time discovering the running tree was two commits behind the source, and
 	 * detecting it required comparing node presence by hand, node by node.
 	 *
-	 *     cat /proc/device-tree/ubuntu-tab,dt-revision
+	 *     tr -d '\0' < /proc/device-tree/ubuntu-tab,dt-revision; echo
+	 *
+	 * 🔴 STRIP THE NUL. Device-tree string properties are NUL-terminated, so a
+	 * plain `cat` of this file emits a trailing NUL byte. It is invisible on a
+	 * terminal and harmless there -- but capture it to a file and GNU grep
+	 * classifies that file as BINARY and returns "no matches" with no output at
+	 * all, while diff refuses with "Binary files differ". One byte silently
+	 * blinds both, in the direction that looks like a clean pass. Use the tr
+	 * form in anything that compares, greps or scripts this value.
 	 *
 	 * The value is written into the COMPILED dtb by
 	 * utilities/kernel/stamp-dtb-revision.sh, using the kernel's own
@@ -239,8 +247,8 @@
 	 * Using that generator rather than re-deriving the format is the point: the
 	 * two strings cannot drift apart, so they compare literally.
 	 *
-	 *     uname -r                                      7.0.6-...-00254-g2c4754ccd0b8
-	 *     cat /proc/device-tree/ubuntu-tab,dt-revision  7.0.6-...-00255-g1fc076a55110
+	 *     uname -r     7.0.6-...-00254-g2c4754ccd0b8   <- the kernel Image
+	 *     the property 7.0.6-...-00256-g680c4b8cfe0a   <- the device tree
 	 *
 	 * Equal  -> Image and device tree were built from one commit.
 	 * Differ -> read off which one is behind, and by how many commits.
