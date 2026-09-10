@@ -15,6 +15,7 @@
 
 /dts-v1/;
 
+#include <dt-bindings/leds/common.h>
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/sound/cs35l45.h>
@@ -2035,6 +2036,34 @@
 			qcom,hw-settle-time = <200>;
 			qcom,pre-scaling = <1 1>;
 		};
+
+		/*
+		 * VPH_PWR -- the battery rail, measured by the PMIC's own ADC.
+		 *
+		 * This exists to give the drain instrument a SECOND, INDEPENDENT
+		 * voltage channel. The fuel gauge's OCV register updates on a slow
+		 * cadence, so "converged" and "stale" are indistinguishable to a
+		 * spread test on that one register -- a defect this project has
+		 * recorded as unsolvable. It is only unsolvable with ONE channel:
+		 * if VPH_PWR moves while the gauge's OCV does not, the gauge is
+		 * PROVABLY stale and the endpoint can be rejected instead of
+		 * certified.
+		 *
+		 * It reads TERMINAL voltage, not OCV, and its LSB (194.6 uV, from
+		 * 1875000/28900 * 3) is coarser than the gauge's raw VBAT (91.7 uV).
+		 * Independence is the point, not resolution.
+		 *
+		 * reg and pre-scaling are transcribed from the device's OWN
+		 * downstream DTS (gts9uwifi_eur_open_w00_r03.dts:2471-2475), which
+		 * declares exactly this channel on this board:
+		 *     pm8550_vph_pwr { reg = <0x18e>; qcom,pre-scaling = <0x01 0x03>; }
+		 * Not inferred, and not taken from a sister device.
+		 */
+		channel@18e {
+			reg = <0x18e>;
+			label = "pm8550_vph_pwr";
+			qcom,pre-scaling = <1 3>;
+		};
 	};
 };
 
@@ -3236,5 +3265,65 @@
 		drive-strength = <4>;
 		bias-disable;
 		input-enable;
+	};
+};
+
+/*
+ * PM8550 flash/torch controller -- enabled NOT for photography but as a
+ * CALIBRATED CURRENT SINK THAT KEEPS DRAWING WHILE THE DEVICE IS SUSPENDED.
+ *
+ * WHY THIS IS HERE
+ * The suspend-drain instrument has never had a positive control. Its own
+ * record says "no mainline change has ever been resolvable by this
+ * instrument" -- and nobody has ever been able to tell whether that means the
+ * changes did nothing or the instrument is blind. Those two look identical
+ * from the outside, and this project has repeatedly paid for that ambiguity.
+ *
+ * A load of KNOWN magnitude, injected during suspend, separates them in one
+ * run: if the instrument cannot see a known 20 mA, it can never see an
+ * unknown one, and every null it has ever produced is uninterpretable.
+ *
+ * WHY THIS PARTICULAR LOAD
+ * drivers/leds/flash/leds-qcom-flash.c contains NO pm ops whatsoever -- zero
+ * matches for dev_pm_ops, _suspend or _resume. Nothing switches it off at
+ * system suspend. It is a PMIC current sink hanging off VPH, indifferent to
+ * whether the AP is running, and it is programmable in TORCH_IRES_UA = 5000
+ * steps to TORCH_CURRENT_MAX_UA = 500000 per channel.
+ *
+ * A duty-cycled CPU load cannot do this job: at equal frequency and equal
+ * utilisation, differing slice lengths change power by up to 50 % because
+ * slice length drives cpuidle state selection. And an RTC-wake duty cycle
+ * injects its charge in the AWAKE regime, which is not the regime under test.
+ *
+ * The hardware is present: the device's own downstream DTS declares this
+ * controller at the same reg <0xee00> with status "ok" and four torch
+ * channels at 500 mA each (gts9uwifi_eur_open_w00_r03.dts:1216+).
+ *
+ * TWO CHANNELS ARE DECLARED ON PURPOSE. Stock declares four, but a current
+ * sink with no LED wired to it sinks nothing, and which channels are
+ * populated on this board is not stated anywhere. Declaring two lets the
+ * gauge's own ammeter decide which one actually draws -- measured, not
+ * assumed. (mainline's led-sources is 1-based; stock's qcom,id is 0-based,
+ * so led-sources = <1> is stock's torch_0.)
+ *
+ * SAFETY: thermal derate thresholds are 200/500 mA; the calibration points
+ * are 5-50 mA, far below. Any instrument that turns this on MUST turn it off
+ * on every exit path -- it is a visible light source on an unattended device.
+ */
+&pm8550_flash {
+	status = "okay";
+
+	led-0 {
+		function = LED_FUNCTION_TORCH;
+		color = <LED_COLOR_ID_WHITE>;
+		led-sources = <1>;
+		led-max-microamp = <500000>;
+	};
+
+	led-1 {
+		function = LED_FUNCTION_TORCH;
+		color = <LED_COLOR_ID_WHITE>;
+		led-sources = <2>;
+		led-max-microamp = <500000>;
 	};
 };
