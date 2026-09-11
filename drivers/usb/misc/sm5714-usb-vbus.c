@@ -28,6 +28,7 @@
 #include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/i2c.h>
+#include <linux/kstrtox.h>
 #include <linux/iio/consumer.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -1015,8 +1016,63 @@ static ssize_t host_vbus_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(host_vbus);
 
+/*
+ * Hold the cell charge FET (Q4, CNTL1 bit ENQ4FET) open from userspace.
+ *
+ * Writing 1 disarms the FET and latches buck_inhibited so the charging worker
+ * does not re-arm it on its next poll; writing 0 re-allows charging, which the
+ * worker then restores within one poll period rather than instantly.
+ *
+ * The system keeps running from VBUS throughout.  Q4 gates charge INTO the
+ * cell, not the cell's ability to supply the system -- which is why the worker
+ * already holds it open whenever no input source is present, i.e. every time
+ * this device runs on battery.
+ *
+ * Why this is worth an attribute: every wall-side power measurement on this
+ * device is otherwise contaminated by the pack absorbing or sourcing a variable
+ * share.  The charger regulates charge current independently of system load, so
+ * a change in system draw is partly masked at the input and a differential can
+ * be biased by an unknown amount in whichever direction the charger happens to
+ * move.  With the FET open the pack is electrically out of the path and the
+ * input current IS the system current, at any state of charge -- so a
+ * measurement no longer has to wait for the pack to terminate before it can be
+ * trusted.
+ *
+ * 🔴 A raw i2c write to CNTL1 is NOT equivalent and must not be used instead.
+ * sm5714_set_charge_fet() re-reads the register from silicon on every poll and
+ * corrects any state it did not set, measured re-arming an externally cleared
+ * bit in ~1.1 s.  The latch is the entire point of this attribute.
+ */
+static ssize_t charge_inhibit_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct sm5714_vbus *sv = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(sv->buck_inhibited));
+}
+
+static ssize_t charge_inhibit_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	bool inhibit;
+	int ret;
+
+	ret = kstrtobool(buf, &inhibit);
+	if (ret)
+		return ret;
+
+	ret = sm5714_charger_inhibit_buck(inhibit);
+	if (ret)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(charge_inhibit);
+
 static struct attribute *sm5714_vbus_attrs[] = {
 	&dev_attr_host_vbus.attr,
+	&dev_attr_charge_inhibit.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(sm5714_vbus);
