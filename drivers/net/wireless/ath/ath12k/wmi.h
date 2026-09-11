@@ -5563,6 +5563,19 @@ struct wmi_wow_add_del_event_cmd {
 	__le32 event_bitmap;
 } __packed;
 
+/* WMI_WOW_FLAG_* -- the bitmask carried in wmi_wow_enable_cmd.flags.
+ * Values from the vendor firmware interface (wmi_unified.h). Only the ones this
+ * driver can currently reach are listed; the comments are the vendor's own.
+ */
+/* "To differentiate system suspend Vs RTPM. BIT set - System Suspend WOW,
+ * BIT Reset - RTPM (DRV)"
+ */
+#define WMI_WOW_FLAG_SYSTEM_SUSPEND_WOW		0x00000020
+/* set when the INI enables modulated DTIM on system suspend */
+#define WMI_WOW_FLAG_MOD_DTIM_ON_SYS_SUSPEND	0x00000040
+/* forced DTIM in suspend mode */
+#define WMI_WOW_FLAG_FORCED_DTIM_ON_SYS_SUSPEND	0x00000080
+
 struct wmi_wow_enable_cmd {
 	__le32 tlv_header;
 	__le32 enable;
@@ -6536,6 +6549,8 @@ ath12k_wmi_mac_phy_get_hw_link_id(const struct ath12k_wmi_mac_phy_caps_params *p
 	return le32_get_bits(param->pdev_and_hw_link_ids,
 			     WMI_CAPS_PARAMS_HW_LINK_ID);
 }
+
+extern unsigned int ath12k_wow_flags;
 
 int ath12k_wmi_wow_host_wakeup_ind(struct ath12k *ar);
 int ath12k_wmi_wow_enable(struct ath12k *ar);

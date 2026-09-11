@@ -80,6 +80,37 @@ static char *ath12k_country = "US";
 module_param_named(country, ath12k_country, charp, 0444);
 MODULE_PARM_DESC(country, "ISO 3166-1 alpha-2 regulatory country (e.g. US), used when the platform supplies none");
 
+/*
+ * WoW flags sent in WMI_WOW_ENABLE_CMDID at suspend.
+ *
+ * The field exists in wmi_wow_enable_cmd and ath12k has never populated it, so
+ * every suspend transmits zero. Zero is not "unspecified": the vendor firmware
+ * interface defines the low bit of interest in the NEGATIVE --
+ *
+ *   WMI_WOW_FLAG_SYSTEM_SUSPEND_WOW = 0x20
+ *     "To differentiate system suspend Vs RTPM.  BIT set - System Suspend WOW,
+ *      BIT Reset - RTPM (DRV)"
+ *
+ * -- so sending zero tells the firmware the host is in runtime power management
+ * and may return at any instant, rather than that the whole system is going to
+ * sleep. A firmware held responsive for RTPM has no reason to enter its deepest
+ * state, and the cost of that would be a continuous DC load rather than a
+ * duty-cycled one.
+ *
+ * The downstream stack on this hardware sends 0xE0 at system suspend: 0x20
+ * together with the two modulated/forced-DTIM bits, which are a separate
+ * mechanism (wake cadence) and are deliberately NOT enabled here.
+ *
+ * Default 0 preserves the existing behaviour exactly, so carrying this patch
+ * changes nothing until the parameter is written. It is 0644 so a control and a
+ * treatment arm can be taken in ONE boot from ONE kernel image -- a measurement
+ * at this scale cannot survive a cross-build comparison, and without a runtime
+ * knob that is the only kind available.
+ */
+unsigned int ath12k_wow_flags;
+module_param_named(wow_flags, ath12k_wow_flags, uint, 0644);
+MODULE_PARM_DESC(wow_flags, "WMI_WOW_FLAG_* bitmask sent in WMI_WOW_ENABLE_CMDID (0x20 = SYSTEM_SUSPEND_WOW; default 0 = upstream behaviour)");
+
 /* protected with ath12k_hw_group_mutex */
 static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);
 

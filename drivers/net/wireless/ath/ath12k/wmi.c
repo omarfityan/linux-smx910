@@ -10324,7 +10324,19 @@ int ath12k_wmi_wow_enable(struct ath12k *ar)
 
 	cmd->enable = cpu_to_le32(1);
 	cmd->pause_iface_config = cpu_to_le32(WOW_IFACE_PAUSE_ENABLED);
-	ath12k_dbg(ar->ab, ATH12K_DBG_WMI, "wmi tlv wow enable\n");
+	/* Zero here is what upstream has always sent, and zero is a positive
+	 * statement to the firmware -- see ath12k_wow_flags in core.c.
+	 */
+	cmd->flags = cpu_to_le32(ath12k_wow_flags);
+	/* CONFIG_ATH12K_DEBUG is off in this configuration, so ath12k_dbg()
+	 * compiles away and would leave no witness of what was transmitted.
+	 * Say it at info level whenever the knob is engaged -- silent in the
+	 * default, loud exactly when a measurement depends on it.
+	 */
+	if (ath12k_wow_flags)
+		ath12k_info(ar->ab, "wow enable flags 0x%x\n", ath12k_wow_flags);
+	ath12k_dbg(ar->ab, ATH12K_DBG_WMI, "wmi tlv wow enable flags 0x%x\n",
+		   ath12k_wow_flags);
 
 	return ath12k_wmi_cmd_send(ar->wmi, skb, WMI_WOW_ENABLE_CMDID);
 }
