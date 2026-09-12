@@ -7,6 +7,7 @@
 #include <net/mac80211.h>
 #include <net/cfg80211.h>
 #include <linux/etherdevice.h>
+#include <linux/of_net.h>
 
 #include "mac.h"
 #include "core.h"
@@ -14486,6 +14487,37 @@ static int ath12k_mac_setup_register(struct ath12k *ar,
 	return 0;
 }
 
+/* The firmware supplies a FRESH, effectively random MAC address in every
+ * WMI_READY event, and ath12k_wmi_rdy_parse() copies it into ab->mac_addr,
+ * which is then published as the wiphy's PERMANENT address. On a device whose
+ * board data carries no address this means the "permanent" address changes on
+ * every firmware load: measured on a WCN7850 over 21 consecutive boots, 21
+ * distinct addresses, with the DHCP lease moving every time because the AP saw
+ * a brand-new client on each boot.
+ *
+ * ath12k had no way to override this: there is no QMI MAC-address request and
+ * nothing read the device tree. Where firmware or platform provides a real
+ * address via 'local-mac-address'/'mac-address'/nvmem, prefer it -- that is the
+ * address the hardware was provisioned with at the factory.
+ *
+ * Absent or malformed properties are not an error; the firmware value is then
+ * kept, which is the previous behaviour.
+ */
+static void ath12k_mac_of_override_mac_addr(struct ath12k_base *ab)
+{
+	u8 addr[ETH_ALEN];
+
+	if (!ab->dev || !dev_of_node(ab->dev))
+		return;
+
+	if (of_get_mac_address(dev_of_node(ab->dev), addr))
+		return;
+
+	ath12k_info(ab, "using MAC address %pM from device tree (firmware offered %pM)\n",
+		    addr, ab->mac_addr);
+	ether_addr_copy(ab->mac_addr, addr);
+}
+
 static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 {
 	struct ieee80211_hw *hw = ah->hw;
@@ -14512,6 +14544,11 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 	u8 mbssid_max_interfaces = 0;
 
 	wiphy->max_ap_assoc_sta = 0;
+
+	/* Before ab->mac_addr is copied out to the per-radio addresses and
+	 * published via SET_IEEE80211_PERM_ADDR() below.
+	 */
+	ath12k_mac_of_override_mac_addr(ab);
 
 	for_each_ar(ah, ar, i) {
 		u32 ht_cap_info = 0;

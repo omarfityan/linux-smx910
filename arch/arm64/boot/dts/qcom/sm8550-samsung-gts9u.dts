@@ -2138,6 +2138,35 @@
 		vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
 		vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
 		vddpcie1p8-supply = <&vreg_pmu_pcie_1p8>;
+
+		/*
+		 * The WCN7850's firmware invents a FRESH MAC address on every
+		 * load and ath12k republishes it as the wiphy's PERMANENT
+		 * address. Measured over the 21 boots the journal retained at
+		 * session 437: 21 distinct addresses, and the DHCP lease
+		 * climbing by exactly one each time as the router greeted a
+		 * brand-new client on every boot.
+		 *
+		 * ath12k has no host-side MAC provisioning at all -- the value
+		 * arrives in the firmware's WMI_READY event
+		 * (ath12k_wmi_rdy_parse()) and goes straight to
+		 * SET_IEEE80211_PERM_ADDR(). There is no QMI MAC request and,
+		 * until the companion patch to ath12k_mac_hw_register(), no
+		 * of_get_mac_address() call either.
+		 *
+		 * GOLDEN-RULE value: this device's OWN factory address, read
+		 * from its EFS partition at /efs/wifi/.mac.info (identical in
+		 * /efs/wifi/.mac.cob, both dated 11-Dec-2023). It is what stock
+		 * OneUI uses. Its sibling /efs/bluetooth/bt_addr is the
+		 * local-bd-address above.
+		 *
+		 * ⚠️ BYTE ORDER DIFFERS FROM local-bd-address AND GETTING IT
+		 * WRONG PRODUCES A VALID-LOOKING WRONG ADDRESS. bdaddr_t is
+		 * little-endian, so the Bluetooth property is REVERSED;
+		 * local-mac-address is consumed by of_get_mac_address() in
+		 * natural network order, so this one is NOT.
+		 */
+		local-mac-address = [08 A5 DF 7E 7A 1F];
 	};
 };
 
