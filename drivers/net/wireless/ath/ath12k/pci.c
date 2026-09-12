@@ -1801,6 +1801,96 @@ static const struct dev_pm_ops __maybe_unused ath12k_pci_pm_ops = {
 				     ath12k_pci_pm_resume_early)
 };
 
+/* PCIe error recovery.
+ *
+ * Without these callbacks the AER core has no way to tell the driver that its
+ * device has gone: report_error_detected() takes the no-callback path, logs
+ * "can't recover (no error_detected callback)", votes
+ * PCI_ERS_RESULT_NO_AER_DRIVER and gives up. The driver then carries on as if
+ * nothing had happened, which on a WLAN device is particularly bad: mac80211
+ * keeps the association object alive, so the interface stays "up" with a valid
+ * address and a cached 1200 Mbit/s rate on a link that no longer exists, and
+ * every attempt to reach the device from userspace reports perfect health.
+ * Recovering then requires a reboot, because nothing ever notices.
+ *
+ * It is also expensive to unwind: with no notification, ath12k_core_stop()
+ * still calls ath12k_qmi_firmware_stop() and every WMI command still waits out
+ * its full timeout against hardware that is not on the bus, so tearing the
+ * device down takes minutes of serialised timeouts.
+ *
+ * From the driver's point of view a fatal PCIe error is the same event as a
+ * firmware crash -- the target is gone and all of its state has to be rebuilt
+ * -- so this reuses the recovery path MHI_CB_EE_RDDM already uses.
+ */
+static pci_ers_result_t ath12k_pci_err_detected(struct pci_dev *pdev,
+						pci_channel_state_t state)
+{
+	struct ath12k_base *ab = pci_get_drvdata(pdev);
+
+	if (!ab)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	switch (state) {
+	case pci_channel_io_normal:
+		/* The link is still usable, so there is nothing to tear down
+		 * and no reason to disturb a working device.
+		 */
+		return PCI_ERS_RESULT_CAN_RECOVER;
+	case pci_channel_io_frozen:
+		ath12k_err(ab, "PCI link frozen, stopping host access and requesting a slot reset\n");
+		/* Stop every path that would otherwise block on absent
+		 * hardware: WMI sends, CE, dp_tx, the mac ops, peer deletion
+		 * and, importantly, ath12k_qmi_firmware_stop().
+		 */
+		set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+		return PCI_ERS_RESULT_NEED_RESET;
+	case pci_channel_io_perm_failure:
+		ath12k_err(ab, "PCI device is permanently unreachable\n");
+		set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+		return PCI_ERS_RESULT_DISCONNECT;
+	default:
+		return PCI_ERS_RESULT_DISCONNECT;
+	}
+}
+
+static pci_ers_result_t ath12k_pci_slot_reset(struct pci_dev *pdev)
+{
+	struct ath12k_base *ab = pci_get_drvdata(pdev);
+
+	if (!ab)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	/* The bridge has reset the link; put back the config space the core
+	 * saved, so the BARs and MSI configuration are addressable again.
+	 */
+	pci_restore_state(pdev);
+	ath12k_info(ab, "PCI slot reset done\n");
+
+	return PCI_ERS_RESULT_RECOVERED;
+}
+
+static void ath12k_pci_err_resume(struct pci_dev *pdev)
+{
+	struct ath12k_base *ab = pci_get_drvdata(pdev);
+
+	if (!ab)
+		return;
+
+	/* Do not fight an unbind that is already in progress. */
+	if (test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))
+		return;
+
+	ath12k_info(ab, "PCI error recovery: rebuilding device state\n");
+	set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+	queue_work(ab->workqueue_aux, &ab->reset_work);
+}
+
+static const struct pci_error_handlers ath12k_pci_err_handlers = {
+	.error_detected = ath12k_pci_err_detected,
+	.slot_reset     = ath12k_pci_slot_reset,
+	.resume         = ath12k_pci_err_resume,
+};
+
 int ath12k_pci_register_driver(const enum ath12k_device_family device_id,
 			       struct ath12k_pci_driver *driver)
 {
@@ -1827,6 +1917,7 @@ int ath12k_pci_register_driver(const enum ath12k_device_family device_id,
 	pci_driver->remove = ath12k_pci_remove;
 	pci_driver->shutdown = ath12k_pci_shutdown;
 	pci_driver->driver.pm = &ath12k_pci_pm_ops;
+	pci_driver->err_handler = &ath12k_pci_err_handlers;
 
 	return pci_register_driver(pci_driver);
 }
