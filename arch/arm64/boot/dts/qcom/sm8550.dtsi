@@ -4754,6 +4754,46 @@
 				};
 			};
 
+			/*
+			 * The sleep counterpart of pcie0-default-state. It differs in
+			 * exactly one field: CLKREQ# (gpio95) is taken away from the
+			 * controller and parked as a plain GPIO, with the same pull-up
+			 * and drive strength, so the DC level on the wire is unchanged.
+			 *
+			 * Turning the controller's GDSC off resets the controller, and a
+			 * resetting controller can drive the CLKREQ# pad. An endpoint
+			 * that is still powered -- which is the case whenever it is
+			 * wakeup-enabled and the host therefore skips powering it off --
+			 * reads that as a request to bring the link back up, against a
+			 * host whose clocks have already gone. Releasing the pad before
+			 * the teardown is what stops it.
+			 *
+			 * PERST# and WAKE# are repeated identically so the sleep state is
+			 * a complete description of the group rather than a delta.
+			 */
+			pcie0_sleep_state: pcie0-sleep-state {
+				perst-pins {
+					pins = "gpio94";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-pull-down;
+				};
+
+				clkreq-pins {
+					pins = "gpio95";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-pull-up;
+				};
+
+				wake-pins {
+					pins = "gpio96";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-pull-up;
+				};
+			};
+
 			pcie1_default_state: pcie1-default-state {
 				perst-pins {
 					pins = "gpio97";

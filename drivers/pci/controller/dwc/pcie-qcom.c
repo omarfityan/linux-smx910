@@ -32,6 +32,7 @@
 #include <linux/platform_device.h>
 #include <linux/phy/pcie.h>
 #include <linux/phy/phy.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
@@ -1354,6 +1355,14 @@ static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
 	struct qcom_pcie *pcie = to_qcom_pcie(pci);
 	int ret;
 
+	/*
+	 * Hand CLKREQ# back to the controller before anything is powered up, so
+	 * the link has its sideband from the first clock. Mirrors the release in
+	 * qcom_pcie_host_deinit(); a no-op on a board that describes no sleep
+	 * state, and on the probe-time call, where this is already the state.
+	 */
+	pinctrl_pm_select_default_state(pci->dev);
+
 	qcom_pcie_perst_assert(pcie);
 
 	ret = pcie->cfg->ops->init(pcie);
@@ -1416,6 +1425,22 @@ static void qcom_pcie_host_deinit(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
 	struct qcom_pcie *pcie = to_qcom_pcie(pci);
+
+	/*
+	 * Park CLKREQ# before the controller is torn down. On the system-suspend
+	 * path this runs after PME_Turn_Off and the L2/L3 Ready poll, which is
+	 * the same point the downstream driver picks, and ahead of the PHY,
+	 * clock and GDSC teardown below -- turning the GDSC off resets the
+	 * controller, and a resetting controller can assert CLKREQ# at an
+	 * endpoint that is still powered because it is wakeup-enabled. The
+	 * endpoint answers by trying to bring the link back to L0 against a host
+	 * that no longer has clocks, and the link is lost for the rest of the
+	 * suspend. Releasing the pad first is what the downstream driver does,
+	 * and its comment names the same failure.
+	 *
+	 * No-op where the board describes no sleep state.
+	 */
+	pinctrl_pm_select_sleep_state(pci->dev);
 
 	qcom_pcie_perst_assert(pcie);
 

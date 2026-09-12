@@ -2099,14 +2099,18 @@
  * and WAKE# (gpio96) are SoC-dedicated PCIe0 pins: sm8550.dtsi's
  * pcie0_default_state pins gpio94/95/96 to perst / pcie0_clk_req_n / wake, so
  * they are fixed by the SoC (not board-routed) and the QRD reference uses the
- * same. CLKREQ# (gpio95) is handled by the pinctrl default state.
+ * same. CLKREQ# (gpio95) is muxed to the controller by the default state and
+ * parked as a plain GPIO by the sleep state, which the driver selects once the
+ * link is down and before the controller's clocks and GDSC go -- the downstream
+ * kernel does the same thing at the same point for the same reason.
  */
 &pcie0 {
 	perst-gpios = <&tlmm 94 GPIO_ACTIVE_LOW>;
 	wake-gpios = <&tlmm 96 GPIO_ACTIVE_HIGH>;
 
 	pinctrl-0 = <&pcie0_default_state>;
-	pinctrl-names = "default";
+	pinctrl-1 = <&pcie0_sleep_state>;
+	pinctrl-names = "default", "sleep";
 
 	status = "okay";
 };
