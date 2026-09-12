@@ -28,6 +28,7 @@
 #include <linux/pci-pwrctrl.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
+#include <linux/pm_wakeup.h>
 #include <linux/platform_device.h>
 #include <linux/phy/pcie.h>
 #include <linux/phy/phy.h>
@@ -292,6 +293,8 @@ struct qcom_pcie {
 	struct dentry *debugfs;
 	struct list_head ports;
 	bool use_pm_opp;
+	int wake_irq;			/* PCIe WAKE#, or 0 if the board has none */
+	unsigned int wake_count;
 };
 
 #define to_qcom_pcie(x)		dev_get_drvdata((x)->dev)
@@ -1932,6 +1935,119 @@ static int qcom_pcie_parse_legacy_binding(struct qcom_pcie *pcie)
 	return 0;
 }
 
+/*
+ * PCIe WAKE# -- the endpoint's OUT-OF-BAND wakeup signal, and the only one that
+ * works once the link is down.
+ *
+ * WHY THIS EXISTS AND WHAT IT FIXES
+ *   A WoWLAN-armed WCN7850 behind this controller matches its wake pattern while
+ *   the system is in S3 and then has to tell the SoC.  The in-band route is a PME
+ *   message, which the PCI core receives as an MSI -- a memory write that travels
+ *   OVER THE LINK.  In suspend the link is down, so that route cannot work, which
+ *   is precisely the case the sideband WAKE# pin exists to cover.
+ *
+ *   Measured on an SM8550 tablet before this change: the firmware reported
+ *   WOW_REASON_RECV_MAGIC_PATTERN on resume -- it HAD matched the packet -- while
+ *   power/wakeup_count stayed 0 on both the endpoint and the Root Port and the
+ *   "PCIe PME" MSI never fired.  The chip was speaking; nothing was listening.
+ *
+ * THIS IS A TRANSCRIPTION OF THE VENDOR DRIVER, NOT A NEW DESIGN
+ *   Qualcomm's downstream pci-msm.c does exactly this: gpio_to_irq() on the
+ *   "wake-gpio" property, request_irq() with IRQF_TRIGGER_FALLING, then
+ *   enable_irq_wake(); its handler poses a wakeup event against a registered
+ *   wakeup_source (__pm_stay_awake()/__pm_relax()).  pm_wakeup_event() is the
+ *   mainline spelling of that pair.
+ *
+ *   `wake-gpios` is already a documented property in qcom,pcie-common.yaml and is
+ *   already present in SoC device trees -- it simply had no consumer in any
+ *   mainline root-complex driver.  The pin is wake-capable: on SM8550 the TLMM
+ *   carries wakeup-parent = <&pdc> and pinctrl-sm8550.c's PDC map routes the line,
+ *   so enable_irq_wake() arms a genuine deep-suspend wake source rather than
+ *   silently doing nothing.
+ *
+ * 🔴 FAILING TO ARM WAKE# MUST NEVER FAIL THE PROBE.
+ *   The link works perfectly without it; only wake-on-LAN does not.  On a device
+ *   whose only transport is the Wi-Fi behind this very controller, refusing to
+ *   probe over an optional sideband pin would trade a missing feature for an
+ *   unreachable machine.  Only -EPROBE_DEFER propagates.
+ */
+static irqreturn_t qcom_pcie_wake_irq(int irq, void *data)
+{
+	struct qcom_pcie *pcie = data;
+	struct device *dev = pcie->pci->dev;
+
+	pcie->wake_count++;
+
+	/*
+	 * Rate-limited rather than dev_dbg: this is the only external evidence
+	 * that the endpoint asserted WAKE# at all, and it is the first thing
+	 * anyone debugging a missing wake will look for.  Rate-limiting keeps a
+	 * floating or bouncing pin from flooding the log.
+	 */
+	dev_info_ratelimited(dev, "PCIe WAKE# asserted by endpoint (count %u)\n",
+			     pcie->wake_count);
+
+	pm_wakeup_event(dev, 0);
+
+	return IRQ_HANDLED;
+}
+
+static int qcom_pcie_setup_wake_irq(struct qcom_pcie *pcie)
+{
+	struct device *dev = pcie->pci->dev;
+	struct gpio_desc *wake;
+	int irq, ret;
+
+	wake = devm_gpiod_get_optional(dev, "wake", GPIOD_IN);
+	if (IS_ERR(wake)) {
+		ret = PTR_ERR(wake);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+		dev_warn(dev, "no usable wake gpio (%d); WAKE# not armed\n", ret);
+		return 0;
+	}
+	if (!wake)
+		return 0;		/* board has no WAKE# line */
+
+	irq = gpiod_to_irq(wake);
+	if (irq < 0) {
+		dev_warn(dev, "wake gpio has no irq (%d); WAKE# not armed\n", irq);
+		return 0;
+	}
+
+	/*
+	 * PCIe WAKE# is active low and open drain, so assertion is a falling
+	 * edge.  This matches the vendor driver's IRQF_TRIGGER_FALLING.
+	 */
+	ret = devm_request_irq(dev, irq, qcom_pcie_wake_irq,
+			       IRQF_TRIGGER_FALLING, "qcom_pcie_wake", pcie);
+	if (ret) {
+		dev_warn(dev, "cannot request wake irq %d (%d); WAKE# not armed\n",
+			 irq, ret);
+		return 0;
+	}
+
+	/*
+	 * pm_wakeup_event() is a no-op unless the device has a wakeup source,
+	 * so this is not optional decoration -- without it the handler would
+	 * run, log, and wake nothing.
+	 */
+	device_init_wakeup(dev, true);
+
+	ret = enable_irq_wake(irq);
+	if (ret) {
+		dev_warn(dev, "cannot arm wake irq %d as a wake source (%d)\n",
+			 irq, ret);
+		device_init_wakeup(dev, false);
+		return 0;
+	}
+
+	pcie->wake_irq = irq;
+	dev_info(dev, "PCIe WAKE# armed as a system wake source (irq %d)\n", irq);
+
+	return 0;
+}
+
 static int qcom_pcie_probe(struct platform_device *pdev)
 {
 	struct qcom_pcie_perst *perst, *tmp_perst;
@@ -2102,6 +2218,10 @@ static int qcom_pcie_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, pcie);
+
+	ret = qcom_pcie_setup_wake_irq(pcie);
+	if (ret)
+		goto err_phy_exit;	/* only -EPROBE_DEFER reaches here */
 
 	ret = dw_pcie_host_init(pp);
 	if (ret) {
