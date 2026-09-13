@@ -4518,6 +4518,47 @@ static void ath12k_mac_vif_setup_ps(struct ath12k_link_vif *arvif)
 		ath12k_info(ar->ab, "vdev %d sta ps: OPM scheme set conservative (%d)\n",
 			    arvif->vdev_id, WMI_STA_PS_OPM_CONSERVATIVE);
 
+		/* Wake cadence.  ath12k otherwise enables station power save and tells
+		 * the firmware NOTHING about how to sleep, leaving it to pick its own
+		 * -- measured here at one beacon in eighty, a wake every ~8 s, which
+		 * costs essentially all group-addressed reception and with it the
+		 * device's reachability from its own LAN.  The vendor stack sets the
+		 * awake state explicitly and holds DTIM 1 while awake, modulating only
+		 * at system suspend.  See ath12k_sta_wake_cadence in core.c for the
+		 * measurements, the vendor's own wording, and why this is a selectable
+		 * bitmask rather than a change to ATH12K_MAX_HW_LISTEN_INTERVAL.
+		 *
+		 * Default 0 sends nothing, so this is inert until the knob is written.
+		 * Each branch reports what it sent: a parameter that was silently never
+		 * transmitted and one the firmware rejected must never look the same,
+		 * or a negative result cannot be told from an untaken test.
+		 */
+		if (ath12k_sta_wake_cadence & BIT(0)) {
+			ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+							    WMI_VDEV_PARAM_DTIM_POLICY,
+							    WMI_BEACON_DTIM_POLICY_NORMAL);
+			if (ret) {
+				ath12k_warn(ar->ab, "failed to set DTIM policy NORMAL for vdev %d: %d\n",
+					    arvif->vdev_id, ret);
+				return;
+			}
+			ath12k_info(ar->ab, "vdev %d sta ps: DTIM policy set NORMAL (%d)\n",
+				    arvif->vdev_id, WMI_BEACON_DTIM_POLICY_NORMAL);
+		}
+
+		if (ath12k_sta_wake_cadence & BIT(1)) {
+			ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+							    WMI_VDEV_PARAM_LISTEN_INTERVAL,
+							    1);
+			if (ret) {
+				ath12k_warn(ar->ab, "failed to set listen interval for vdev %d: %d\n",
+					    arvif->vdev_id, ret);
+				return;
+			}
+			ath12k_info(ar->ab, "vdev %d sta ps: listen interval set 1\n",
+				    arvif->vdev_id);
+		}
+
 		param = WMI_STA_PS_PARAM_INACTIVITY_TIME;
 
 		timeout = conf->dynamic_ps_timeout;

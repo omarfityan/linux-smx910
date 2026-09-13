@@ -111,6 +111,56 @@ unsigned int ath12k_wow_flags;
 module_param_named(wow_flags, ath12k_wow_flags, uint, 0644);
 MODULE_PARM_DESC(wow_flags, "WMI_WOW_FLAG_* bitmask sent in WMI_WOW_ENABLE_CMDID (0x20 = SYSTEM_SUSPEND_WOW; default 0 = upstream behaviour)");
 
+/*
+ * Wake-cadence parameters sent to the firmware when station power save is enabled.
+ *
+ * MEASURED PROBLEM.  With power save on, this device is awake for 1.2 % of the AP's
+ * beacons -- 0.12/s against 9.65/s measured with power save off on the same boot, the
+ * off arm calibrating the counter at 96.5 % of the theoretical rate.  That is a wake
+ * roughly every 8 seconds.  The consequences are not subtle: group-addressed traffic is
+ * almost entirely missed (6 of 200 multicast frames delivered, and 0 of 30 in an earlier
+ * window), so inbound ARP never resolves and NOTHING ON THE LAN CAN OPEN A CONNECTION TO
+ * THE DEVICE until it happens to transmit first.  Unicast latency to an already-resolved
+ * neighbour runs 406 ms mean against 12 ms with power save off.
+ *
+ * WHY IT HAPPENS.  ath12k turns station power save on and then never tells the firmware
+ * anything about how to sleep.  WMI_VDEV_PARAM_LISTEN_INTERVAL, WMI_VDEV_PARAM_DTIM_POLICY
+ * and WMI_STA_DTIM_PS_METHOD_CMDID are all enumerated in wmi.h and called from nowhere, and
+ * ath12k_mac_op_config() is a stub returning 0 while the driver advertises
+ * IEEE80211_HW_SUPPORTS_DYNAMIC_PS -- so every IEEE80211_CONF_CHANGE_PS is discarded too.
+ * The firmware is left to choose its own cadence, and it chooses a deep one.
+ *
+ * WHAT THE VENDOR DOES ON THIS EXACT SILICON.  Its WLAN configuration carries
+ * gEnableModulatedDTIM=5 together with enable_mod_dtim_on_system_suspend=1, and the
+ * vendor's own documentation of that second value reads:
+ *
+ *     "1 -> Enable modulated DTIM only for System suspend wow.
+ *           For RTPM wow, the device will stay in DTIM 1 (non-modulated DTIM)"
+ *
+ * so the 5-beacon cadence is a SUSPEND-ONLY policy; while awake the vendor holds DTIM 1.
+ * It sets the awake state explicitly, sending the listen interval and then
+ * WMI_VDEV_PARAM_DTIM_POLICY = NORMAL_DTIM together (pmo_core_set_vdev_resume_dtim()).
+ *
+ * 🔴 NOTE WHAT THIS IS NOT.  Advertising listen interval 5 over the air
+ * (ATH12K_MAX_HW_LISTEN_INTERVAL) cannot by itself account for the observed cadence: 5
+ * beacons is 0.5 s and the station sleeps ~8 s, sixteen times longer.  The arithmetic
+ * refutes that explanation, which is why this is a selectable bitmask rather than a
+ * one-line change to that constant.
+ *
+ *   bit 0  send WMI_VDEV_PARAM_DTIM_POLICY = WMI_BEACON_DTIM_POLICY_NORMAL
+ *   bit 1  send WMI_VDEV_PARAM_LISTEN_INTERVAL = 1
+ *
+ * Default 0 sends nothing and preserves current behaviour exactly, so carrying this patch
+ * changes the driver only once the parameter is written.  It is 0644 and the parameters are
+ * applied from ath12k_mac_vif_setup_ps(), which mac80211 re-runs on every BSS_CHANGED_PS --
+ * so `iw dev <dev> set power_save off; iw dev <dev> set power_save on` re-applies them with
+ * NO re-association.  Control and treatment therefore run in ONE boot from ONE image, which
+ * is the only kind of comparison a measurement at this scale survives.
+ */
+unsigned int ath12k_sta_wake_cadence;
+module_param_named(sta_wake_cadence, ath12k_sta_wake_cadence, uint, 0644);
+MODULE_PARM_DESC(sta_wake_cadence, "wake-cadence params sent on STA power-save enable: bit0 = DTIM_POLICY NORMAL, bit1 = LISTEN_INTERVAL 1 (default 0 = send nothing, upstream behaviour)");
+
 /* protected with ath12k_hw_group_mutex */
 static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);
 

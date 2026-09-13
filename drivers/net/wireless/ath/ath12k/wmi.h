@@ -1087,6 +1087,24 @@ enum wmi_tlv_pdev_param {
 	WMI_PDEV_PARAM_ENABLE_SR_PROHIBIT = 0xc6,
 };
 
+/* Values for WMI_VDEV_PARAM_DTIM_POLICY.
+ *
+ * Transcribed from this device's own firmware API headers
+ * (fw-api/fw/wlan_defs.h, "BEACON_DTIM_POLICY"), and cross-checked against the vendor
+ * host driver's enum pmo_beacon_dtim_policy, which carries the identical values.
+ *
+ * 🔴 There is a SECOND, DIFFERENT enum in the same firmware API using the same words:
+ * WMI_STA_DTIM_PS_NORMAL_DTIM = 0x01, which belongs to WMI_STA_DTIM_PS_METHOD_CMDID and
+ * NOT to this vdev parameter. Sending 0x01 here selects IGNORE_DTIM -- the opposite of
+ * what is intended, with no error returned. The pairing matters as much as the value.
+ */
+enum wmi_beacon_dtim_policy {
+	WMI_BEACON_DTIM_POLICY_IGNORE	= 0x01,
+	WMI_BEACON_DTIM_POLICY_NORMAL	= 0x02,
+	WMI_BEACON_DTIM_POLICY_STICK	= 0x03,
+	WMI_BEACON_DTIM_POLICY_AUTO	= 0x04,
+};
+
 enum wmi_tlv_vdev_param {
 	WMI_VDEV_PARAM_RTS_THRESHOLD = 0x1,
 	WMI_VDEV_PARAM_FRAGMENTATION_THRESHOLD,
@@ -6564,6 +6582,7 @@ ath12k_wmi_mac_phy_get_hw_link_id(const struct ath12k_wmi_mac_phy_caps_params *p
 }
 
 extern unsigned int ath12k_wow_flags;
+extern unsigned int ath12k_sta_wake_cadence;
 
 int ath12k_wmi_wow_host_wakeup_ind(struct ath12k *ar);
 int ath12k_wmi_wow_enable(struct ath12k *ar);
