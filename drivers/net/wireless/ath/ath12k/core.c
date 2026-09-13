@@ -149,6 +149,23 @@ MODULE_PARM_DESC(wow_flags, "WMI_WOW_FLAG_* bitmask sent in WMI_WOW_ENABLE_CMDID
  *
  *   bit 0  send WMI_VDEV_PARAM_DTIM_POLICY = WMI_BEACON_DTIM_POLICY_NORMAL
  *   bit 1  send WMI_VDEV_PARAM_LISTEN_INTERVAL = 1
+ *   bit 2  send WMI_STA_PS_PARAM_RX_WAKE_POLICY = WAKE
+ *   bit 3  send WMI_STA_PS_PARAM_TX_WAKE_THRESHOLD = ALWAYS
+ *   bit 4  send WMI_STA_PS_PARAM_PSPOLL_COUNT = NO_MAX
+ *   bit 5  send WMI_STA_PS_PARAM_SPEC_WAKE_INTERVAL = 0
+ *
+ * 🔴 MEASURED: bits 0 and 1 are REFUTED. Singly and together they moved the wake rate
+ * from a 3.5 % control to 3.2 / 2.7 / 4.0 %, against a 96.0 % power-save-off calibration
+ * taken in the same run -- noise. Both commands were ACCEPTED by the firmware (each logged
+ * its send and none warned), so that is a real negative and not an untaken test. Do not
+ * re-test them.
+ *
+ * Bits 2-5 are the four parameters wma_set_force_sleep() sends on every power-save enable
+ * and ath12k never has; three of their ids were already in this driver's enum and simply
+ * never transmitted. RX_WAKE_POLICY is the one whose firmware documentation names the
+ * measured defect -- see enum wmi_sta_ps_rx_wake_policy in wmi.h. This device's values are
+ * WAKE / ALWAYS / NO_MAX, because gMaxPsPoll is absent from its vendor configuration and
+ * defaults to 0, selecting that branch of the vendor's own code.
  *
  * Default 0 sends nothing and preserves current behaviour exactly, so carrying this patch
  * changes the driver only once the parameter is written.  It is 0644 and the parameters are
@@ -159,7 +176,7 @@ MODULE_PARM_DESC(wow_flags, "WMI_WOW_FLAG_* bitmask sent in WMI_WOW_ENABLE_CMDID
  */
 unsigned int ath12k_sta_wake_cadence;
 module_param_named(sta_wake_cadence, ath12k_sta_wake_cadence, uint, 0644);
-MODULE_PARM_DESC(sta_wake_cadence, "wake-cadence params sent on STA power-save enable: bit0 = DTIM_POLICY NORMAL, bit1 = LISTEN_INTERVAL 1 (default 0 = send nothing, upstream behaviour)");
+MODULE_PARM_DESC(sta_wake_cadence, "wake-cadence params sent on STA power-save enable: bit0 DTIM_POLICY NORMAL, bit1 LISTEN_INTERVAL 1, bit2 RX_WAKE_POLICY WAKE, bit3 TX_WAKE_THRESHOLD ALWAYS, bit4 PSPOLL_COUNT NO_MAX, bit5 SPEC_WAKE_INTERVAL 0 (default 0 = send nothing, upstream behaviour)");
 
 /* protected with ath12k_hw_group_mutex */
 static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);

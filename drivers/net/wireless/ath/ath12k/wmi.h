@@ -4687,7 +4687,31 @@ enum wmi_sta_powersave_param {
 	 * this parameter gets OPM whether it wanted it or not.
 	 */
 	WMI_STA_PS_ENABLE_OPM = 6,
+
+	/* Id 12 in this device's firmware API. The vendor sends it on every
+	 * power-save enable; ath12k's copy of the enum stopped at UAPSD, so it
+	 * had no name here and had never been transmitted.
+	 */
+	WMI_STA_PS_PARAM_SPEC_WAKE_INTERVAL = 12,
 };
+
+/* 🔴 THE VALUES FOR THE PARAMETERS BELOW WERE ALREADY IN THIS DRIVER.
+ *
+ * enum wmi_sta_ps_param_rx_wake_policy, enum wmi_sta_ps_param_tx_wake_threshold and the
+ * PS-Poll count constant are all defined further down this header, upstream, with the
+ * correct values -- and they are referenced by nothing.  ath12k therefore has the
+ * parameter ids, the value enumerations AND the firmware's documentation of what they
+ * mean, and has never transmitted any of them.  The firmware picks instead.
+ *
+ * The firmware's own description of the rx wake policy, which names the defect measured
+ * on this device (awake for 1.2 % of beacons, 6 of 200 multicast frames delivered):
+ *
+ *   WAKE       "Wake up when ever there is an RX activity on the VDEV ... by either
+ *               sending null frame (or) a data frame (with PS==0) IN RESPONSE TO TIM BIT
+ *               SET in the received beacon frame from AP."
+ *   POLL_UAPSD "the power save state machine WILL NOT WAKEUP IN RESPONSE TO TIM BIT,
+ *               instead it will send a PSPOLL (or) UAPSD trigger..."
+ */
 
 /* Values for WMI_STA_PS_ENABLE_OPM. */
 enum wmi_sta_ps_scheme_cfg {

@@ -4559,6 +4559,73 @@ static void ath12k_mac_vif_setup_ps(struct ath12k_link_vif *arvif)
 				    arvif->vdev_id);
 		}
 
+		/* The four parameters the vendor sends on every power-save enable and
+		 * ath12k never has.  Three of the ids were already in this driver's enum
+		 * and simply never transmitted, so the firmware has always chosen its own
+		 * values for them.
+		 *
+		 * RX_WAKE_POLICY is the one that names the measured defect: the firmware's
+		 * own API documents WAKE as "come out of sleep ... in response to TIM bit
+		 * set in the received beacon" and POLL_UAPSD as "will not wakeup in
+		 * response to TIM bit".  A station on POLL_UAPSD that is not issuing
+		 * PS-Polls collects no buffered traffic at all.
+		 *
+		 * The values are this device's own: gMaxPsPoll is absent from its vendor
+		 * WLAN configuration and defaults to 0, so wma_set_force_sleep() takes the
+		 * branch sending WAKE / NO_MAX / ALWAYS.
+		 */
+		if (ath12k_sta_wake_cadence & BIT(2)) {
+			ret = ath12k_wmi_set_sta_ps_param(ar, arvif->vdev_id,
+							  WMI_STA_PS_PARAM_RX_WAKE_POLICY,
+							  WMI_STA_PS_RX_WAKE_POLICY_WAKE);
+			if (ret) {
+				ath12k_warn(ar->ab, "failed to set rx wake policy for vdev %d: %d\n",
+					    arvif->vdev_id, ret);
+				return;
+			}
+			ath12k_info(ar->ab, "vdev %d sta ps: rx wake policy set WAKE (%d)\n",
+				    arvif->vdev_id, WMI_STA_PS_RX_WAKE_POLICY_WAKE);
+		}
+
+		if (ath12k_sta_wake_cadence & BIT(3)) {
+			ret = ath12k_wmi_set_sta_ps_param(ar, arvif->vdev_id,
+							  WMI_STA_PS_PARAM_TX_WAKE_THRESHOLD,
+							  WMI_STA_PS_TX_WAKE_THRESHOLD_ALWAYS);
+			if (ret) {
+				ath12k_warn(ar->ab, "failed to set tx wake threshold for vdev %d: %d\n",
+					    arvif->vdev_id, ret);
+				return;
+			}
+			ath12k_info(ar->ab, "vdev %d sta ps: tx wake threshold set ALWAYS (%d)\n",
+				    arvif->vdev_id, WMI_STA_PS_TX_WAKE_THRESHOLD_ALWAYS);
+		}
+
+		if (ath12k_sta_wake_cadence & BIT(4)) {
+			ret = ath12k_wmi_set_sta_ps_param(ar, arvif->vdev_id,
+							  WMI_STA_PS_PARAM_PSPOLL_COUNT,
+							  WMI_STA_PS_PSPOLL_COUNT_NO_MAX);
+			if (ret) {
+				ath12k_warn(ar->ab, "failed to set pspoll count for vdev %d: %d\n",
+					    arvif->vdev_id, ret);
+				return;
+			}
+			ath12k_info(ar->ab, "vdev %d sta ps: pspoll count set NO_MAX (%d)\n",
+				    arvif->vdev_id, WMI_STA_PS_PSPOLL_COUNT_NO_MAX);
+		}
+
+		if (ath12k_sta_wake_cadence & BIT(5)) {
+			ret = ath12k_wmi_set_sta_ps_param(ar, arvif->vdev_id,
+							  WMI_STA_PS_PARAM_SPEC_WAKE_INTERVAL,
+							  0);
+			if (ret) {
+				ath12k_warn(ar->ab, "failed to set spec wake interval for vdev %d: %d\n",
+					    arvif->vdev_id, ret);
+				return;
+			}
+			ath12k_info(ar->ab, "vdev %d sta ps: spec wake interval set 0\n",
+				    arvif->vdev_id);
+		}
+
 		param = WMI_STA_PS_PARAM_INACTIVITY_TIME;
 
 		timeout = conf->dynamic_ps_timeout;
