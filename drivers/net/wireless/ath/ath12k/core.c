@@ -320,12 +320,49 @@ MODULE_PARM_DESC(sta_listen_interval, "override peer_listen_intval in WMI_PEER_A
  * the device's address until it happens to transmit first, so a host whose neighbour entry has
  * expired gets "No route to host" from a machine that is awake, associated and idle.
  *
- * WHY THIS IS NOT A WAKE-CADENCE FIX, AND WHY THAT MATTERS.  The listen interval carried in
- * WMI_PEER_ASSOC_CMDID is real and controllable on this firmware -- forcing it to 1 moves the
- * unicast buffering delay from a 512 ms ceiling to a 102 ms one, exactly as predicted -- and it
- * does NOT restore group reception.  Neither does WMI_VDEV_PARAM_DTIM_POLICY at any value.
- * Eight WMI parameters have now been refuted against this symptom.  The station's wake cadence
- * and its group-addressed path are independent here, so no cadence knob is going to fix this.
+ * 🔴 CORRECTED.  THIS PARAGRAPH USED TO SAY A WAKE-CADENCE KNOB COULD NOT FIX THIS.  IT CAN,
+ * AND THE KNOB IS sta_listen_interval BELOW.  The original wording read: "forcing it to 1 ...
+ * does NOT restore group reception ... the station's wake cadence and its group-addressed path
+ * are independent here, so no cadence knob is going to fix this."  That was measured honestly
+ * and generalised too far, and the correction matters because the sentence is the first thing a
+ * later reader meets before deciding not to try this.
+ *
+ * THE THREE STAGES, WHICH THE ORIGINAL CLAIM DID NOT SEPARATE:
+ *
+ *     A  the radio collects the group frame off the air -- requires being awake at that DTIM
+ *     B  the FIRMWARE's own responder answers the ARP -- never touches the host
+ *     C  the frame is delivered to the HOST netdev
+ *
+ * The refutation was produced by a device-side capture counting mDNS and broadcast ARP arriving
+ * at the netdev: that is stage C, and it stands, unchanged.  It could not observe stage B,
+ * because arming the responder while awake did not exist yet.  So "listen interval gates A" and
+ * "C is separately broken" were always consistent with that null.
+ *
+ * WHAT STAGE A ACTUALLY DOES, MEASURED OVER THE AIR.  A monitor capture on the AP's channel
+ * shows the AP retransmitting 100% of broadcast ARP requests as group frames, every one of them
+ * within 1.3-3.6 ms of the beacon target transmission time -- i.e. correctly buffered to DTIM,
+ * exactly when a power-saving station is listening.  The AP is not the problem.  Classifying each
+ * probe by the AP's own TSF then shows the answered ones landing on a FIVE-BEACON LATTICE:
+ * every probe whose frame was released at a TBTT index congruent to a fixed residue mod 5 was
+ * answered, and essentially none of the others, replicated out of sample against a residue fixed
+ * in advance.  That is ATH12K_MAX_HW_LISTEN_INTERVAL = 5 observed from outside the device.
+ *
+ * AND FORCING IT TO 1 DISSOLVES THE LATTICE.  Interleaved within one boot and one image:
+ *
+ *     sta_listen_interval=0 (upstream -> 5)   broadcast ARP answered  24.0 %, on ONE residue
+ *     sta_listen_interval=1                   broadcast ARP answered  97.5 %, on ALL FIVE
+ *
+ * The rate moving is an effect; the residue structure dissolving with it is the mechanism.  The
+ * user-visible symptom moves too, though by less, because Linux's ARP retries were already
+ * rescuing most attempts: cold ssh with the neighbour entry flushed goes 12/16 to 16/16.
+ *
+ * WMI_VDEV_PARAM_DTIM_POLICY remains refuted at every value; it is a different carrier, and so
+ * is WMI_VDEV_PARAM_LISTEN_INTERVAL.  Only the PEER-ASSOC listen interval moves this.
+ *
+ * ⚠️ THIS DOES NOT MAKE THE RESPONDER REDUNDANT ON THE EVIDENCE SO FAR.  Whether a station awake
+ * at every beacon still needs the firmware to answer for it is UNMEASURED -- the instrument that
+ * would decide it needs a quiet netdev, and the arms that tested cold ssh were full of session
+ * traffic.  Both changes stand until that is measured.
  *
  * WHAT THE FIRMWARE CAN ALREADY DO.  With the host FROZEN across a system suspend -- ping 0/30,
  * proving the host stack could not have answered anything -- this firmware answered broadcast
