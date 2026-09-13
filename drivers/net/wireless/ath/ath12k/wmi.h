@@ -84,6 +84,13 @@ struct wmi_tlv {
 #define WMI_MAX_MEM_REQS        32
 #define ATH12K_MAX_HW_LISTEN_INTERVAL 5
 
+/* The listen interval this driver puts in WMI_PEER_ASSOC_CMDID for its OWN station
+ * vdev, which is the value this firmware's power-save scheduler actually follows.
+ * Deliberately NOT ATH12K_MAX_HW_LISTEN_INTERVAL: that one is advertised to the AP in
+ * the association request and must stay at 5.  See ath12k_peer_assoc_h_listen_intval().
+ */
+#define ATH12K_STA_LISTEN_INTERVAL 1
+
 #define WMI_HOST_RC_DS_FLAG			0x01
 #define WMI_HOST_RC_CW40_FLAG			0x02
 #define WMI_HOST_RC_SGI_FLAG			0x04

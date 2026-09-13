@@ -245,7 +245,15 @@ module_param_named(sta_dtim_policy, ath12k_sta_dtim_policy, uint, 0644);
 MODULE_PARM_DESC(sta_dtim_policy, "WMI_VDEV_PARAM_DTIM_POLICY sent at STA association: 0 send nothing (default, upstream v7.0.6 behaviour), 1 IGNORE, 2 NORMAL, 3 STICK (upstream af50baccaa5f), 4 AUTO");
 
 /* The LISTEN INTERVAL CARRIED IN WMI_PEER_ASSOC_CMDID -- the quantity every parameter tried
- * so far was a proxy for, and the one thing in this area that had never been touched.
+ * before it was a proxy for, and the carrier that turned out to govern the wake cadence.
+ *
+ * 🔴 THIS KNOB IS NO LONGER THE MECHANISM.  The workaround now ships as the driver's DEFAULT for
+ * its own station vdev, in ath12k_peer_assoc_h_listen_intval() (mac.c), which returns
+ * ATH12K_STA_LISTEN_INTERVAL = 1 -- ath10k's shape, and the upstreamable one.  What remains here
+ * is an ESCAPE HATCH and a CONTROL ARM: writing 5 reproduces the pre-fix defect from the same
+ * image, which is the only way an A/B of this field survives.  A debug knob is not a load-bearing
+ * mechanism, and shipping one as if it were is how a fix silently depends on a sysfs write that
+ * no boot performs.
  *
  * WHAT GOVERNS THE FIRMWARE'S WAKE CADENCE.  Upstream af50baccaa5f says the station "always
  * follows the listen interval regardless of the DTIM value", and names where that listen
@@ -299,10 +307,15 @@ MODULE_PARM_DESC(sta_dtim_policy, "WMI_VDEV_PARAM_DTIM_POLICY sent at STA associ
  * linearly (the ath10k comment says so), so a null result is not evidence that the effect is
  * merely small, and a positive need not be proportionate.
  *
- *   0        leave arg->peer_listen_intval at hw->conf.listen_interval -- upstream behaviour
- *            exactly, which on this driver is ATH12K_MAX_HW_LISTEN_INTERVAL = 5 (default)
- *   1        wake every beacon; ath10k's value and the vendor's CFG_LISTEN_INTERVAL default
+ *   0        no override: the driver's own value, ATH12K_STA_LISTEN_INTERVAL = 1 (default)
+ *   1        the same value, stated explicitly
+ *   5        THE CONTROL ARM -- reproduces the pre-fix, upstream ATH12K_MAX_HW_LISTEN_INTERVAL
+ *            behaviour, and with it the five-beacon wake lattice, from the shipped image
  *   2-65535  any other value, so a null at 1 can be separated from an ignored field
+ *
+ * ⚠️ 0 NO LONGER MEANS "UPSTREAM BEHAVIOUR".  It used to, and anything written against the old
+ * meaning -- a harness whose control arm writes 0 -- now runs two treatment arms and reports a
+ * null it never measured.  The control value is 5.
  *
  * It is 0644 and is read when the peer assoc command is built, so re-applying it needs a
  * RE-ASSOCIATION -- as with sta_dtim_policy, write the value and then bounce the connection.
@@ -310,7 +323,7 @@ MODULE_PARM_DESC(sta_dtim_policy, "WMI_VDEV_PARAM_DTIM_POLICY sent at STA associ
  */
 unsigned int ath12k_sta_listen_interval;
 module_param_named(sta_listen_interval, ath12k_sta_listen_interval, uint, 0644);
-MODULE_PARM_DESC(sta_listen_interval, "override peer_listen_intval in WMI_PEER_ASSOC_CMDID for a station interface, in beacon intervals: 0 use mac80211's value (default, upstream behaviour = ATH12K_MAX_HW_LISTEN_INTERVAL 5), 1 wake every beacon (the ath10k workaround and the vendor default)");
+MODULE_PARM_DESC(sta_listen_interval, "override peer_listen_intval in WMI_PEER_ASSOC_CMDID for our own station vdev, in beacon intervals: 0 no override, use the driver default ATH12K_STA_LISTEN_INTERVAL 1 (the ath10k workaround and the vendor's CFG_LISTEN_INTERVAL default), 5 reproduce the pre-fix upstream behaviour ATH12K_MAX_HW_LISTEN_INTERVAL and its five-beacon wake lattice -- this is the CONTROL ARM value, not 0");
 
 /* ARM THE FIRMWARE'S ARP/NS RESPONDER WHILE THE STATION IS AWAKE, AS THE VENDOR DOES.
  *

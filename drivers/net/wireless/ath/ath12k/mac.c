@@ -1981,6 +1981,40 @@ static void ath12k_mac_vif_sta_connection_loss_work(struct work_struct *work)
 	ieee80211_connection_loss(vif);
 }
 
+/* ath10k's answer to the TODO that stood in ath12k_peer_assoc_h_basic(): force the station's
+ * listen interval down, in the peer assoc command and NOWHERE ELSE.
+ *
+ * hw->conf.listen_interval is ATH12K_MAX_HW_LISTEN_INTERVAL -- 5 -- and this field is the
+ * carrier upstream af50baccaa5f names when it says the station "always follows the listen
+ * interval ... which is set in the peer assoc command".  Overriding it HERE rather than
+ * lowering that #define deliberately leaves the OVER-THE-AIR ADVERTISED listen interval alone,
+ * exactly as ath10k does (ath10k/mac.c:10124 keeps max_listen_interval at 5 while
+ * ath10k_peer_assoc_h_listen_intval() returns 1).  The advertised value tells the AP how long
+ * to buffer UNICAST for us and is the wrong half to move; see ath12k_sta_listen_interval in
+ * core.c.  This is also NOT WMI_VDEV_PARAM_LISTEN_INTERVAL, which was measured and refuted.
+ *
+ * Gated to our own station vdev: this function also builds the peer assoc for clients
+ * associating TO us in AP mode, whose listen interval is theirs to choose and must not be
+ * rewritten.  Same gate as the DTIM knob in ath12k_bss_assoc().
+ */
+static u32 ath12k_peer_assoc_h_listen_intval(struct ath12k *ar,
+					     struct ath12k_link_vif *arvif)
+{
+	struct ieee80211_hw *hw = ath12k_ar_to_hw(ar);
+
+	if (arvif->ahvif->vdev_type != WMI_VDEV_TYPE_STA ||
+	    arvif->ahvif->vdev_subtype != WMI_VDEV_SUBTYPE_NONE)
+		return hw->conf.listen_interval;
+
+	/* non-zero overrides the workaround, so the pre-fix behaviour stays reachable from the
+	 * same image for a control arm: sta_listen_interval=5 reproduces upstream exactly.
+	 */
+	if (ath12k_sta_listen_interval)
+		return ath12k_sta_listen_interval;
+
+	return ATH12K_STA_LISTEN_INTERVAL;
+}
+
 static void ath12k_peer_assoc_h_basic(struct ath12k *ar,
 				      struct ath12k_link_vif *arvif,
 				      struct ath12k_link_sta *arsta,
@@ -2003,34 +2037,22 @@ static void ath12k_peer_assoc_h_basic(struct ath12k *ar,
 	arg->vdev_id = arvif->vdev_id;
 	arg->peer_associd = aid;
 	arg->auth_flag = true;
-	arg->peer_listen_intval = hw->conf.listen_interval;
+	arg->peer_listen_intval = ath12k_peer_assoc_h_listen_intval(ar, arvif);
 
-	/* ath10k's answer to the TODO that stood here: force the station's listen interval down,
-	 * in the peer assoc command and nowhere else.
-	 *
-	 * hw->conf.listen_interval is ATH12K_MAX_HW_LISTEN_INTERVAL -- 5 -- and this field is the
-	 * carrier upstream af50baccaa5f names when it says the station "always follows the listen
-	 * interval ... which is set in the peer assoc command".  Overriding it here rather than
-	 * lowering the #define deliberately leaves the OVER-THE-AIR advertised listen interval
-	 * alone, exactly as ath10k does; see ath12k_sta_listen_interval in core.c for why that
-	 * half is the wrong one to move and why this is NOT WMI_VDEV_PARAM_LISTEN_INTERVAL.
-	 *
-	 * Gated to our own station vdev: this function also builds the peer assoc for clients
-	 * associating TO us in AP mode, whose listen interval is theirs to choose and must not be
-	 * rewritten.  Same gate as the DTIM knob in ath12k_bss_assoc().
-	 *
-	 * Logged whenever it fires, because peer assoc reports no per-field accept or reject --
-	 * an override that was never applied and one the firmware ignored must not look alike.
+	/* Logged on EVERY station peer assoc, including the default, because peer assoc returns
+	 * no per-field accept or reject: this line is the only host-side witness that the value
+	 * was sent at all.  Without it, "the workaround never reached the command" and "the
+	 * firmware ignored it" are indistinguishable from outside the device -- and that is
+	 * exactly the discrimination any measurement of this field depends on.
 	 */
-	if (ath12k_sta_listen_interval &&
-	    arvif->ahvif->vdev_type == WMI_VDEV_TYPE_STA &&
-	    arvif->ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE) {
+	if (arvif->ahvif->vdev_type == WMI_VDEV_TYPE_STA &&
+	    arvif->ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE)
 		ath12k_info(ar->ab,
-			    "vdev %d sta ps: peer assoc listen interval %u -> %u (advertised %u unchanged)\n",
+			    "vdev %d sta ps: peer assoc listen interval %u (%s), advertised %u unchanged\n",
 			    arvif->vdev_id, arg->peer_listen_intval,
-			    ath12k_sta_listen_interval, hw->conf.listen_interval);
-		arg->peer_listen_intval = ath12k_sta_listen_interval;
-	}
+			    ath12k_sta_listen_interval ? "sta_listen_interval override" :
+							 "driver default, ath10k workaround",
+			    hw->conf.listen_interval);
 
 	arg->peer_nss = 1;
 
