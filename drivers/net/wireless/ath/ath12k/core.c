@@ -244,6 +244,74 @@ unsigned int ath12k_sta_dtim_policy;
 module_param_named(sta_dtim_policy, ath12k_sta_dtim_policy, uint, 0644);
 MODULE_PARM_DESC(sta_dtim_policy, "WMI_VDEV_PARAM_DTIM_POLICY sent at STA association: 0 send nothing (default, upstream v7.0.6 behaviour), 1 IGNORE, 2 NORMAL, 3 STICK (upstream af50baccaa5f), 4 AUTO");
 
+/* The LISTEN INTERVAL CARRIED IN WMI_PEER_ASSOC_CMDID -- the quantity every parameter tried
+ * so far was a proxy for, and the one thing in this area that had never been touched.
+ *
+ * WHAT GOVERNS THE FIRMWARE'S WAKE CADENCE.  Upstream af50baccaa5f says the station "always
+ * follows the listen interval regardless of the DTIM value", and names where that listen
+ * interval comes from: "the peer assoc command".  The chain is entirely inside this tree:
+ *
+ *     net/mac80211/main.c:1520-1523   hw.max_listen_interval defaults to 5 only if the driver
+ *                                     left it 0; conf.listen_interval = max_listen_interval
+ *     ath12k/mac.c:14837              hw->max_listen_interval = ATH12K_MAX_HW_LISTEN_INTERVAL
+ *     ath12k/wmi.h:85                 #define ATH12K_MAX_HW_LISTEN_INTERVAL 5
+ *     ath12k/mac.c (h_basic)          arg->peer_listen_intval = hw->conf.listen_interval
+ *     ath12k/wmi.c:2221               cmd->peer_listen_intval  -> WMI_PEER_ASSOC_CMDID
+ *
+ * so this device tells its own firmware to wake every 5 beacons -- 512 ms at a 102.4 ms beacon
+ * interval -- and the pooled unicast RTT measured on it, every sample in [8, 473] ms with none
+ * above 512, is what that looks like sampled by a 1 Hz ping.
+ *
+ * 🔴 THIS IS NOT WMI_VDEV_PARAM_LISTEN_INTERVAL, WHICH WAS REFUTED.  That vdev parameter was
+ * sent with the value 1, was ACCEPTED by the firmware, and moved nothing.  It is a DIFFERENT
+ * CARRIER: the peer-assoc value is latched for the peer at association and is what the
+ * firmware's power-save scheduler actually follows, which is precisely why upstream's commit
+ * message names the peer assoc command and not the vdev parameter.  A refutation of one says
+ * nothing about the other.
+ *
+ * WHY THIS OVERRIDES THE PEER-ASSOC VALUE AND NOT ATH12K_MAX_HW_LISTEN_INTERVAL.  Lowering the
+ * #define would move the OVER-THE-AIR ADVERTISED listen interval as well, because
+ * conf.listen_interval is also what mac80211 puts in the association request
+ * (net/mac80211/mlme.c:2318-2334).  That is the wrong half twice over: the advertised value
+ * tells the AP how long to buffer UNICAST for us, whereas the symptom is loss of
+ * GROUP-addressed traffic, which an AP emits after DTIM beacons whatever our listen interval
+ * says; and changing it puts the AP's buffering behaviour inside a single-variable test.
+ *
+ * ath10k, which has carried this workaround for stations since forever, does exactly what this
+ * does -- ath10k_peer_assoc_h_listen_intval() returns 1 for NL80211_IFTYPE_STATION while
+ * ath10k/mac.c:10124 leaves hw->max_listen_interval at 5.  Its comment describes the defect
+ * measured here in the vendor's own words:
+ *
+ *     "Some firmware revisions have unstable STA powersave when listen interval is set too
+ *      high (e.g. 5).  The symptoms are firmware doesn't generate NullFunc frames properly
+ *      even if buffered frames have been indicated in Beacon TIM.  Firmware would seldom wake
+ *      up to pull buffered frames.  Often pinging the device from AP would simply fail."
+ *
+ * ath11k and ath12k both dropped that workaround; ath12k_peer_assoc_h_basic() still carries
+ * the open question as a comment ("TODO: STA WAR in ath10k for listen interval required?").
+ * The vendor's own configuration agrees with ath10k: qcacld-3.0's CFG_LISTEN_INTERVAL has
+ * range 0-65535 and default 1, not 5.
+ *
+ * ⚠️ WHAT THIS CONTROL CANNOT WITNESS.  Peer assoc returns no per-field accept or reject, so
+ * the log below proves the value was SENT, never that the firmware honoured it -- a weaker
+ * control than the DTIM knob's, and it is recorded as weaker rather than read as stronger.
+ * Note too that the firmware at listen interval 5 may MALFUNCTION rather than degrade
+ * linearly (the ath10k comment says so), so a null result is not evidence that the effect is
+ * merely small, and a positive need not be proportionate.
+ *
+ *   0        leave arg->peer_listen_intval at hw->conf.listen_interval -- upstream behaviour
+ *            exactly, which on this driver is ATH12K_MAX_HW_LISTEN_INTERVAL = 5 (default)
+ *   1        wake every beacon; ath10k's value and the vendor's CFG_LISTEN_INTERVAL default
+ *   2-65535  any other value, so a null at 1 can be separated from an ignored field
+ *
+ * It is 0644 and is read when the peer assoc command is built, so re-applying it needs a
+ * RE-ASSOCIATION -- as with sta_dtim_policy, write the value and then bounce the connection.
+ * Control and treatment still share one boot and one image.
+ */
+unsigned int ath12k_sta_listen_interval;
+module_param_named(sta_listen_interval, ath12k_sta_listen_interval, uint, 0644);
+MODULE_PARM_DESC(sta_listen_interval, "override peer_listen_intval in WMI_PEER_ASSOC_CMDID for a station interface, in beacon intervals: 0 use mac80211's value (default, upstream behaviour = ATH12K_MAX_HW_LISTEN_INTERVAL 5), 1 wake every beacon (the ath10k workaround and the vendor default)");
+
 /* protected with ath12k_hw_group_mutex */
 static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);
 

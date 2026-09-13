@@ -2003,8 +2003,35 @@ static void ath12k_peer_assoc_h_basic(struct ath12k *ar,
 	arg->vdev_id = arvif->vdev_id;
 	arg->peer_associd = aid;
 	arg->auth_flag = true;
-	/* TODO: STA WAR in ath10k for listen interval required? */
 	arg->peer_listen_intval = hw->conf.listen_interval;
+
+	/* ath10k's answer to the TODO that stood here: force the station's listen interval down,
+	 * in the peer assoc command and nowhere else.
+	 *
+	 * hw->conf.listen_interval is ATH12K_MAX_HW_LISTEN_INTERVAL -- 5 -- and this field is the
+	 * carrier upstream af50baccaa5f names when it says the station "always follows the listen
+	 * interval ... which is set in the peer assoc command".  Overriding it here rather than
+	 * lowering the #define deliberately leaves the OVER-THE-AIR advertised listen interval
+	 * alone, exactly as ath10k does; see ath12k_sta_listen_interval in core.c for why that
+	 * half is the wrong one to move and why this is NOT WMI_VDEV_PARAM_LISTEN_INTERVAL.
+	 *
+	 * Gated to our own station vdev: this function also builds the peer assoc for clients
+	 * associating TO us in AP mode, whose listen interval is theirs to choose and must not be
+	 * rewritten.  Same gate as the DTIM knob in ath12k_bss_assoc().
+	 *
+	 * Logged whenever it fires, because peer assoc reports no per-field accept or reject --
+	 * an override that was never applied and one the firmware ignored must not look alike.
+	 */
+	if (ath12k_sta_listen_interval &&
+	    arvif->ahvif->vdev_type == WMI_VDEV_TYPE_STA &&
+	    arvif->ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE) {
+		ath12k_info(ar->ab,
+			    "vdev %d sta ps: peer assoc listen interval %u -> %u (advertised %u unchanged)\n",
+			    arvif->vdev_id, arg->peer_listen_intval,
+			    ath12k_sta_listen_interval, hw->conf.listen_interval);
+		arg->peer_listen_intval = ath12k_sta_listen_interval;
+	}
+
 	arg->peer_nss = 1;
 
 	bss_conf = ath12k_mac_get_link_bss_conf(arvif);
