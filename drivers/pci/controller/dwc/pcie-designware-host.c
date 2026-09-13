@@ -1221,13 +1221,31 @@ static int dw_pcie_pme_turn_off(struct dw_pcie *pci)
 int dw_pcie_suspend_noirq(struct dw_pcie *pci)
 {
 	bool pme_capable = false;
+	bool d3cold_possible;
 	int ret = 0;
 	u32 val;
 
 	if (!dw_pcie_link_up(pci))
 		goto stop_link;
 
-	if (!pci_host_common_d3cold_possible(pci->pp.bridge, &pme_capable))
+	/* Say which branch this suspend took.  Whether the controller is torn
+	 * down at all is decided here, and nothing downstream reports it: a
+	 * suspend that returns at this line leaves the link up and never sets
+	 * pci->suspended, so the resume path is a no-op too and the whole
+	 * cycle is indistinguishable, from the log, from one that worked.
+	 *
+	 * The walk this calls requires every active device on the bus -- the
+	 * root port included -- to be in D3hot.  Clearing an endpoint's
+	 * d3cold_allowed clears the root port's bridge_d3, which stops
+	 * pci_pm_suspend_noirq() putting the port to sleep, which fails the
+	 * walk.  So that sysfs knob reaches this branch, and its effect is to
+	 * skip the teardown rather than to change it.
+	 */
+	d3cold_possible = pci_host_common_d3cold_possible(pci->pp.bridge,
+							  &pme_capable);
+	dev_info(pci->dev, "suspend_noirq: d3cold_possible=%d pme_capable=%d\n",
+		 d3cold_possible, pme_capable);
+	if (!d3cold_possible)
 		return 0;
 
 	if (pci->pp.ops->pme_turn_off) {

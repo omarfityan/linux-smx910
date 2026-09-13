@@ -4663,6 +4663,19 @@ enum wmi_sta_powersave_param {
 	WMI_STA_PS_PARAM_PSPOLL_COUNT = 2,
 	WMI_STA_PS_PARAM_INACTIVITY_TIME = 3,
 	WMI_STA_PS_PARAM_UAPSD = 4,
+
+	/* Selects the firmware's opportunistic power management scheme.
+	 * The firmware enables OPM by default, so a host that never sends
+	 * this parameter gets OPM whether it wanted it or not.
+	 */
+	WMI_STA_PS_ENABLE_OPM = 6,
+};
+
+/* Values for WMI_STA_PS_ENABLE_OPM. */
+enum wmi_sta_ps_scheme_cfg {
+	WMI_STA_PS_OPM_CONSERVATIVE = 0,
+	WMI_STA_PS_OPM_AGGRESSIVE = 1,
+	WMI_STA_PS_USER_DEF = 2,
 };
 
 enum wmi_sta_ps_param_uapsd {

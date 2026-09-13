@@ -4486,6 +4486,38 @@ static void ath12k_mac_vif_setup_ps(struct ath12k_link_vif *arvif)
 	enable_ps = arvif->ahvif->ps;
 	if (enable_ps) {
 		psmode = WMI_STA_PS_MODE_ENABLED;
+
+		/* Opportunistic power management is ENABLED BY DEFAULT INSIDE
+		 * THE FIRMWARE, so a host that never mentions it gets OPM
+		 * implicitly the moment it turns station power save on.  The
+		 * vendor driver says so in as many words and disables it
+		 * explicitly on every power-save enable
+		 * (qcacld-3.0 wma_set_force_sleep(): "Advanced power save is
+		 * enabled by default in Firmware / So Disable advanced power
+		 * save explicitly"), sending this parameter first, ahead of the
+		 * inactivity timeout and ahead of the power-save mode command.
+		 * The order is reproduced here.
+		 *
+		 * The value is the device's own: its vendor WLAN configuration
+		 * carries gOptimizedPowerManagement=0, which the vendor stack
+		 * maps to the conservative scheme.
+		 *
+		 * This driver's copy of enum wmi_sta_powersave_param stopped at
+		 * UAPSD, so the parameter had no name here and had never been
+		 * sent.  A truncated copy of a wire protocol fails silently:
+		 * nothing errors, the firmware simply keeps its own default.
+		 */
+		ret = ath12k_wmi_set_sta_ps_param(ar, arvif->vdev_id,
+						  WMI_STA_PS_ENABLE_OPM,
+						  WMI_STA_PS_OPM_CONSERVATIVE);
+		if (ret) {
+			ath12k_warn(ar->ab, "failed to set OPM scheme for vdev %d: %d\n",
+				    arvif->vdev_id, ret);
+			return;
+		}
+		ath12k_info(ar->ab, "vdev %d sta ps: OPM scheme set conservative (%d)\n",
+			    arvif->vdev_id, WMI_STA_PS_OPM_CONSERVATIVE);
+
 		param = WMI_STA_PS_PARAM_INACTIVITY_TIME;
 
 		timeout = conf->dynamic_ps_timeout;
