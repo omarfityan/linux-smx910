@@ -125,10 +125,16 @@ MODULE_PARM_DESC(wow_flags, "WMI_WOW_FLAG_* bitmask sent in WMI_WOW_ENABLE_CMDID
  *
  * WHY IT HAPPENS.  ath12k turns station power save on and then never tells the firmware
  * anything about how to sleep.  WMI_VDEV_PARAM_LISTEN_INTERVAL, WMI_VDEV_PARAM_DTIM_POLICY
- * and WMI_STA_DTIM_PS_METHOD_CMDID are all enumerated in wmi.h and called from nowhere, and
- * ath12k_mac_op_config() is a stub returning 0 while the driver advertises
- * IEEE80211_HW_SUPPORTS_DYNAMIC_PS -- so every IEEE80211_CONF_CHANGE_PS is discarded too.
+ * and WMI_STA_DTIM_PS_METHOD_CMDID are all enumerated in wmi.h and called from nowhere.
  * The firmware is left to choose its own cadence, and it chooses a deep one.
+ *
+ * (An earlier note here also blamed ath12k_mac_op_config() being a stub while the driver
+ * advertises IEEE80211_HW_SUPPORTS_DYNAMIC_PS.  That is a red herring: ieee80211_recalc_ps()
+ * returns early for any SUPPORTS_DYNAMIC_PS driver, BEFORE the only assignments to
+ * hw.conf.dynamic_ps_timeout and hw.conf.ps_dtim_period, and cfg.c fires .config before
+ * recalc runs -- so the callback always arrives with IEEE80211_CONF_PS clear and the timeout
+ * zero.  There is nothing in it to discard.  rtw88 and rtw89 were fixed in 2023 by DELETING
+ * their CONF_CHANGE_PS handlers, and iwlwifi stubs .config in both op_modes.)
  *
  * WHAT THE VENDOR DOES ON THIS EXACT SILICON.  Its WLAN configuration carries
  * gEnableModulatedDTIM=5 together with enable_mod_dtim_on_system_suspend=1, and the
@@ -141,11 +147,27 @@ MODULE_PARM_DESC(wow_flags, "WMI_WOW_FLAG_* bitmask sent in WMI_WOW_ENABLE_CMDID
  * It sets the awake state explicitly, sending the listen interval and then
  * WMI_VDEV_PARAM_DTIM_POLICY = NORMAL_DTIM together (pmo_core_set_vdev_resume_dtim()).
  *
- * 🔴 NOTE WHAT THIS IS NOT.  Advertising listen interval 5 over the air
- * (ATH12K_MAX_HW_LISTEN_INTERVAL) cannot by itself account for the observed cadence: 5
- * beacons is 0.5 s and the station sleeps ~8 s, sixteen times longer.  The arithmetic
- * refutes that explanation, which is why this is a selectable bitmask rather than a
- * one-line change to that constant.
+ * 🔴🔴 THE PARAGRAPH THAT STOOD HERE WAS WRONG, AND IT POINTED THE WORK AWAY FROM THE FIX.
+ * It argued that advertising listen interval 5 (ATH12K_MAX_HW_LISTEN_INTERVAL) "cannot
+ * account for the observed cadence: 5 beacons is 0.5 s and the station sleeps ~8 s".
+ * Both halves fail.
+ *
+ * The ~8 s came from `beacon rx` in `iw station dump`, which is
+ * sdata->deflink.u.mgd.count_beacon_signal -- a count of beacons MAC80211 PARSED IN THE
+ * HOST, incremented in ieee80211_rx_mgmt_beacon().  It counts what the firmware chose to
+ * forward, not what the radio woke for, and the power-save-off calibration cannot separate
+ * the two because firmware-side beacon forwarding is exactly what changes between the arms.
+ * Measured against it: a station completing 40 SSH round trips over 200 s still read 3.8 %.
+ *
+ * The retrieval cadence the pooled unicast RTT actually shows is ~512 ms = 5 x 102.4 ms --
+ * every sample taken with power save on falls in [8, 473] ms, none above 512 -- which is
+ * the listen interval, exactly the explanation the arithmetic was used to dismiss.
+ *
+ * ⇒ The listen interval is BACK ON THE TABLE, and ath10k has forced it to 1 for stations
+ * since forever, in ath10k_peer_assoc_h_listen_intval(), whose comment describes this
+ * defect: "unstable STA powersave when listen interval is set too high (e.g. 5) ... firmware
+ * would seldom wake up to pull buffered frames.  Often pinging the device from AP would
+ * simply fail."  ath11k and ath12k both dropped that workaround.
  *
  *   bit 0  send WMI_VDEV_PARAM_DTIM_POLICY = WMI_BEACON_DTIM_POLICY_NORMAL
  *   bit 1  send WMI_VDEV_PARAM_LISTEN_INTERVAL = 1
@@ -177,6 +199,50 @@ MODULE_PARM_DESC(wow_flags, "WMI_WOW_FLAG_* bitmask sent in WMI_WOW_ENABLE_CMDID
 unsigned int ath12k_sta_wake_cadence;
 module_param_named(sta_wake_cadence, ath12k_sta_wake_cadence, uint, 0644);
 MODULE_PARM_DESC(sta_wake_cadence, "wake-cadence params sent on STA power-save enable: bit0 DTIM_POLICY NORMAL, bit1 LISTEN_INTERVAL 1, bit2 RX_WAKE_POLICY WAKE, bit3 TX_WAKE_THRESHOLD ALWAYS, bit4 PSPOLL_COUNT NO_MAX, bit5 SPEC_WAKE_INTERVAL 0 (default 0 = send nothing, upstream behaviour)");
+
+/* The DTIM policy sent at ASSOCIATION, which is a different lever from the bitmask above and
+ * is the one upstream chose.
+ *
+ * WHAT IT FIXES.  WCN7850's firmware follows the listen interval and ignores the AP's DTIM
+ * period, so the station wakes on its own schedule and collects almost no group-addressed
+ * traffic.  Upstream states it plainly in af50baccaa5f ("wifi: ath12k: Set DTIM policy to
+ * stick mode for station interface", tested on WCN7850 hw2.0 PCI):
+ *
+ *     "Currently, the station always follows the listen interval regardless of the DTIM
+ *      value.  The DTIM function does not work as expected.  The default value of the listen
+ *      interval is 5 so that the STA wakes up every 500ms when power save is on."
+ *
+ * Its fix is WMI_VDEV_PARAM_DTIM_POLICY = STICK, "per the firmware team's request", so the
+ * station follows the AP's DTIM "rather than listen interval, which is set in the peer assoc
+ * command".  ath11k has carried the identical fix since 55e18e5a76ab (2021).
+ *
+ * 🔴 WHY THE CALL SITE MATTERS, AND WHY bit 0 ABOVE IS NOT THIS.  bit 0 sends the same vdev
+ * parameter with the value NORMAL, from ath12k_mac_vif_setup_ps() -- a different value, at a
+ * different moment.  Upstream sends STICK from ath12k_bss_assoc(), inside the association
+ * exchange, because the listen interval it has to override is latched from peer-assoc.  A
+ * send from the power-save path is accepted by the firmware and may change nothing, which is
+ * indistinguishable from the parameter having no effect.  bit 0's refutation therefore says
+ * nothing about this knob.
+ *
+ * WHY IT CARRIES A VALUE AND NOT A BOOLEAN.  This firmware branch is c5-00284; upstream
+ * validated STICK on c7-00108.  A null result has to be separable from "this build ignores
+ * the policy", so all four values stay reachable from one image -- including NORMAL, which
+ * re-tests bit 0's value from the correct call site and so separates "wrong value" from
+ * "wrong call site" without a second build.
+ *
+ *   0  send nothing (default; v7.0.6 behaviour exactly)
+ *   1  WMI_BEACON_DTIM_POLICY_IGNORE
+ *   2  WMI_BEACON_DTIM_POLICY_NORMAL   <- the value bit 0 sends, from the other call site
+ *   3  WMI_BEACON_DTIM_POLICY_STICK    <- upstream's fix
+ *   4  WMI_BEACON_DTIM_POLICY_AUTO
+ *
+ * It is 0644, but unlike the bitmask above it is read at association, so re-applying it needs
+ * a RE-ASSOCIATION rather than a power-save toggle.  Control and treatment still share one
+ * boot and one image: write the value, then bounce the connection.
+ */
+unsigned int ath12k_sta_dtim_policy;
+module_param_named(sta_dtim_policy, ath12k_sta_dtim_policy, uint, 0644);
+MODULE_PARM_DESC(sta_dtim_policy, "WMI_VDEV_PARAM_DTIM_POLICY sent at STA association: 0 send nothing (default, upstream v7.0.6 behaviour), 1 IGNORE, 2 NORMAL, 3 STICK (upstream af50baccaa5f), 4 AUTO");
 
 /* protected with ath12k_hw_group_mutex */
 static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);

@@ -6607,6 +6607,7 @@ ath12k_wmi_mac_phy_get_hw_link_id(const struct ath12k_wmi_mac_phy_caps_params *p
 
 extern unsigned int ath12k_wow_flags;
 extern unsigned int ath12k_sta_wake_cadence;
+extern unsigned int ath12k_sta_dtim_policy;
 
 int ath12k_wmi_wow_host_wakeup_ind(struct ath12k *ar);
 int ath12k_wmi_wow_enable(struct ath12k *ar);

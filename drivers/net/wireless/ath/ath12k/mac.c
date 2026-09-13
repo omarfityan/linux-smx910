@@ -3972,6 +3972,37 @@ static void ath12k_bss_assoc(struct ath12k *ar,
 		ath12k_warn(ar->ab, "failed to set vdev %i OBSS PD parameters: %d\n",
 			    arvif->vdev_id, ret);
 
+	/* Make the station follow the AP's DTIM instead of its own listen interval.
+	 *
+	 * Without this the firmware wakes on ATH12K_MAX_HW_LISTEN_INTERVAL beacons -- 5, carried
+	 * to it in WMI_PEER_ASSOC_CMDID's peer_listen_intval -- and collects essentially no
+	 * group-addressed traffic.  Measured on this device with power save on: zero broadcast
+	 * ARP across 250 DTIM opportunities, and 6 of 200 frames of a multicast group it had
+	 * JOINED, so nothing on the LAN can resolve its address until it transmits first.
+	 *
+	 * This is upstream af50baccaa5f, whose gating conditions are reproduced exactly; see
+	 * ath12k_sta_dtim_policy in core.c for why the value is selectable and why sending the
+	 * same parameter from ath12k_mac_vif_setup_ps() is NOT the same test.
+	 *
+	 * Reported either way: a parameter the firmware rejected and one that was silently never
+	 * sent must never look alike, or a negative result cannot be told from an untaken test.
+	 */
+	if (ath12k_sta_dtim_policy >= WMI_BEACON_DTIM_POLICY_IGNORE &&
+	    ath12k_sta_dtim_policy <= WMI_BEACON_DTIM_POLICY_AUTO &&
+	    ar->ab->hw_params->supports_sta_ps &&
+	    ahvif->vdev_type == WMI_VDEV_TYPE_STA &&
+	    ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE) {
+		ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+						    WMI_VDEV_PARAM_DTIM_POLICY,
+						    ath12k_sta_dtim_policy);
+		if (ret)
+			ath12k_warn(ar->ab, "failed to set vdev %d DTIM policy %u: %d\n",
+				    arvif->vdev_id, ath12k_sta_dtim_policy, ret);
+		else
+			ath12k_info(ar->ab, "vdev %d sta ps: DTIM policy set %u at assoc\n",
+				    arvif->vdev_id, ath12k_sta_dtim_policy);
+	}
+
 	/*
 	 * Do not stop the 11d scan before it has actually learned a country.
 	 *
