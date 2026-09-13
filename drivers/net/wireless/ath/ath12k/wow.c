@@ -739,7 +739,7 @@ static void ath12k_wow_prepare_arp_offload(struct ath12k_link_vif *arvif,
 		   vif_cfg.arp_addr_cnt, vif->addr, offload->ipv4_addr);
 }
 
-static int ath12k_wow_arp_ns_offload(struct ath12k *ar, bool enable)
+int ath12k_wow_arp_ns_offload(struct ath12k *ar, bool enable)
 {
 	struct wmi_arp_ns_offload_arg *offload;
 	struct ath12k_link_vif *arvif;
@@ -988,6 +988,31 @@ int ath12k_wow_op_resume(struct ieee80211_hw *hw)
 		ath12k_warn(ar->ab, "failed to clear wow protocol offload events: %d\n",
 			    ret);
 		goto exit;
+	}
+
+	/* ath12k_wow_protocol_offload() has just disabled the ARP/NS responder along with
+	 * the GTK rekey offload.  That is upstream's behaviour and it is wrong for a
+	 * station that wants to stay answerable while it is awake, so re-arm it.
+	 *
+	 * The vendor driver never hits this, because it does not disable the responder at
+	 * resume at all: hdd_disable_arp_offload() consults pmo_core_arp_check_offload(),
+	 * which returns E_INVAL -- "Flushing of ARP offload not required" -- whenever
+	 * active-mode offload is on and the offload is already applied.  On this device's
+	 * stock, where gActiveModeOffload defaults to 1, that is always.
+	 *
+	 * Without this the responder would survive exactly one suspend and then be gone for
+	 * the rest of the boot: the inetaddr notifier only fires when an address actually
+	 * changes, so nothing would ever arm it again.
+	 */
+	if (ath12k_arp_ns_offload_awake) {
+		ret = ath12k_wow_arp_ns_offload(ar, true);
+		if (ret) {
+			ath12k_warn(ar->ab, "failed to re-arm awake arp ns offload after resume: %d\n",
+				    ret);
+			goto exit;
+		}
+		ath12k_dbg(ar->ab, ATH12K_DBG_WOW,
+			   "re-armed awake arp ns offload after resume\n");
 	}
 
 	ret = ath12k_wow_set_keepalive(ar,

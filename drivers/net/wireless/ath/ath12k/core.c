@@ -312,6 +312,68 @@ unsigned int ath12k_sta_listen_interval;
 module_param_named(sta_listen_interval, ath12k_sta_listen_interval, uint, 0644);
 MODULE_PARM_DESC(sta_listen_interval, "override peer_listen_intval in WMI_PEER_ASSOC_CMDID for a station interface, in beacon intervals: 0 use mac80211's value (default, upstream behaviour = ATH12K_MAX_HW_LISTEN_INTERVAL 5), 1 wake every beacon (the ath10k workaround and the vendor default)");
 
+/* ARM THE FIRMWARE'S ARP/NS RESPONDER WHILE THE STATION IS AWAKE, AS THE VENDOR DOES.
+ *
+ * THE SYMPTOM.  A station of this firmware, associated and in power save, answers essentially
+ * no broadcast ARP: measured on this device, 1 reply to 30 broadcast ARP requests while the
+ * very same 58-second window answered 30 of 30 unicast pings.  Nothing on the LAN can resolve
+ * the device's address until it happens to transmit first, so a host whose neighbour entry has
+ * expired gets "No route to host" from a machine that is awake, associated and idle.
+ *
+ * WHY THIS IS NOT A WAKE-CADENCE FIX, AND WHY THAT MATTERS.  The listen interval carried in
+ * WMI_PEER_ASSOC_CMDID is real and controllable on this firmware -- forcing it to 1 moves the
+ * unicast buffering delay from a 512 ms ceiling to a 102 ms one, exactly as predicted -- and it
+ * does NOT restore group reception.  Neither does WMI_VDEV_PARAM_DTIM_POLICY at any value.
+ * Eight WMI parameters have now been refuted against this symptom.  The station's wake cadence
+ * and its group-addressed path are independent here, so no cadence knob is going to fix this.
+ *
+ * WHAT THE FIRMWARE CAN ALREADY DO.  With the host FROZEN across a system suspend -- ping 0/30,
+ * proving the host stack could not have answered anything -- this firmware answered broadcast
+ * ARP from its own responder, at a median round trip of about 100 ms.  So the radio DOES collect
+ * group-addressed frames off the air; what fails is their delivery to the host.  A responder
+ * living in the firmware sidesteps that delivery path entirely.
+ *
+ * WHY ARMING IT WHILE AWAKE IS THE VENDOR'S OWN DESIGN, NOT AN INVENTION.  This device's stock
+ * qcacld-3.0 arms the responder from the IPv4-change notifier while running, and then declines
+ * to re-arm it at suspend because it is already installed:
+ *
+ *     core/hdd/src/wlan_hdd_power.c      __hdd_ipv4_notifier_work_queue() ->
+ *                                        hdd_enable_arp_offload(.., pmo_ipv4_change_notify)
+ *     components/pmo/core/src/wlan_pmo_arp.c
+ *         pmo_core_do_enable_arp_offload()  case pmo_ipv4_change_notify:
+ *             "enable arp when active offload is true (ipv4 notifier)"
+ *         pmo_core_arp_check_offload()      at suspend AND at resume, returns E_INVAL when
+ *             active_mode_offload && is_offload_applied -- i.e. SKIP, it is already armed
+ *
+ * gActiveModeOffload, hostArpOffload and hostNSOffload are all absent from this device's own
+ * vendor/etc/wifi/kiwi_v2/WCNSS_qcom_cfg.ini, and all three are CFG_INI_BOOL(..., 1, ...) in
+ * its own qcacld tree, so all three are enabled on stock.  ath12k does the exact inverse: it
+ * arms the responder only inside ath12k_wow_op_suspend() and tears it down again in
+ * ath12k_wow_op_resume(), which is to say it is armed for precisely the interval during which
+ * the host is not running and could have answered for itself.
+ *
+ * ⚠️ THIS ROUTES AROUND THE DEFECT RATHER THAN REPAIRING IT.  The group-addressed path is still
+ * broken; the firmware simply answers the one kind of group traffic that matters for
+ * reachability, so the symptom stops mattering.  It is a missing layer restored, and it should
+ * not be reported as parity with stock: stock's screen-off state runs modulated DTIM 5 with
+ * per-screen-state APF programs, so stock may never occupy the awake-idle power-saving state in
+ * which this device loses reachability.
+ *
+ * WHAT CARRIES IT.  mac80211 already maintains vif.cfg.arp_addr_list from the inetaddr notifier
+ * (net/mac80211/main.c, ieee80211_ifa_changed) and raises BSS_CHANGED_ARP_FILTER once the
+ * interface is associated -- the exact analogue of the vendor's trigger.  ath12k ignored that
+ * flag entirely; ath11k at least caches the addresses but still only arms at suspend.
+ *
+ * It is 0644 and is applied by the ARP-filter and association hooks, so the control arm is a
+ * WITHIN-BOOT REVERSAL: write the value, then make the notifier fire by adding and removing a
+ * secondary address on the wireless interface, which leaves the primary address and the
+ * association untouched.  Writing 0 sends an explicit disable rather than merely skipping the
+ * next arm, so the two arms differ by this parameter alone.
+ */
+bool ath12k_arp_ns_offload_awake = true;
+module_param_named(arp_ns_offload_awake, ath12k_arp_ns_offload_awake, bool, 0644);
+MODULE_PARM_DESC(arp_ns_offload_awake, "keep the firmware's ARP/NS responder armed while the station is awake, as this device's vendor driver does: Y arm it at association and on every IPv4 address change and keep it across resume (default), N upstream behaviour, armed only across a WoWLAN suspend");
+
 /* protected with ath12k_hw_group_mutex */
 static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);
 

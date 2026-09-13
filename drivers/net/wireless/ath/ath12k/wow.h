@@ -41,6 +41,7 @@ int ath12k_wow_op_resume(struct ieee80211_hw *hw);
 void ath12k_wow_op_set_wakeup(struct ieee80211_hw *hw, bool enabled);
 int ath12k_wow_enable(struct ath12k *ar);
 int ath12k_wow_wakeup(struct ath12k *ar);
+int ath12k_wow_arp_ns_offload(struct ath12k *ar, bool enable);
 
 #else
 
@@ -55,6 +56,11 @@ static inline int ath12k_wow_enable(struct ath12k *ar)
 }
 
 static inline int ath12k_wow_wakeup(struct ath12k *ar)
+{
+	return 0;
+}
+
+static inline int ath12k_wow_arp_ns_offload(struct ath12k *ar, bool enable)
 {
 	return 0;
 }

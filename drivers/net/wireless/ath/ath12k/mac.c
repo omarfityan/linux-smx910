@@ -4435,6 +4435,45 @@ static int ath12k_mac_fils_discovery(struct ath12k_link_vif *arvif,
 	return ret;
 }
 
+/* Keep the firmware's ARP/NS responder armed while the station is AWAKE, which is what this
+ * device's own vendor driver does and what ath12k does not.  See ath12k_arp_ns_offload_awake
+ * in core.c for the measurements and for the vendor source this follows.
+ */
+static void ath12k_mac_arm_arp_ns_offload(struct ieee80211_hw *hw,
+					  struct ieee80211_vif *vif)
+{
+	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
+	struct ath12k_link_vif *arvif;
+	struct ath12k *ar;
+	int ret;
+
+	lockdep_assert_wiphy(hw->wiphy);
+
+	if (vif->type != NL80211_IFTYPE_STATION)
+		return;
+
+	/* ath12k_wow_arp_ns_offload() walks ar->arvifs itself and acts only on the deflink
+	 * of a station vdev, so the radio behind the deflink is the one to hand it and a
+	 * single call covers the interface.
+	 */
+	arvif = &ahvif->deflink;
+	ar = arvif->ar;
+	if (!ar)
+		return;
+
+	ret = ath12k_wow_arp_ns_offload(ar, ath12k_arp_ns_offload_awake);
+	if (ret) {
+		ath12k_warn(ar->ab, "failed to %s awake arp ns offload: %d\n",
+			    ath12k_arp_ns_offload_awake ? "arm" : "disarm", ret);
+		return;
+	}
+
+	ath12k_dbg(ar->ab, ATH12K_DBG_WOW,
+		   "%s awake arp ns offload for %d ipv4 address(es)\n",
+		   ath12k_arp_ns_offload_awake ? "armed" : "disarmed",
+		   vif->cfg.arp_addr_cnt);
+}
+
 void ath12k_mac_op_vif_cfg_changed(struct ieee80211_hw *hw,
 				   struct ieee80211_vif *vif,
 				   u64 changed)
@@ -4503,7 +4542,28 @@ void ath12k_mac_op_vif_cfg_changed(struct ieee80211_hw *hw,
 				ath12k_bss_disassoc(ar, arvif);
 			}
 		}
+
+		/* Arm at association as well as on address change.  The inetaddr notifier
+		 * fires only when an address actually changes, and mac80211 forwards it to
+		 * the driver only once the interface is associated
+		 * (net/mac80211/main.c, ieee80211_ifa_changed), so on a reconnect where the
+		 * address is already configured no BSS_CHANGED_ARP_FILTER would ever arrive
+		 * and the responder would stay unarmed for the life of the connection.
+		 *
+		 * On a first connection this typically arms with arp_addr_cnt 0, because
+		 * DHCP has not completed yet; the address change that follows re-arms it
+		 * with the real address.
+		 */
+		if (vif->cfg.assoc)
+			ath12k_mac_arm_arp_ns_offload(hw, vif);
 	}
+
+	/* mac80211 raises this from its inetaddr notifier once the interface is
+	 * associated, having already refreshed vif.cfg.arp_addr_list.  It is the exact
+	 * analogue of the vendor's pmo_ipv4_change_notify trigger, and ath12k ignored it.
+	 */
+	if (changed & BSS_CHANGED_ARP_FILTER)
+		ath12k_mac_arm_arp_ns_offload(hw, vif);
 
 	if (changed & BSS_CHANGED_PS) {
 		unsigned long ps_links = ahvif->links_map;
