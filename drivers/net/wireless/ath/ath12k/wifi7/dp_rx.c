@@ -354,14 +354,37 @@ static void ath12k_wifi7_dp_rx_h_mpdu(struct ath12k_pdev_dp *dp_pdev,
 		 * packets only for AP as STA sends unicast packets.
 		 */
 		rxcb->is_mcbc = rxcb->is_mcbc && !peer->ucast_ra_only;
-
-		if (rxcb->is_mcbc)
-			enctype = peer->sec_type_grp;
-		else
-			enctype = peer->sec_type;
-	} else {
-		enctype = HAL_ENCRYPT_TYPE_OPEN;
 	}
+
+	/* For a group-addressed frame, take the cipher from the hardware that
+	 * decrypted it rather than from the peer.
+	 *
+	 * A group frame has no per-station context, and this chip reports a
+	 * peer id of 0 for most of them -- 0 being exactly the value
+	 * ath12k_dp_peer_find_by_peerid() rejects -- so the lookup above
+	 * legitimately finds nothing through no fault of the frame. Falling
+	 * back to OPEN there discards traffic the hardware has already
+	 * decrypted: the crypto header this function's callee rebuilds is
+	 * sized from enctype, so OPEN pushes a zero-length header and writes
+	 * nothing into it, while the frame control keeps its protected bit.
+	 * mac80211 then reads its key index from what is now the RFC1042 SNAP
+	 * header, gets 0, finds no key installed at index 0 and drops the
+	 * frame as unprotected. Broadcast and multicast are lost that way
+	 * whatever their L2 destination, because the only discriminator is
+	 * is_mcbc.
+	 *
+	 * The accessor behind rx_info->enctype returns OPEN unless the
+	 * descriptor's encrypt-info-valid bit is set, so an unencrypted
+	 * network still reports OPEN and still gets no crypto header.
+	 * ath12k_dp_rx_h_undecap_frag() already takes the cipher from this
+	 * same source.
+	 */
+	if (rxcb->is_mcbc)
+		enctype = rx_info->enctype;
+	else if (peer)
+		enctype = peer->sec_type;
+	else
+		enctype = HAL_ENCRYPT_TYPE_OPEN;
 
 	if (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap)
 		is_decrypted = rx_info->is_decrypted;
