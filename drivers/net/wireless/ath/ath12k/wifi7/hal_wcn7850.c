@@ -614,6 +614,7 @@ void ath12k_hal_extract_rx_desc_data_wcn7850(struct hal_rx_desc_data *rx_desc_da
 	rx_desc_data->ip_csum_fail = ath12k_hal_rx_h_ip_cksum_fail_wcn7850(rx_desc);
 	rx_desc_data->is_decrypted = ath12k_hal_rx_h_is_decrypted_wcn7850(rx_desc);
 	rx_desc_data->err_bitmap = ath12k_hal_rx_h_mpdu_err_wcn7850(rx_desc);
+	rx_desc_data->msdu_end_info = __le32_to_cpu(rx_desc->u.wcn7850.msdu_end.info13);
 }
 
 int ath12k_hal_srng_create_config_wcn7850(struct ath12k_hal *hal)

@@ -19,6 +19,7 @@
 #include <linux/export.h>
 #include <linux/kcov.h>
 #include <linux/bitops.h>
+#include <linux/net.h>
 #include <kunit/visibility.h>
 #include <net/mac80211.h>
 #include <net/ieee80211_radiotap.h>
@@ -2001,13 +2002,57 @@ ieee80211_rx_get_bigtk(struct ieee80211_rx_data *rx, int idx)
 	return key;
 }
 
+/*
+ * Both RX_DROP_U_UNPROTECTED returns below report the same drop reason, so a
+ * reason-code trace can neither tell them apart nor say which key index was
+ * looked up and which slots actually held a key. Report that here instead.
+ * Silent and free until the site is armed with
+ *   echo 'format "unprot-drop" +p' > /sys/kernel/debug/dynamic_debug/control
+ */
+static void ieee80211_rx_log_unprotected_drop(struct ieee80211_rx_data *rx,
+					      const char *site, int keyidx,
+					      int mmie_keyidx)
+{
+	static const u8 elided[ETH_ALEN] = {};
+	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)rx->skb->data;
+	struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(rx->skb);
+	u8 link_gtk = 0, sta_gtk = 0, sdata_keys = 0;
+	bool full_hdr = rx->skb->len >= 24;
+	int i;
+
+	if (rx->link)
+		for (i = 0; i < ARRAY_SIZE(rx->link->gtk); i++)
+			if (rcu_access_pointer(rx->link->gtk[i]))
+				link_gtk |= BIT(i);
+
+	if (rx->link_sta)
+		for (i = 0; i < ARRAY_SIZE(rx->link_sta->gtk); i++)
+			if (rcu_access_pointer(rx->link_sta->gtk[i]))
+				sta_gtk |= BIT(i);
+
+	for (i = 0; i < ARRAY_SIZE(rx->sdata->keys); i++)
+		if (rcu_access_pointer(rx->sdata->keys[i]))
+			sdata_keys |= BIT(i);
+
+	net_dbg_ratelimited("unprot-drop site=%s keyidx=%d mmie=%d fc=0x%04x hdrlen=%u len=%u flag=0x%08x link_id=%d link=%d link_sta=%d link_gtk=0x%02x sta_gtk=0x%02x sdata_keys=0x%02x a1=%pM a2=%pM a3=%pM\n",
+			    site, keyidx, mmie_keyidx,
+			    le16_to_cpu(hdr->frame_control),
+			    ieee80211_hdrlen(hdr->frame_control),
+			    rx->skb->len, status->flag,
+			    rx->link_id, !!rx->link, !!rx->link_sta,
+			    link_gtk, sta_gtk, sdata_keys,
+			    hdr->addr1,
+			    full_hdr ? hdr->addr2 : elided,
+			    full_hdr ? hdr->addr3 : elided);
+}
+
 static ieee80211_rx_result debug_noinline
 ieee80211_rx_h_decrypt(struct ieee80211_rx_data *rx)
 {
 	struct sk_buff *skb = rx->skb;
 	struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
-	int keyidx;
+	int keyidx = -1;
 	ieee80211_rx_result result = RX_DROP_U_DECRYPT_FAIL;
 	struct ieee80211_key *sta_ptk = NULL;
 	struct ieee80211_key *ptk_idx = NULL;
@@ -2105,8 +2150,12 @@ ieee80211_rx_h_decrypt(struct ieee80211_rx_data *rx)
 			return RX_DROP_U_BAD_MGMT_KEYIDX; /* unexpected BIP keyidx */
 		if (rx->link_sta) {
 			if (ieee80211_is_group_privacy_action(skb) &&
-			    test_sta_flag(rx->sta, WLAN_STA_MFP))
+			    test_sta_flag(rx->sta, WLAN_STA_MFP)) {
+				ieee80211_rx_log_unprotected_drop(rx, "bip-mfp",
+								  keyidx,
+								  mmie_keyidx);
 				return RX_DROP_U_UNPROTECTED;
+			}
 
 			rx->key = rcu_dereference(rx->link_sta->gtk[mmie_keyidx]);
 		}
@@ -2195,6 +2244,10 @@ ieee80211_rx_h_decrypt(struct ieee80211_rx_data *rx)
 
 		/* TODO: add threshold stuff again */
 	} else {
+		ieee80211_rx_log_unprotected_drop(rx,
+						  mmie_keyidx >= 0 ?
+							"bip-nokey" : "keylookup",
+						  keyidx, mmie_keyidx);
 		return RX_DROP_U_UNPROTECTED;
 	}
 

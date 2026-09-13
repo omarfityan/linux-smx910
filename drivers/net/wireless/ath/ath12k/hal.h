@@ -732,6 +732,15 @@ struct hal_rx_desc_data {
 	    is_mcbc:1,
 	    seq_ctl_valid:1,
 	    fc_valid:1;
+	/* Raw chip status word for the MSDU, recorded for diagnostics only.
+	 * Nothing on the driver's decision path may read this: it exists so
+	 * that per-frame status the driver does not otherwise consume -- the
+	 * AST lookup result, and the power-save delivery bits that say the
+	 * frame came out of the AP's buffered group queue -- is readable when
+	 * a receive path is under investigation. Zero on chips that do not
+	 * fill it.
+	 */
+	u32 msdu_end_info;
 	u16 msdu_len;
 	u16 peer_id;
 	u16 seq_no;

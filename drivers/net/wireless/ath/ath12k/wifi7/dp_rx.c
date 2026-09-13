@@ -4,6 +4,8 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
+#include <linux/net.h>
+
 #include "dp_rx.h"
 #include "../dp_tx.h"
 #include "../peer.h"
@@ -363,6 +365,21 @@ static void ath12k_wifi7_dp_rx_h_mpdu(struct ath12k_pdev_dp *dp_pdev,
 
 	if (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap)
 		is_decrypted = rx_info->is_decrypted;
+
+	/* Group frames have their replay check and key lookup done by
+	 * mac80211, so whether this MPDU was resolved to a peer here decides
+	 * what mac80211 is handed. Off unless the site is armed with
+	 *   echo 'format "mcbc-rx" +p' > /sys/kernel/debug/dynamic_debug/control
+	 */
+	if (rx_info->is_mcbc)
+		net_dbg_ratelimited("mcbc-rx peer_id=%u peer=%d ucast_ra_only=%d sec_grp=%d sec=%d enctype=%d hw_dec=%d is_dec=%d err=0x%08x decap=%d mcbc_now=%d msdu_end=0x%08x\n",
+				    rxcb->peer_id, !!peer,
+				    peer ? peer->ucast_ra_only : -1,
+				    peer ? peer->sec_type_grp : -1,
+				    peer ? peer->sec_type : -1,
+				    enctype, rx_info->is_decrypted, is_decrypted,
+				    err_bitmap, rx_info->decap_type,
+				    rxcb->is_mcbc, rx_info->msdu_end_info);
 
 	/* Clear per-MPDU flags while leaving per-PPDU flags intact */
 	rx_status->flag &= ~(RX_FLAG_FAILED_FCS_CRC |
