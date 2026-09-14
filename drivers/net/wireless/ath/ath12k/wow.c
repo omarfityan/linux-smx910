@@ -858,6 +858,75 @@ static int ath12k_wow_set_keepalive(struct ath12k *ar,
 	return 0;
 }
 
+/* Re-tune the station power-save inactivity timeout across system suspend.
+ *
+ * The vendor driver re-sends this parameter at system suspend and ath12k never has:
+ * ath12k_mac_vif_setup_ps() has exactly one caller, BSS_CHANGED_PS, and nothing else on the
+ * suspend path touches a power-save parameter.  Whatever was chosen at association is therefore
+ * still in force for the whole time the system is asleep.
+ *
+ * @suspend selects the suspend value; otherwise each vdev is returned to the value that was in
+ * force while it was awake, recorded at the moment it was applied so that the revert cannot
+ * drift from a recomputation.
+ *
+ * ORDERING: on the suspend side this MUST run BEFORE ath12k_wow_enable().  Once the firmware
+ * has entered WoW state -- and certainly once the copy-engine interrupts are disabled and the
+ * bus is suspended -- a WMI command is no longer processed, and a send placed after it would
+ * fail silently and read as a negative result.  The vendor orders it the same way:
+ * pmo_core_psoc_configure_suspend() runs before pmo_tgt_psoc_send_wow_enable_req().
+ *
+ * Sending nothing when the knob is 0 preserves upstream behaviour exactly.
+ */
+static int ath12k_wow_set_inactivity_time(struct ath12k *ar, bool suspend)
+{
+	struct ath12k_link_vif *arvif;
+	u32 timeout;
+	int ret;
+
+	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+
+	if (!ath12k_sta_suspend_inactivity_time)
+		return 0;
+
+	list_for_each_entry(arvif, &ar->arvifs, list) {
+		if (arvif->ahvif->vdev_type != WMI_VDEV_TYPE_STA)
+			continue;
+
+		/* Power save was never set up on this vdev, so there is neither
+		 * anything to re-tune nor a value to revert to.  Say so rather than
+		 * skipping quietly: "the hook ran and had nothing to do" and "the hook
+		 * never ran at all" must not produce the same silence.
+		 */
+		if (!arvif->ps_inactivity_time) {
+			ath12k_info(ar->ab, "vdev %d sta ps: no awake inactivity time recorded, %s skipped\n",
+				    arvif->vdev_id, suspend ? "suspend" : "resume");
+			continue;
+		}
+
+		timeout = suspend ? ath12k_sta_suspend_inactivity_time :
+				    arvif->ps_inactivity_time;
+
+		ret = ath12k_wmi_set_sta_ps_param(ar, arvif->vdev_id,
+						  WMI_STA_PS_PARAM_INACTIVITY_TIME,
+						  timeout);
+		if (ret) {
+			ath12k_warn(ar->ab, "failed to set %s inactivity time %u ms for vdev %d: %d\n",
+				    suspend ? "suspend" : "resume", timeout,
+				    arvif->vdev_id, ret);
+			return ret;
+		}
+
+		/* Report every send.  A parameter that was silently never transmitted
+		 * and one the firmware rejected must never look the same, or a null
+		 * result cannot be told from an untaken test.
+		 */
+		ath12k_info(ar->ab, "vdev %d sta ps: inactivity time set %u ms on %s\n",
+			    arvif->vdev_id, timeout, suspend ? "suspend" : "resume");
+	}
+
+	return 0;
+}
+
 int ath12k_wow_op_suspend(struct ieee80211_hw *hw,
 			  struct cfg80211_wowlan *wowlan)
 {
@@ -906,6 +975,12 @@ int ath12k_wow_op_suspend(struct ieee80211_hw *hw,
 				       WMI_STA_KEEPALIVE_INTERVAL_DEFAULT);
 	if (ret) {
 		ath12k_warn(ar->ab, "failed to enable wow keepalive: %d\n", ret);
+		goto cleanup;
+	}
+
+	ret = ath12k_wow_set_inactivity_time(ar, true);
+	if (ret) {
+		ath12k_warn(ar->ab, "failed to set suspend inactivity time: %d\n", ret);
 		goto cleanup;
 	}
 
@@ -968,6 +1043,17 @@ int ath12k_wow_op_resume(struct ieee80211_hw *hw)
 	ret = ath12k_wow_wakeup(ar);
 	if (ret) {
 		ath12k_warn(ar->ab, "failed to wakeup from wow: %d\n", ret);
+		goto exit;
+	}
+
+	/* Revert the suspend-time re-tune at the first point WMI is usable again.
+	 * Nothing re-issues BSS_CHANGED_PS after resume, so without this the suspend
+	 * value would persist into the awake state after the very first cycle and
+	 * silently degrade awake reachability.
+	 */
+	ret = ath12k_wow_set_inactivity_time(ar, false);
+	if (ret) {
+		ath12k_warn(ar->ab, "failed to restore awake inactivity time: %d\n", ret);
 		goto exit;
 	}
 

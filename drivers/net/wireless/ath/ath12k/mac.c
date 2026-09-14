@@ -4781,6 +4781,16 @@ static void ath12k_mac_vif_setup_ps(struct ath12k_link_vif *arvif)
 			timeout = ieee80211_tu_to_usec(info->beacon_int) / 1000;
 		}
 
+		/* An explicitly requested value outranks both of the above, including
+		 * mac80211's own.  The fallback just taken lands 102 ms against a
+		 * 102.4 ms beacon interval -- 0.4 ms of sleep per beacon period on a
+		 * timer the firmware restarts on VDEV activity -- and testing that is
+		 * the whole point of the knob.  See ath12k_sta_inactivity_time in
+		 * core.c for the arithmetic and for why this is not yet a finding.
+		 */
+		if (ath12k_sta_inactivity_time)
+			timeout = ath12k_sta_inactivity_time;
+
 		ret = ath12k_wmi_set_sta_ps_param(ar, arvif->vdev_id, param,
 						  timeout);
 		if (ret) {
@@ -4788,6 +4798,16 @@ static void ath12k_mac_vif_setup_ps(struct ath12k_link_vif *arvif)
 				    arvif->vdev_id, ret);
 			return;
 		}
+
+		/* Remember what is actually in force while awake, so that a
+		 * suspend-time re-tune reverts to this exact value and not to a
+		 * recomputation.  Report it too: a parameter that was silently never
+		 * transmitted and one the firmware rejected must never look the same.
+		 */
+		arvif->ps_inactivity_time = timeout;
+		if (ath12k_sta_inactivity_time)
+			ath12k_info(ar->ab, "vdev %d sta ps: inactivity time set %d ms (override)\n",
+				    arvif->vdev_id, timeout);
 	} else {
 		psmode = WMI_STA_PS_MODE_DISABLED;
 	}

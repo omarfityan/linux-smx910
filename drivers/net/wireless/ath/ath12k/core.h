@@ -343,6 +343,13 @@ struct ath12k_link_vif {
 	/* only used in station mode */
 	bool is_sta_assoc_link;
 
+	/* The station power-save inactivity timeout most recently applied while
+	 * AWAKE, in ms.  Recorded so that a suspend-time re-tune can be reverted
+	 * at resume to precisely the value that was in force, rather than to a
+	 * recomputation that could diverge from it.
+	 */
+	u32 ps_inactivity_time;
+
 	struct ath12k_reg_tpc_power_info reg_tpc_info;
 
 	bool group_key_valid;

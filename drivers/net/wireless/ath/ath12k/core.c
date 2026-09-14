@@ -424,6 +424,62 @@ bool ath12k_arp_ns_offload_awake = true;
 module_param_named(arp_ns_offload_awake, ath12k_arp_ns_offload_awake, bool, 0644);
 MODULE_PARM_DESC(arp_ns_offload_awake, "keep the firmware's ARP/NS responder armed while the station is awake, as this device's vendor driver does: Y arm it at association and on every IPv4 address change and keep it across resume (default), N upstream behaviour, armed only across a WoWLAN suspend");
 
+/* The station power-save INACTIVITY TIME, and the value re-sent at system suspend.
+ *
+ * 🔴 THE DEFAULT EQUALS THE BEACON INTERVAL, AND NOBODY CHOSE IT.
+ *
+ * ath12k_mac_vif_setup_ps() takes conf->dynamic_ps_timeout, which is never assigned for this
+ * device, and falls through to
+ *
+ *     timeout = ieee80211_tu_to_usec(info->beacon_int) / 1000;
+ *
+ * ieee80211_tu_to_usec() is 1024 * tu, so a 100 TU beacon interval is 102400 us and the integer
+ * division truncates 102.4 ms to 102 ms.  The AP this device associates to beacons every
+ * 102.4 ms (measured: "beacon int: 100").
+ *
+ * The firmware documents WMI_STA_PS_PARAM_INACTIVITY_TIME as "TX/RX inactivity time in msec
+ * before going to sleep ... the power save SM will monitor tx/rx activity on the VDEV, if no
+ * activity for the specified msec of the parameter the Power save SM will go to sleep."
+ * A timer armed for 0.4 ms LESS than the interval at which the VDEV receives beacons leaves at
+ * most 0.39 % of each beacon period in which the radio can be asleep.
+ *
+ * That is the shape the measurements report: this device's suspend trace is a FLAT DC LINE where
+ * the vendor's is a 12-14 mA floor with ~8 %-duty bursts.  A flat line is a radio that never
+ * sleeps between beacons.
+ *
+ * 🔴 THE MECHANISM IS A HYPOTHESIS, NOT A FINDING.  Whether beacon reception counts as "RX
+ * activity on the VDEV" for this timer is firmware behaviour and has not been measured.  Both
+ * parameters therefore default to 0 and send NOTHING, so carrying this patch changes the driver
+ * only once a value is written.
+ *
+ * sta_inactivity_time overrides the AWAKE value in ath12k_mac_vif_setup_ps(), which mac80211
+ * re-runs on every BSS_CHANGED_PS -- so
+ *
+ *     iw dev <dev> set power_save off; iw dev <dev> set power_save on
+ *
+ * re-applies it with NO re-association.  A sweep therefore runs AWAKE, in ONE boot from ONE
+ * image, against the awake-idle instrument, with no suspend cycle and none of the cross-run
+ * drift that dominates suspend brackets.  Measure the SHAPE, not the mean: duty cycling
+ * appearing where a flat line was is the result; a few mA of mean difference is not.
+ *
+ * sta_suspend_inactivity_time is re-sent at system suspend from ath12k_wow_op_suspend() and the
+ * awake value restored at resume.  The vendor re-tunes this parameter at suspend; ath12k has
+ * never revisited it after association, because ath12k_mac_vif_setup_ps() has exactly one
+ * caller and ath12k_wow_op_suspend() touches no power-save parameter at all.
+ *
+ * 🔴 The vendor's own suspend value could NOT be sourced from the artifacts available here: its
+ * send site carries no such immediate, the value is read from configuration memory at runtime,
+ * and the ini that governs it (InfraInactivityInterval) is not on disk.  No vendor number is
+ * baked in on inference -- the knob takes its value at measurement time.
+ */
+unsigned int ath12k_sta_inactivity_time;
+module_param_named(sta_inactivity_time, ath12k_sta_inactivity_time, uint, 0644);
+MODULE_PARM_DESC(sta_inactivity_time, "STA power-save TX/RX inactivity timeout in ms, sent on every power-save enable (default 0 = upstream behaviour, which falls through to the beacon interval and lands 0.4 ms below it)");
+
+unsigned int ath12k_sta_suspend_inactivity_time;
+module_param_named(sta_suspend_inactivity_time, ath12k_sta_suspend_inactivity_time, uint, 0644);
+MODULE_PARM_DESC(sta_suspend_inactivity_time, "STA power-save TX/RX inactivity timeout in ms, re-sent at system suspend and reverted at resume as this device's vendor driver does (default 0 = send nothing, upstream behaviour)");
+
 /* protected with ath12k_hw_group_mutex */
 static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);
 
