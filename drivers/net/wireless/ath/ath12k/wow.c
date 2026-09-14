@@ -1070,7 +1070,7 @@ int ath12k_wow_op_suspend(struct ieee80211_hw *hw,
 	ret = ath12k_wow_set_inactivity_time(ar, true);
 	if (ret) {
 		ath12k_warn(ar->ab, "failed to set suspend inactivity time: %d\n", ret);
-		goto cleanup;
+		goto restore_ps;
 	}
 
 	/* Before ath12k_wow_enable(): the vendor sends the cadence and only then
@@ -1081,13 +1081,13 @@ int ath12k_wow_op_suspend(struct ieee80211_hw *hw,
 	ret = ath12k_wow_set_listen_interval(ar, true);
 	if (ret) {
 		ath12k_warn(ar->ab, "failed to set suspend listen interval: %d\n", ret);
-		goto cleanup;
+		goto restore_ps;
 	}
 
 	ret = ath12k_wow_enable(ar);
 	if (ret) {
 		ath12k_warn(ar->ab, "failed to start wow: %d\n", ret);
-		goto cleanup;
+		goto restore_ps;
 	}
 
 	ath12k_hif_irq_disable(ar->ab);
@@ -1103,6 +1103,30 @@ int ath12k_wow_op_suspend(struct ieee80211_hw *hw,
 
 wakeup:
 	ath12k_wow_wakeup(ar);
+
+restore_ps:
+	/* 🔴 UNDO THE SUSPEND-TIME STA-PS RE-TUNES ON EVERY FAILURE PATH BELOW THE
+	 * POINT THEY WERE APPLIED. Without this a suspend that fails AFTER the
+	 * re-tune leaves the station tuned for sleep WHILE AWAKE -- and for the
+	 * listen interval that is the group-addressed frame loss that sessions
+	 * 440-448 spent six sessions repairing, arriving silently, with nothing on
+	 * the device reporting it as wrong.
+	 *
+	 * ath12k_wow_cleanup() below does NOT cover this: it clears WoW wakeup
+	 * PATTERNS, not vdev parameters.
+	 *
+	 * 🔴 AND THE INACTIVITY-TIME RE-TUNE HAD THE SAME HOLE BEFORE THIS LEVER
+	 * EXISTED. It is reverted here too rather than left as the pre-existing
+	 * behaviour, because "the bug was already there" is not a reason to ship a
+	 * second copy of it beside the one being fixed.
+	 *
+	 * Return values are deliberately ignored: we are already on an error path
+	 * with `ret` carrying the failure that must be reported, and both callees
+	 * warn for themselves. Both are no-ops when their knob is 0, which is the
+	 * shipped configuration, so this costs nothing until a knob is written.
+	 */
+	ath12k_wow_set_listen_interval(ar, false);
+	ath12k_wow_set_inactivity_time(ar, false);
 
 cleanup:
 	ath12k_wow_cleanup(ar);
