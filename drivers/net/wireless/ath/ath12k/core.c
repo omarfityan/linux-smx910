@@ -480,6 +480,62 @@ unsigned int ath12k_sta_suspend_inactivity_time;
 module_param_named(sta_suspend_inactivity_time, ath12k_sta_suspend_inactivity_time, uint, 0644);
 MODULE_PARM_DESC(sta_suspend_inactivity_time, "STA power-save TX/RX inactivity timeout in ms, re-sent at system suspend and reverted at resume as this device's vendor driver does (default 0 = send nothing, upstream behaviour)");
 
+/* THE SUSPEND-TIME WAKE CADENCE -- the vendor's modulated DTIM, transcribed.
+ *
+ * WHAT THE VENDOR ACTUALLY DOES, read from this device's own binary.
+ * qca_cld3_kiwi_v2.ko is unstripped and carries our vermagic.  Its
+ * pmo_core_config_modulated_dtim() (.text+0x3aa5c0) does two vdev writes at
+ * SYSTEM SUSPEND and reverts them at resume:
+ *
+ *     3aa810:  mov  w1, wzr          ; pmo_vdev_param[0]
+ *     3aa814:  mul  w20, w25, w8     ; value = min(mod_dtim, cap) * dtim_period
+ *     3aa81c:  bl   pmo_tgt_vdev_update_param_req
+ *     3aa8ac:  mov  w1, #0x1         ; pmo_vdev_param[1]
+ *     3aa8b0:  mov  w2, #0x2         ; = WMI_BEACON_DTIM_POLICY_NORMAL
+ *
+ * The PMO->firmware ordinal table (.rodata+0x1900a8, bounds-checked < 4) reads
+ * {4, 71, 168, 122}, so param[0] is WMI_VDEV_PARAM_LISTEN_INTERVAL and param[1]
+ * is WMI_VDEV_PARAM_DTIM_POLICY.  Positive control: the same section at +0x800
+ * reads (0,0,0,0) rather than another tidy small-ordinal table, so the alignment
+ * is not a coincidence.  For these two the PMO-vs-firmware ordinal trap does not
+ * bite -- both land on ath12k's own enum values.
+ *
+ * With the vendor ini on this device (gEnableModulatedDTIM=5, dtim_period 1 on
+ * this AP) the transmitted value is 5 x 1 = 5.
+ *
+ * 🔴 WHY THE WoW FLAG IS NOT THIS.  wmi.h describes WoW flag 0x40 as set "when
+ * the INI enables modulated DTIM on system suspend" -- it is a NOTIFICATION THAT
+ * A VALUE EXISTS, not the value.  Session 451 measured flags 0xE0 at suspend and
+ * got +0.71 mW against 1.37 mW of bracketed drift with the two treated arms
+ * disagreeing in sign: NOT-ESTABLISHED.  The cadence travels on these parameters
+ * instead, and ath12k_wow_op_suspend() has never sent either of them.
+ *
+ * 🔴 WHY SESSION 449'S REFUTATION DOES NOT COVER THIS.  sta_wake_cadence BIT(1)
+ * also sends WMI_VDEV_PARAM_LISTEN_INTERVAL and was measured to noise -- but it
+ * sends 1, AT ASSOCIATION, to wake MORE often (a reachability repair).  This
+ * sends a LARGER value, at SUSPEND ONLY, to wake less.  Opposite direction,
+ * different moment.
+ *
+ * 🔴 AND WHY IT IS SUSPEND-SCOPED AND REVERTS.  A listen interval above 1 costs
+ * group-addressed reception, which is the defect sessions 440-448 spent six
+ * sessions repairing.  The vendor's own comment is explicit: "Enable modulated
+ * DTIM only for System suspend wow.  For RTPM wow, the device will stay in
+ * DTIM 1."  A version of this that is not suspend-scoped, or that fails to
+ * revert, re-opens that defect.
+ *
+ * Both default to 0 = send nothing, so this ships INERT and the control arm of
+ * any measurement is the shipped configuration.  They are separate knobs on
+ * purpose: the vendor moves them together, but a null result from a single
+ * combined knob could not say which half was responsible.
+ */
+unsigned int ath12k_sta_suspend_listen_interval;
+module_param_named(sta_suspend_listen_interval, ath12k_sta_suspend_listen_interval, uint, 0644);
+MODULE_PARM_DESC(sta_suspend_listen_interval, "WMI_VDEV_PARAM_LISTEN_INTERVAL in beacon intervals, sent at SYSTEM SUSPEND and reverted to ATH12K_STA_LISTEN_INTERVAL at resume, as this device's vendor driver does (default 0 = send nothing, upstream behaviour; 5 = the vendor's own gEnableModulatedDTIM x dtim_period on this AP). Raising this trades group-addressed reception WHILE SUSPENDED for power");
+
+unsigned int ath12k_sta_suspend_dtim_policy;
+module_param_named(sta_suspend_dtim_policy, ath12k_sta_suspend_dtim_policy, uint, 0644);
+MODULE_PARM_DESC(sta_suspend_dtim_policy, "WMI_VDEV_PARAM_DTIM_POLICY sent at SYSTEM SUSPEND alongside sta_suspend_listen_interval and reverted at resume (default 0 = send nothing, upstream behaviour; 2 = NORMAL, which is what the vendor pairs with modulated DTIM)");
+
 /* protected with ath12k_hw_group_mutex */
 static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);
 

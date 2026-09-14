@@ -927,6 +927,95 @@ static int ath12k_wow_set_inactivity_time(struct ath12k *ar, bool suspend)
 	return 0;
 }
 
+/* Modulated DTIM across system suspend, as this device's vendor driver does.
+ * The mechanism, the ordinal evidence and the reachability trade are documented
+ * at ath12k_sta_suspend_listen_interval in core.c -- read that before changing
+ * anything here.
+ *
+ * 🔴 THE REVERT VALUE IS DECLARED, NOT RECORDED, AND THAT IS A REAL DIFFERENCE
+ * FROM THE TEMPLATE ABOVE.  ath12k_wow_set_inactivity_time() reverts to
+ * arvif->ps_inactivity_time, a value the driver itself sent while awake and
+ * therefore knows.  There is no equivalent here: ath12k sends NO vdev listen
+ * interval by default, so there is no awake value to remember.  We revert to
+ * ATH12K_STA_LISTEN_INTERVAL -- 1, wake on every beacon -- because that is the
+ * cadence the rest of the driver is built around: it is what the peer-assoc
+ * carries (mac.c ath12k_mac_get_listen_interval()) and what sessions 440-448
+ * established the device's LAN reachability depends on.
+ *
+ * ⚠️ That makes the resume path ASSERT a value rather than restore one.  If a
+ * future change gives the awake vdev listen interval a different value, this
+ * revert silently overrides it.  The assert is still the safer of the two
+ * failure modes: reverting to the wrong small value costs power, while failing
+ * to revert at all costs reachability, which is the defect that took six
+ * sessions to find.
+ *
+ * ⚠️ UNRESOLVED, AND WORTH KNOWING BEFORE READING A RESULT: core.c records that
+ * for REACHABILITY only the peer-assoc listen interval moved the needle and this
+ * vdev parameter did nothing -- yet the vdev parameter is the carrier the vendor
+ * uses for suspend modulation.  The cheapest reconciliation is that they act at
+ * different moments (association versus a live vdev), but that is untested.  A
+ * null from this function does NOT distinguish "the lever does nothing" from
+ * "the lever does nothing AT ASSOCIATION but something here".
+ */
+static int ath12k_wow_set_listen_interval(struct ath12k *ar, bool suspend)
+{
+	struct ath12k_link_vif *arvif;
+	u32 interval, policy;
+	int ret;
+
+	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+
+	if (!ath12k_sta_suspend_listen_interval && !ath12k_sta_suspend_dtim_policy)
+		return 0;
+
+	list_for_each_entry(arvif, &ar->arvifs, list) {
+		if (arvif->ahvif->vdev_type != WMI_VDEV_TYPE_STA)
+			continue;
+
+		if (ath12k_sta_suspend_listen_interval) {
+			interval = suspend ? ath12k_sta_suspend_listen_interval :
+					     ATH12K_STA_LISTEN_INTERVAL;
+
+			ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+							    WMI_VDEV_PARAM_LISTEN_INTERVAL,
+							    interval);
+			if (ret) {
+				ath12k_warn(ar->ab, "failed to set %s listen interval %u for vdev %d: %d\n",
+					    suspend ? "suspend" : "resume", interval,
+					    arvif->vdev_id, ret);
+				return ret;
+			}
+
+			/* Report every send, for the same reason the template above
+			 * does: a parameter that was silently never transmitted and
+			 * one the firmware rejected must not look the same.
+			 */
+			ath12k_info(ar->ab, "vdev %d sta ps: listen interval set %u on %s\n",
+				    arvif->vdev_id, interval, suspend ? "suspend" : "resume");
+		}
+
+		if (ath12k_sta_suspend_dtim_policy) {
+			policy = suspend ? ath12k_sta_suspend_dtim_policy :
+					   WMI_BEACON_DTIM_POLICY_NORMAL;
+
+			ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+							    WMI_VDEV_PARAM_DTIM_POLICY,
+							    policy);
+			if (ret) {
+				ath12k_warn(ar->ab, "failed to set %s DTIM policy %u for vdev %d: %d\n",
+					    suspend ? "suspend" : "resume", policy,
+					    arvif->vdev_id, ret);
+				return ret;
+			}
+
+			ath12k_info(ar->ab, "vdev %d sta ps: DTIM policy set %u on %s\n",
+				    arvif->vdev_id, policy, suspend ? "suspend" : "resume");
+		}
+	}
+
+	return 0;
+}
+
 int ath12k_wow_op_suspend(struct ieee80211_hw *hw,
 			  struct cfg80211_wowlan *wowlan)
 {
@@ -981,6 +1070,17 @@ int ath12k_wow_op_suspend(struct ieee80211_hw *hw,
 	ret = ath12k_wow_set_inactivity_time(ar, true);
 	if (ret) {
 		ath12k_warn(ar->ab, "failed to set suspend inactivity time: %d\n", ret);
+		goto cleanup;
+	}
+
+	/* Before ath12k_wow_enable(): the vendor sends the cadence and only then
+	 * announces it in the WoW flags word, and a value that arrives after the
+	 * handshake would be a policy the firmware has already been told about
+	 * without ever being given.
+	 */
+	ret = ath12k_wow_set_listen_interval(ar, true);
+	if (ret) {
+		ath12k_warn(ar->ab, "failed to set suspend listen interval: %d\n", ret);
 		goto cleanup;
 	}
 
@@ -1054,6 +1154,18 @@ int ath12k_wow_op_resume(struct ieee80211_hw *hw)
 	ret = ath12k_wow_set_inactivity_time(ar, false);
 	if (ret) {
 		ath12k_warn(ar->ab, "failed to restore awake inactivity time: %d\n", ret);
+		goto exit;
+	}
+
+	/* 🔴 THIS IS THE HALF THAT PROTECTS REACHABILITY. A suspend-time listen
+	 * interval that is not reverted leaves the station waking once every N
+	 * beacons while AWAKE, which is the group-frame loss sessions 440-448
+	 * spent six sessions repairing. It runs on the error path out of every
+	 * failure below it, not only on the happy path.
+	 */
+	ret = ath12k_wow_set_listen_interval(ar, false);
+	if (ret) {
+		ath12k_warn(ar->ab, "failed to restore awake listen interval: %d\n", ret);
 		goto exit;
 	}
 
