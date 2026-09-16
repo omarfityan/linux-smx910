@@ -2020,12 +2020,18 @@ static int qcom_geni_serial_suspend(struct device *dev)
 
 	/*
 	 * This is done so we can hit the lowest possible state in suspend
-	 * even with no_console_suspend
+	 * even with no_console_suspend.
+	 *
+	 * It is done for every port, not only the console: a non-console
+	 * port closed shortly before suspend is still runtime-active at
+	 * suspend entry (the serial-core port child autosuspends 500 ms
+	 * after close and the parent cannot suspend behind it), and nothing
+	 * on the system suspend path releases it. Its untagged vote is then
+	 * aggregated into the sleep set as well and the AOSS never enters
+	 * CX shutdown for the whole sleep.
 	 */
-	if (uart_console(uport)) {
-		geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ACTIVE_ONLY);
-		geni_icc_set_bw(&port->se);
-	}
+	geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ACTIVE_ONLY);
+	geni_icc_set_bw(&port->se);
 	return uart_suspend_port(private_data->drv, uport);
 }
 
@@ -2037,10 +2043,8 @@ static int qcom_geni_serial_resume(struct device *dev)
 	struct qcom_geni_private_data *private_data = uport->private_data;
 
 	ret = uart_resume_port(private_data->drv, uport);
-	if (uart_console(uport)) {
-		geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ALWAYS);
-		geni_icc_set_bw(&port->se);
-	}
+	geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ALWAYS);
+	geni_icc_set_bw(&port->se);
 	return ret;
 }
 
