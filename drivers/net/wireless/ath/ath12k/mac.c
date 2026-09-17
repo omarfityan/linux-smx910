@@ -10418,6 +10418,12 @@ void ath12k_mac_11d_scan_start(struct ath12k *ar, u32 vdev_id)
 	if (ar->regdom_set_by_user)
 		goto fin;
 
+	/* ath12k.dot11d=N: same effect as a user regulatory hint. See the
+	 * parameter's comment in core.c for the measurement behind it.
+	 */
+	if (!ath12k_dot11d)
+		goto fin;
+
 	if (ar->vdev_id_11d_scan != ATH12K_11D_INVALID_VDEV_ID)
 		goto fin;
 

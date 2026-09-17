@@ -6621,6 +6621,7 @@ extern unsigned int ath12k_sta_listen_interval;
 extern unsigned int ath12k_sta_suspend_listen_interval;
 extern unsigned int ath12k_sta_suspend_dtim_policy;
 extern bool ath12k_arp_ns_offload_awake;
+extern bool ath12k_dot11d;
 
 int ath12k_wmi_wow_host_wakeup_ind(struct ath12k *ar);
 int ath12k_wmi_wow_enable(struct ath12k *ar);

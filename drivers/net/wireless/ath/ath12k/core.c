@@ -80,6 +80,29 @@ static char *ath12k_country = "US";
 module_param_named(country, ath12k_country, charp, 0444);
 MODULE_PARM_DESC(country, "ISO 3166-1 alpha-2 regulatory country (e.g. US), used when the platform supplies none");
 
+/* Whether the firmware's 802.11d country scan is started on station vdevs.
+ *
+ * Measured on this device (WCN7850, WLAN.HMT.1.1.c5-00284.1) with every
+ * regulatory command and reply logged: after a firmware restart the host's
+ * country is accepted within 6 ms, yet no host scan returns a 5 GHz BSS for
+ * as long as the 11d scan is running -- two complete sweeps found only the
+ * 2.4 GHz BSS of an access point serving this device on 5745 MHz seconds
+ * earlier, and the same BSS turned up 0.6 s into the first sweep after the
+ * scan was stopped. The 11d scan is started by the first host scan on every
+ * scan vdev and stopped only by an association, so it is running for the
+ * whole pre-association window of every boot and every resume, and its first
+ * cycle reports "00", which ath12k_update_11d() then pushes to the firmware
+ * and the firmware refuses.
+ *
+ * N has the effect a user regulatory hint has in ath12k_mac_11d_scan_start()
+ * (the country in force stays whatever was last set) without the notifier
+ * path, which is compiled out here. Runtime-writable so the two arms of the
+ * measurement share one boot. Default Y = upstream behaviour.
+ */
+bool ath12k_dot11d = true;
+module_param_named(dot11d, ath12k_dot11d, bool, 0644);
+MODULE_PARM_DESC(dot11d, "start the firmware's 802.11d country scan on station vdevs (default Y, upstream behaviour); N never starts it, as a user regulatory hint would");
+
 /*
  * WoW flags sent in WMI_WOW_ENABLE_CMDID at suspend.
  *
