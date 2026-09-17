@@ -862,7 +862,11 @@ static int rpmhpd_send_corner(struct rpmhpd *pd, int state,
  * Bluetooth UART's CX pin released: 388 ARC commands in the [active] bracket and
  * ZERO in [sleep] or [wake], while BCM interconnect resources appear in all
  * three. cx.lvl is written with the level index only while awake. cxsd and aosd
- * have read 0 across every arm ever run.
+ * read 0 across every arm up to session 455; sessions 456-457 then reached both
+ * with the Bluetooth UART's interconnect vote released, and attributed the
+ * holder to that vote (BCM QUP2, via the UART's qup-core path), not to this
+ * domain's corner: the cx domain powers off through genpd with the UART active
+ * and cxsd is refused regardless. This knob was not the lever.
  *
  * Every active-only peer is empty here -- cx_ao, mx_ao, mxc_ao and mmcx_ao each
  * have zero devices -- while cx carries ten consumers, so nothing ever supplies

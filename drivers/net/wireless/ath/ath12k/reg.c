@@ -887,6 +887,40 @@ void ath12k_reg_reset_reg_info(struct ath12k_reg_info *reg_info)
 	}
 }
 
+/* The firmware answers WMI_SET_CURRENT_COUNTRY with a REG_CHAN_LIST_CC_EXT event,
+ * and it does not always answer yes. Measured on this device (WCN7850, firmware
+ * WLAN.HMT.1.1.c5-00284.1) after every system resume that powers the chip down:
+ * both commands the driver sends while the firmware comes back -- the resume
+ * re-apply in ath12k_core_reapply_country() and the one in
+ * ath12k_mac_op_reconfig_complete() -- are answered 6 to 17 s later with a
+ * rejection, and until an association on 2.4 GHz has let 802.11d settle the
+ * domain, the 5 GHz band is not scannable: two full sweeps by wpa_supplicant
+ * found only the 2.4 GHz BSS of an access point that was serving this device
+ * on 5745 MHz two seconds before the suspend. The stock warning printed one
+ * fixed sentence for every rejection reason, so nothing on the record said
+ * WHICH status the firmware returned or which domain it kept. Both are logged
+ * here, and every accepted event too, so the firmware's schedule can be read
+ * off the log rather than inferred.
+ */
+static const char *ath12k_reg_cc_status_str(enum ath12k_reg_cc_code code)
+{
+	switch (code) {
+	case REG_SET_CC_STATUS_PASS:
+		return "PASS";
+	case REG_CURRENT_ALPHA2_NOT_FOUND:
+		return "CURRENT_ALPHA2_NOT_FOUND";
+	case REG_INIT_ALPHA2_NOT_FOUND:
+		return "INIT_ALPHA2_NOT_FOUND";
+	case REG_SET_CC_CHANGE_NOT_ALLOWED:
+		return "CHANGE_NOT_ALLOWED";
+	case REG_SET_CC_STATUS_NO_MEMORY:
+		return "NO_MEMORY";
+	case REG_SET_CC_STATUS_FAIL:
+		return "FAIL";
+	}
+	return "?";
+}
+
 enum ath12k_reg_status ath12k_reg_validate_reg_info(struct ath12k_base *ab,
 						    struct ath12k_reg_info *reg_info)
 {
@@ -897,7 +931,11 @@ enum ath12k_reg_status ath12k_reg_validate_reg_info(struct ath12k_base *ab,
 		 * firmware retains the current regd. We print a failure info
 		 * and return from here.
 		 */
-		ath12k_warn(ab, "Failed to set the requested Country regulatory setting\n");
+		ath12k_warn(ab,
+			    "Failed to set the requested Country regulatory setting: status %s, firmware stays at %c%c (ctry_code %u, phy %u)\n",
+			    ath12k_reg_cc_status_str(reg_info->status_code),
+			    reg_info->alpha2[0], reg_info->alpha2[1],
+			    reg_info->ctry_code, reg_info->phy_id);
 		return ATH12K_REG_STATUS_DROP;
 	}
 
@@ -920,6 +958,14 @@ enum ath12k_reg_status ath12k_reg_validate_reg_info(struct ath12k_base *ab,
 	    !memcmp(ab->default_regd[pdev_idx]->alpha2,
 		    reg_info->alpha2, 2))
 		return ATH12K_REG_STATUS_DROP;
+
+	/* Logged only for an event the driver will actually keep; the two
+	 * DROP branches above discard events the firmware nonetheless
+	 * answered PASS to, and "accepted" would be a lie for those.
+	 */
+	ath12k_info(ab, "regulatory: firmware accepted country %c%c (ctry_code %u, phy %u)\n",
+		    reg_info->alpha2[0], reg_info->alpha2[1],
+		    reg_info->ctry_code, reg_info->phy_id);
 
 	return ATH12K_REG_STATUS_VALID;
 }

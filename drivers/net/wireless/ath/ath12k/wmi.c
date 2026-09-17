@@ -3369,19 +3369,24 @@ int ath12k_wmi_send_set_current_country_cmd(struct ath12k *ar,
 	memcpy(&cmd->new_alpha2, &arg->alpha2, sizeof(arg->alpha2));
 	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_SET_CURRENT_COUNTRY_CMDID);
 
-	ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
-		   "set current country pdev id %d alpha2 %c%c\n",
-		   ar->pdev->pdev_id,
-		   arg->alpha2[0],
-		   arg->alpha2[1]);
-
 	if (ret) {
 		ath12k_warn(ar->ab,
 			    "failed to send WMI_SET_CURRENT_COUNTRY_CMDID: %d\n", ret);
 		dev_kfree_skb(skb);
+		return ret;
 	}
 
-	return ret;
+	/* Info, not dbg: this is sent a handful of times per boot and the
+	 * firmware's answer to it (a REG_CHAN_LIST_CC_EXT event, logged in
+	 * ath12k_reg_validate_reg_info()) decides whether the 5 GHz band exists.
+	 */
+	ath12k_info(ar->ab,
+		    "regulatory: set current country pdev id %d alpha2 %c%c\n",
+		    ar->pdev->pdev_id,
+		    arg->alpha2[0],
+		    arg->alpha2[1]);
+
+	return 0;
 }
 
 int ath12k_wmi_send_11d_scan_start_cmd(struct ath12k *ar,
@@ -6835,9 +6840,9 @@ static int ath12k_reg_11d_new_cc_event(struct ath12k_base *ab, struct sk_buff *s
 	memcpy(&ab->new_alpha2, &ev->new_alpha2, REG_ALPHA2_LEN);
 	spin_unlock_bh(&ab->base_lock);
 
-	ath12k_dbg(ab, ATH12K_DBG_WMI, "wmi 11d new cc %c%c\n",
-		   ab->new_alpha2[0],
-		   ab->new_alpha2[1]);
+	ath12k_info(ab, "regulatory: 802.11d learned country %c%c\n",
+		    ab->new_alpha2[0],
+		    ab->new_alpha2[1]);
 
 	kfree(tb);
 
