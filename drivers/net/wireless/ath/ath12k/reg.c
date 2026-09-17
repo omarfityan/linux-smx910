@@ -956,8 +956,17 @@ enum ath12k_reg_status ath12k_reg_validate_reg_info(struct ath12k_base *ab,
 	 */
 	if (ab->default_regd[pdev_idx] && !ab->new_regd[pdev_idx] &&
 	    !memcmp(ab->default_regd[pdev_idx]->alpha2,
-		    reg_info->alpha2, 2))
+		    reg_info->alpha2, 2)) {
+		/* A discarded PASS is not a no-op: the firmware's scan channel
+		 * list is programmed by the host, from ath12k_regd_update(),
+		 * which only runs for an event that is kept.
+		 */
+		ath12k_info(ab, "regulatory: firmware answered PASS for %c%c but the driver dropped the event (default regd already %c%c, no new regd)\n",
+			    reg_info->alpha2[0], reg_info->alpha2[1],
+			    ab->default_regd[pdev_idx]->alpha2[0],
+			    ab->default_regd[pdev_idx]->alpha2[1]);
 		return ATH12K_REG_STATUS_DROP;
+	}
 
 	/* Logged only for an event the driver will actually keep; the two
 	 * DROP branches above discard events the firmware nonetheless
