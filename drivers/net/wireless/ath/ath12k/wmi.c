@@ -9049,8 +9049,9 @@ static void ath12k_pdev_set_hw_mode_resp_event(struct ath12k_base *ab,
 		return;
 	}
 
-	ath12k_info(ab, "hw mode: firmware answered WMI_PDEV_SET_HW_MODE status %u, configured hw_mode_index %u, %u vdev-mac entries\n",
-		    le32_to_cpu(ev->status), le32_to_cpu(ev->cfgd_hw_mode_index),
+	ath12k_info(ab, "hw mode: firmware answered WMI_PDEV_SET_HW_MODE pdev %u status %u (0 OK, 1 EINVAL, 3 ENOTSUP), configured hw_mode_index %u, %u vdev-mac entries\n",
+		    le32_to_cpu(ev->pdev_id), le32_to_cpu(ev->status),
+		    le32_to_cpu(ev->cfgd_hw_mode_index),
 		    le32_to_cpu(ev->num_vdev_mac_entries));
 	kfree(tb);
 }
@@ -9076,8 +9077,8 @@ static void ath12k_pdev_hw_mode_transition_event(struct ath12k_base *ab,
 		return;
 	}
 
-	ath12k_info(ab, "hw mode: firmware transition hw_mode_index %u -> %u, %u vdev-mac entries\n",
-		    le32_to_cpu(ev->old_hw_mode_index),
+	ath12k_info(ab, "hw mode: firmware transition pdev %u hw_mode_index %u -> %u, %u vdev-mac entries\n",
+		    le32_to_cpu(ev->pdev_id), le32_to_cpu(ev->old_hw_mode_index),
 		    le32_to_cpu(ev->new_hw_mode_index),
 		    le32_to_cpu(ev->num_vdev_mac_entries));
 	kfree(tb);
@@ -9130,8 +9131,8 @@ static void ath12k_pdev_set_mac_config_resp_event(struct ath12k_base *ab,
 		return;
 	}
 
-	ath12k_info(ab, "hw mode: firmware answered WMI_PDEV_SET_MAC_CONFIG word0 %u word1 %u (status, then pdev_id, per the firmware header)\n",
-		    le32_to_cpu(ev->status), le32_to_cpu(ev->pdev_id));
+	ath12k_info(ab, "hw mode: firmware answered WMI_PDEV_SET_MAC_CONFIG pdev %u status %u\n",
+		    le32_to_cpu(ev->pdev_id), le32_to_cpu(ev->status));
 	kfree(tb);
 }
 

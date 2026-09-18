@@ -1662,6 +1662,14 @@ static int ath12k_core_start(struct ath12k_base *ab)
 			 */
 			scan_cfg = ab->wmi_ab.default_conc_scan_config_bits;
 			fw_cfg = ab->wmi_ab.default_fw_config_bits;
+			if (!scan_cfg && !fw_cfg) {
+				/* never seen: service-ready-ext precedes core
+				 * start on every observed start. Sending zeros
+				 * would switch dual-MAC operation off entirely.
+				 */
+				ath12k_warn(ab, "hw mode: firmware default config words are zero; not sending a dual-MAC config\n");
+				goto skip_dual_mac_config;
+			}
 			if (!ath12k_dual_mac_async_sbs)
 				fw_cfg &= ~WMI_DBS_FW_MODE_CFG_ASYNC_SBS;
 			how = ath12k_dual_mac_async_sbs ?
@@ -1681,6 +1689,7 @@ static int ath12k_core_start(struct ath12k_base *ab)
 			ath12k_warn(ab, "failed to send dual mac config: %d (continuing)\n",
 				    ret);
 	}
+skip_dual_mac_config:
 
 	ret = ath12k_dp_tx_htt_h2t_ver_req_msg(ab);
 	if (ret) {

@@ -2554,14 +2554,20 @@ struct ath12k_wmi_soc_set_dual_mac_config_cmd {
 	__le32 fw_mode_config_bits;
 } __packed;
 
-/* The firmware's answers, which upstream ath12k drops as unknown events. */
+/* The firmware's answers, which upstream ath12k drops as unknown events.
+ * Layouts from the vendor's fw-api wmi_unified.h (the PDEV forms carry
+ * pdev_id first): wmi_pdev_set_hw_mode_response_event_fixed_param,
+ * wmi_pdev_hw_mode_transition_event_fixed_param.
+ */
 struct wmi_pdev_set_hw_mode_resp_event {
+	__le32 pdev_id;
 	__le32 status;
 	__le32 cfgd_hw_mode_index;
 	__le32 num_vdev_mac_entries;
 } __packed;
 
 struct wmi_pdev_hw_mode_transition_event {
+	__le32 pdev_id;
 	__le32 old_hw_mode_index;
 	__le32 new_hw_mode_index;
 	__le32 num_vdev_mac_entries;
@@ -2589,8 +2595,8 @@ struct ath12k_wmi_pdev_set_mac_config_cmd {
 } __packed;
 
 struct wmi_pdev_set_mac_config_resp_event {
-	__le32 status;
 	__le32 pdev_id;
+	__le32 status;
 } __packed;
 
 struct ath12k_wmi_ppe_threshold_params {
