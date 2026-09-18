@@ -2543,6 +2543,34 @@ struct ath12k_wmi_pdev_set_hw_mode_cmd {
 	__le32 num_band_to_mac;
 } __packed;
 
+/* WMI_SOC_SET_DUAL_MAC_CONFIG_CMDID: how the firmware may use its two MACs for
+ * scans (concurrent_scan_config_bits) and connections (fw_mode_config_bits).
+ * The vendor host driver sends this at start-up; upstream ath12k never does.
+ */
+struct ath12k_wmi_soc_set_dual_mac_config_cmd {
+	__le32 tlv_header;
+	__le32 pdev_id;
+	__le32 concurrent_scan_config_bits;
+	__le32 fw_mode_config_bits;
+} __packed;
+
+/* The firmware's answers, which upstream ath12k drops as unknown events. */
+struct wmi_pdev_set_hw_mode_resp_event {
+	__le32 status;
+	__le32 cfgd_hw_mode_index;
+	__le32 num_vdev_mac_entries;
+} __packed;
+
+struct wmi_pdev_hw_mode_transition_event {
+	__le32 old_hw_mode_index;
+	__le32 new_hw_mode_index;
+	__le32 num_vdev_mac_entries;
+} __packed;
+
+struct wmi_soc_set_dual_mac_config_resp_event {
+	__le32 status;
+} __packed;
+
 struct ath12k_wmi_ppe_threshold_params {
 	__le32 numss_m1; /** NSS - 1*/
 	__le32 ru_info;
@@ -6572,6 +6600,8 @@ int ath12k_wmi_fils_discovery(struct ath12k *ar, u32 vdev_id, u32 interval,
 			      bool unsol_bcast_probe_resp_enabled);
 int ath12k_wmi_probe_resp_tmpl(struct ath12k *ar, u32 vdev_id,
 			       struct sk_buff *tmpl);
+int ath12k_wmi_set_dual_mac_config(struct ath12k_base *ab, u32 scan_cfg,
+				   u32 fw_mode_cfg);
 int ath12k_wmi_set_hw_mode(struct ath12k_base *ab,
 			   enum wmi_host_hw_mode_config_type mode);
 int ath12k_wmi_set_bios_cmd(struct ath12k_base *ab, u32 param_id,

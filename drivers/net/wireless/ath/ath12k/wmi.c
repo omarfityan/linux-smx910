@@ -177,6 +177,12 @@ static const struct ath12k_wmi_tlv_policy ath12k_wmi_tlv_policies[] = {
 		.min_len = sizeof(struct wmi_service_available_event) },
 	[WMI_TAG_PEER_ASSOC_CONF_EVENT] = {
 		.min_len = sizeof(struct wmi_peer_assoc_conf_event) },
+	[WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_EVENT] = {
+		.min_len = sizeof(struct wmi_pdev_set_hw_mode_resp_event) },
+	[WMI_TAG_PDEV_HW_MODE_TRANSITION_EVENT] = {
+		.min_len = sizeof(struct wmi_pdev_hw_mode_transition_event) },
+	[WMI_TAG_SOC_SET_DUAL_MAC_CONFIG_RESPONSE_EVENT] = {
+		.min_len = sizeof(struct wmi_soc_set_dual_mac_config_resp_event) },
 	[WMI_TAG_RFKILL_EVENT] = {
 		.min_len = sizeof(struct wmi_rfkill_state_change_event) },
 	[WMI_TAG_PDEV_CTL_FAILSAFE_CHECK_EVENT] = {
@@ -4266,6 +4272,35 @@ int ath12k_wmi_set_hw_mode(struct ath12k_base *ab,
 	ret = ath12k_wmi_cmd_send(&wmi_ab->wmi[0], skb, WMI_PDEV_SET_HW_MODE_CMDID);
 	if (ret) {
 		ath12k_warn(ab, "failed to send WMI_PDEV_SET_HW_MODE_CMDID\n");
+		dev_kfree_skb(skb);
+	}
+
+	return ret;
+}
+
+int ath12k_wmi_set_dual_mac_config(struct ath12k_base *ab, u32 scan_cfg,
+				   u32 fw_mode_cfg)
+{
+	struct ath12k_wmi_soc_set_dual_mac_config_cmd *cmd;
+	struct ath12k_wmi_base *wmi_ab = &ab->wmi_ab;
+	struct sk_buff *skb;
+	int ret;
+
+	skb = ath12k_wmi_alloc_skb(wmi_ab, sizeof(*cmd));
+	if (!skb)
+		return -ENOMEM;
+
+	cmd = (struct ath12k_wmi_soc_set_dual_mac_config_cmd *)skb->data;
+	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_SOC_SET_DUAL_MAC_CONFIG_CMD,
+						 sizeof(*cmd));
+	cmd->pdev_id = cpu_to_le32(WMI_PDEV_ID_SOC);
+	cmd->concurrent_scan_config_bits = cpu_to_le32(scan_cfg);
+	cmd->fw_mode_config_bits = cpu_to_le32(fw_mode_cfg);
+
+	ret = ath12k_wmi_cmd_send(&wmi_ab->wmi[0], skb,
+				  WMI_SOC_SET_DUAL_MAC_CONFIG_CMDID);
+	if (ret) {
+		ath12k_warn(ab, "failed to send WMI_SOC_SET_DUAL_MAC_CONFIG_CMDID\n");
 		dev_kfree_skb(skb);
 	}
 
@@ -8941,6 +8976,92 @@ out:
 	return ret;
 }
 
+/* The firmware's answer to WMI_PDEV_SET_HW_MODE. Upstream never reads it, so a
+ * request for a mode the firmware did not advertise fails silently and the chip
+ * stays in whatever mode it chose at init. Logged at info level on purpose:
+ * this is the only place the mode the firmware actually runs is stated.
+ */
+static void ath12k_pdev_set_hw_mode_resp_event(struct ath12k_base *ab,
+					       struct sk_buff *skb)
+{
+	const struct wmi_pdev_set_hw_mode_resp_event *ev;
+	const void **tb;
+
+	tb = ath12k_wmi_tlv_parse_alloc(ab, skb, GFP_ATOMIC);
+	if (IS_ERR(tb)) {
+		ath12k_warn(ab, "failed to parse hw mode response tlv: %ld\n",
+			    PTR_ERR(tb));
+		return;
+	}
+
+	ev = tb[WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_EVENT];
+	if (!ev) {
+		ath12k_warn(ab, "hw mode response without its fixed param (%u bytes)\n",
+			    skb->len);
+		kfree(tb);
+		return;
+	}
+
+	ath12k_info(ab, "hw mode: firmware answered WMI_PDEV_SET_HW_MODE status %u, configured hw_mode_index %u, %u vdev-mac entries\n",
+		    le32_to_cpu(ev->status), le32_to_cpu(ev->cfgd_hw_mode_index),
+		    le32_to_cpu(ev->num_vdev_mac_entries));
+	kfree(tb);
+}
+
+static void ath12k_pdev_hw_mode_transition_event(struct ath12k_base *ab,
+						 struct sk_buff *skb)
+{
+	const struct wmi_pdev_hw_mode_transition_event *ev;
+	const void **tb;
+
+	tb = ath12k_wmi_tlv_parse_alloc(ab, skb, GFP_ATOMIC);
+	if (IS_ERR(tb)) {
+		ath12k_warn(ab, "failed to parse hw mode transition tlv: %ld\n",
+			    PTR_ERR(tb));
+		return;
+	}
+
+	ev = tb[WMI_TAG_PDEV_HW_MODE_TRANSITION_EVENT];
+	if (!ev) {
+		ath12k_warn(ab, "hw mode transition without its fixed param (%u bytes)\n",
+			    skb->len);
+		kfree(tb);
+		return;
+	}
+
+	ath12k_info(ab, "hw mode: firmware transition hw_mode_index %u -> %u, %u vdev-mac entries\n",
+		    le32_to_cpu(ev->old_hw_mode_index),
+		    le32_to_cpu(ev->new_hw_mode_index),
+		    le32_to_cpu(ev->num_vdev_mac_entries));
+	kfree(tb);
+}
+
+static void ath12k_soc_set_dual_mac_config_resp_event(struct ath12k_base *ab,
+						      struct sk_buff *skb)
+{
+	const struct wmi_soc_set_dual_mac_config_resp_event *ev;
+	const void **tb;
+
+	tb = ath12k_wmi_tlv_parse_alloc(ab, skb, GFP_ATOMIC);
+	if (IS_ERR(tb)) {
+		ath12k_warn(ab, "failed to parse dual mac config response tlv: %ld\n",
+			    PTR_ERR(tb));
+		return;
+	}
+
+	ev = tb[WMI_TAG_SOC_SET_DUAL_MAC_CONFIG_RESPONSE_EVENT];
+	if (!ev) {
+		ath12k_warn(ab, "dual mac config response without its fixed param (%u bytes)\n",
+			    skb->len);
+		kfree(tb);
+		return;
+	}
+
+	ath12k_info(ab, "hw mode: firmware answered WMI_SOC_SET_DUAL_MAC_CONFIG status %u\n",
+		    le32_to_cpu(ev->status));
+	kfree(tb);
+}
+
 static void ath12k_rfkill_state_change_event(struct ath12k_base *ab,
 					     struct sk_buff *skb)
 {
@@ -9921,6 +10042,15 @@ static void ath12k_wmi_op_rx(struct ath12k_base *ab, struct sk_buff *skb)
 		break;
 	case WMI_RFKILL_STATE_CHANGE_EVENTID:
 		ath12k_rfkill_state_change_event(ab, skb);
+		break;
+	case WMI_PDEV_SET_HW_MODE_RESP_EVENTID:
+		ath12k_pdev_set_hw_mode_resp_event(ab, skb);
+		break;
+	case WMI_PDEV_HW_MODE_TRANSITION_EVENTID:
+		ath12k_pdev_hw_mode_transition_event(ab, skb);
+		break;
+	case WMI_SOC_SET_DUAL_MAC_CONFIG_RESP_EVENTID:
+		ath12k_soc_set_dual_mac_config_resp_event(ab, skb);
 		break;
 	case WMI_TWT_ENABLE_EVENTID:
 		ath12k_wmi_twt_enable_event(ab, skb);

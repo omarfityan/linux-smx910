@@ -103,6 +103,37 @@ bool ath12k_dot11d = true;
 module_param_named(dot11d, ath12k_dot11d, bool, 0644);
 MODULE_PARM_DESC(dot11d, "start the firmware's 802.11d country scan on station vdevs (default Y, upstream behaviour); N never starts it, as a user regulatory hint would");
 
+/* The hardware mode the firmware runs, and how it may split its two MACs.
+ *
+ * On single-pdev chips ath12k_core_start() asks for WMI_HOST_HW_MODE_DBS by
+ * sending hw_mode_index 1 and never reads the firmware's answer. This
+ * device's WCN7850 firmware advertises hw modes 0 (SINGLE), 5 (DBS_OR_SBS) and
+ * 8 only, so that request selects nothing, and in DBS_OR_SBS the firmware scans
+ * the 5 GHz band above 5490 MHz on the 2.4 GHz MAC until that MAC carries a
+ * link -- a MAC this board does not operate there (measured on the air: no
+ * frame transmitted or received on 5745 MHz in the first sweep after every
+ * firmware start; the same BSS found within one sweep once scanned by the other
+ * MAC). The vendor driver forbids SBS by policy (enable_sbs=0) through
+ * WMI_SOC_SET_DUAL_MAC_CONFIG_CMDID, which upstream ath12k does not send.
+ * These parameters make both levers available, each defaulting to the
+ * upstream behaviour.
+ */
+static int ath12k_hw_mode_index = -1;
+module_param_named(hw_mode_index, ath12k_hw_mode_index, int, 0644);
+MODULE_PARM_DESC(hw_mode_index, "hw_mode_index sent in WMI_PDEV_SET_HW_MODE_CMDID at core start on single-pdev chips: -1 = upstream behaviour (WMI_HOST_HW_MODE_DBS = 1, sent whether or not the firmware advertised a mode 1), -2 = send nothing, >= 0 = send that index");
+
+static bool ath12k_dual_mac_config;
+module_param_named(dual_mac_config, ath12k_dual_mac_config, bool, 0644);
+MODULE_PARM_DESC(dual_mac_config, "send WMI_SOC_SET_DUAL_MAC_CONFIG_CMDID at core start carrying dual_mac_scan_cfg and dual_mac_fw_mode_cfg (default N = upstream behaviour, never sent; this device's vendor driver sends it with SBS disabled)");
+
+static uint ath12k_dual_mac_scan_cfg;
+module_param_named(dual_mac_scan_cfg, ath12k_dual_mac_scan_cfg, uint, 0644);
+MODULE_PARM_DESC(dual_mac_scan_cfg, "concurrent_scan_config_bits word sent by dual_mac_config, as the firmware defines it (raw 32-bit value)");
+
+static uint ath12k_dual_mac_fw_mode_cfg;
+module_param_named(dual_mac_fw_mode_cfg, ath12k_dual_mac_fw_mode_cfg, uint, 0644);
+MODULE_PARM_DESC(dual_mac_fw_mode_cfg, "fw_mode_config_bits word sent by dual_mac_config, as the firmware defines it (raw 32-bit value)");
+
 /*
  * WoW flags sent in WMI_WOW_ENABLE_CMDID at suspend.
  *
@@ -1596,13 +1627,34 @@ static int ath12k_core_start(struct ath12k_base *ab)
 		goto err_reo_cleanup;
 	}
 
-	/* put hardware to DBS mode */
-	if (ab->hw_params->single_pdev_only) {
-		ret = ath12k_wmi_set_hw_mode(ab, WMI_HOST_HW_MODE_DBS);
+	/* put hardware to DBS mode -- see the ath12k_hw_mode_index comment: the
+	 * firmware answers this in WMI_PDEV_SET_HW_MODE_RESP_EVENTID, now logged.
+	 */
+	if (ab->hw_params->single_pdev_only && ath12k_hw_mode_index != -2) {
+		int idx = ath12k_hw_mode_index < 0 ? WMI_HOST_HW_MODE_DBS :
+						     ath12k_hw_mode_index;
+
+		ath12k_info(ab, "hw mode: sending WMI_PDEV_SET_HW_MODE hw_mode_index %d (firmware advertised %u modes, driver preferred %d)\n",
+			    idx, ab->wmi_ab.svc_ext_info.num_hw_modes,
+			    ab->wmi_ab.preferred_hw_mode);
+		ret = ath12k_wmi_set_hw_mode(ab, idx);
 		if (ret) {
 			ath12k_err(ab, "failed to send dbs mode: %d\n", ret);
 			goto err_reo_cleanup;
 		}
+	} else if (ab->hw_params->single_pdev_only) {
+		ath12k_info(ab, "hw mode: WMI_PDEV_SET_HW_MODE not sent (hw_mode_index=-2); firmware keeps its init choice, driver preferred %d\n",
+			    ab->wmi_ab.preferred_hw_mode);
+	}
+
+	if (ath12k_dual_mac_config) {
+		ath12k_info(ab, "hw mode: sending WMI_SOC_SET_DUAL_MAC_CONFIG scan_cfg 0x%08x fw_mode_cfg 0x%08x\n",
+			    ath12k_dual_mac_scan_cfg, ath12k_dual_mac_fw_mode_cfg);
+		ret = ath12k_wmi_set_dual_mac_config(ab, ath12k_dual_mac_scan_cfg,
+						     ath12k_dual_mac_fw_mode_cfg);
+		if (ret)
+			ath12k_warn(ab, "failed to send dual mac config: %d (continuing)\n",
+				    ret);
 	}
 
 	ret = ath12k_dp_tx_htt_h2t_ver_req_msg(ab);
