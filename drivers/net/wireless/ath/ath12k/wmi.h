@@ -2571,6 +2571,13 @@ struct wmi_soc_set_dual_mac_config_resp_event {
 	__le32 status;
 } __packed;
 
+/* fw_mode_config_bits bit positions, from the firmware's wmi_unified.h:
+ * 31 DBS, 30 AGILE_DFS, 29 DBS_FOR_CXN, 28 DBS_FOR_STA_PLUS_STA,
+ * 27 DBS_FOR_STA_PLUS_P2P, 26 ASYNC_SBS. concurrent_scan_config_bits:
+ * 31 DBS_SCAN, 30 AGILE_SCAN, 29 AGILE_DFS_SCAN, 28 ASYNC_DBS_SCAN, 27 SYNC_DBS_SCAN.
+ */
+#define WMI_DBS_FW_MODE_CFG_ASYNC_SBS	BIT(26)
+
 /* WMI_PDEV_SET_MAC_CONFIG_CMDID: the live form of the same command (the SOC form
  * above is marked deprecated in the firmware header); identical payload.
  */
@@ -5357,6 +5364,9 @@ struct ath12k_wmi_base {
 	struct ath12k_wmi_target_cap_arg *targ_cap;
 
 	struct ath12k_svc_ext_info svc_ext_info;
+	/* the firmware's own defaults for WMI_PDEV_SET_MAC_CONFIG, from service-ready-ext */
+	u32 default_conc_scan_config_bits;
+	u32 default_fw_config_bits;
 	u32 sbs_lower_band_end_freq;
 	struct ath12k_hw_mode_info hw_mode_info;
 

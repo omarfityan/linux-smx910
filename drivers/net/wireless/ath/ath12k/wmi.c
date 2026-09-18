@@ -4685,6 +4685,9 @@ static int ath12k_wmi_hw_mode_caps(struct ath12k_base *soc,
 	 * two default config words back (masked by its ini) in
 	 * WMI_PDEV_SET_MAC_CONFIG. Upstream ath12k parses all three and uses none.
 	 */
+	soc->wmi_ab.default_conc_scan_config_bits =
+		svc_rdy_ext->arg.default_conc_scan_config_bits;
+	soc->wmi_ab.default_fw_config_bits = svc_rdy_ext->arg.default_fw_config_bits;
 	ath12k_info(soc, "hw mode: firmware advertised %u modes (driver preferred %d); firmware defaults: dbs hw_mode_index %u, conc_scan_config 0x%08x, fw_config 0x%08x; dual-band-simultaneous service %s\n",
 		    svc_ext_info->num_hw_modes, soc->wmi_ab.preferred_hw_mode,
 		    soc->target_caps.default_dbs_hw_mode_index,

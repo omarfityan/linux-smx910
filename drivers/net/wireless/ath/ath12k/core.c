@@ -122,9 +122,9 @@ static int ath12k_hw_mode_index = -1;
 module_param_named(hw_mode_index, ath12k_hw_mode_index, int, 0644);
 MODULE_PARM_DESC(hw_mode_index, "hw_mode_index sent in WMI_PDEV_SET_HW_MODE_CMDID at core start on single-pdev chips: -1 = upstream behaviour (WMI_HOST_HW_MODE_DBS = 1, sent whether or not the firmware advertised a mode 1), -2 = send nothing, >= 0 = send that index");
 
-static uint ath12k_dual_mac_config;
+static uint ath12k_dual_mac_config = 2;
 module_param_named(dual_mac_config, ath12k_dual_mac_config, uint, 0644);
-MODULE_PARM_DESC(dual_mac_config, "send the dual-MAC configuration at core start carrying dual_mac_scan_cfg and dual_mac_fw_mode_cfg: 0 = never (upstream behaviour), 1 = the deprecated WMI_SOC_SET_DUAL_MAC_CONFIG_CMDID form, 2 = the live WMI_PDEV_SET_MAC_CONFIG_CMDID form the vendor driver uses");
+MODULE_PARM_DESC(dual_mac_config, "send the dual-MAC configuration at core start carrying dual_mac_scan_cfg and dual_mac_fw_mode_cfg (or, with both at 0, the firmware's own defaults with ASYNC_SBS cleared): 0 = never (upstream behaviour), 1 = the deprecated WMI_SOC_SET_DUAL_MAC_CONFIG_CMDID form, 2 = the live WMI_PDEV_SET_MAC_CONFIG_CMDID form the vendor driver uses (default)");
 
 static uint ath12k_dual_mac_scan_cfg;
 module_param_named(dual_mac_scan_cfg, ath12k_dual_mac_scan_cfg, uint, 0644);
@@ -133,6 +133,10 @@ MODULE_PARM_DESC(dual_mac_scan_cfg, "concurrent_scan_config_bits word sent by du
 static uint ath12k_dual_mac_fw_mode_cfg;
 module_param_named(dual_mac_fw_mode_cfg, ath12k_dual_mac_fw_mode_cfg, uint, 0644);
 MODULE_PARM_DESC(dual_mac_fw_mode_cfg, "fw_mode_config_bits word sent by dual_mac_config, as the firmware defines it (raw 32-bit value)");
+
+static bool ath12k_dual_mac_async_sbs;
+module_param_named(dual_mac_async_sbs, ath12k_dual_mac_async_sbs, bool, 0644);
+MODULE_PARM_DESC(dual_mac_async_sbs, "when dual_mac_config sends the firmware's own default words (both dual_mac_*_cfg left at 0), keep the ASYNC_SBS bit the firmware sets by default (Y) or clear it as this device's vendor driver does under enable_sbs=0 (N, default). With ASYNC_SBS set this firmware scans the 5 GHz channels above 5490 MHz on the 2.4 GHz MAC until that MAC has a link, and this board does not operate that MAC there");
 
 /*
  * WoW flags sent in WMI_WOW_ENABLE_CMDID at suspend.
@@ -1648,16 +1652,31 @@ static int ath12k_core_start(struct ath12k_base *ab)
 	}
 
 	if (ath12k_dual_mac_config) {
-		ath12k_info(ab, "hw mode: sending %s scan_cfg 0x%08x fw_mode_cfg 0x%08x\n",
+		u32 scan_cfg = ath12k_dual_mac_scan_cfg;
+		u32 fw_cfg = ath12k_dual_mac_fw_mode_cfg;
+		const char *how = "explicit words";
+
+		if (!scan_cfg && !fw_cfg) {
+			/* the vendor driver's behaviour: echo the firmware's own
+			 * defaults, with ASYNC_SBS cleared unless asked otherwise
+			 */
+			scan_cfg = ab->wmi_ab.default_conc_scan_config_bits;
+			fw_cfg = ab->wmi_ab.default_fw_config_bits;
+			if (!ath12k_dual_mac_async_sbs)
+				fw_cfg &= ~WMI_DBS_FW_MODE_CFG_ASYNC_SBS;
+			how = ath12k_dual_mac_async_sbs ?
+				"firmware defaults as advertised" :
+				"firmware defaults with ASYNC_SBS cleared";
+		}
+
+		ath12k_info(ab, "hw mode: sending %s scan_cfg 0x%08x fw_mode_cfg 0x%08x (%s)\n",
 			    ath12k_dual_mac_config == 2 ? "WMI_PDEV_SET_MAC_CONFIG" :
 						      "WMI_SOC_SET_DUAL_MAC_CONFIG",
-			    ath12k_dual_mac_scan_cfg, ath12k_dual_mac_fw_mode_cfg);
+			    scan_cfg, fw_cfg, how);
 		if (ath12k_dual_mac_config == 2)
-			ret = ath12k_wmi_set_mac_config(ab, ath12k_dual_mac_scan_cfg,
-							ath12k_dual_mac_fw_mode_cfg);
+			ret = ath12k_wmi_set_mac_config(ab, scan_cfg, fw_cfg);
 		else
-			ret = ath12k_wmi_set_dual_mac_config(ab, ath12k_dual_mac_scan_cfg,
-							     ath12k_dual_mac_fw_mode_cfg);
+			ret = ath12k_wmi_set_dual_mac_config(ab, scan_cfg, fw_cfg);
 		if (ret)
 			ath12k_warn(ab, "failed to send dual mac config: %d (continuing)\n",
 				    ret);
