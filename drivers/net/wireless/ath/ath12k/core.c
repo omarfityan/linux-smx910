@@ -122,9 +122,9 @@ static int ath12k_hw_mode_index = -1;
 module_param_named(hw_mode_index, ath12k_hw_mode_index, int, 0644);
 MODULE_PARM_DESC(hw_mode_index, "hw_mode_index sent in WMI_PDEV_SET_HW_MODE_CMDID at core start on single-pdev chips: -1 = upstream behaviour (WMI_HOST_HW_MODE_DBS = 1, sent whether or not the firmware advertised a mode 1), -2 = send nothing, >= 0 = send that index");
 
-static bool ath12k_dual_mac_config;
-module_param_named(dual_mac_config, ath12k_dual_mac_config, bool, 0644);
-MODULE_PARM_DESC(dual_mac_config, "send WMI_SOC_SET_DUAL_MAC_CONFIG_CMDID at core start carrying dual_mac_scan_cfg and dual_mac_fw_mode_cfg (default N = upstream behaviour, never sent; this device's vendor driver sends it with SBS disabled)");
+static uint ath12k_dual_mac_config;
+module_param_named(dual_mac_config, ath12k_dual_mac_config, uint, 0644);
+MODULE_PARM_DESC(dual_mac_config, "send the dual-MAC configuration at core start carrying dual_mac_scan_cfg and dual_mac_fw_mode_cfg: 0 = never (upstream behaviour), 1 = the deprecated WMI_SOC_SET_DUAL_MAC_CONFIG_CMDID form, 2 = the live WMI_PDEV_SET_MAC_CONFIG_CMDID form the vendor driver uses");
 
 static uint ath12k_dual_mac_scan_cfg;
 module_param_named(dual_mac_scan_cfg, ath12k_dual_mac_scan_cfg, uint, 0644);
@@ -1648,10 +1648,16 @@ static int ath12k_core_start(struct ath12k_base *ab)
 	}
 
 	if (ath12k_dual_mac_config) {
-		ath12k_info(ab, "hw mode: sending WMI_SOC_SET_DUAL_MAC_CONFIG scan_cfg 0x%08x fw_mode_cfg 0x%08x\n",
+		ath12k_info(ab, "hw mode: sending %s scan_cfg 0x%08x fw_mode_cfg 0x%08x\n",
+			    ath12k_dual_mac_config == 2 ? "WMI_PDEV_SET_MAC_CONFIG" :
+						      "WMI_SOC_SET_DUAL_MAC_CONFIG",
 			    ath12k_dual_mac_scan_cfg, ath12k_dual_mac_fw_mode_cfg);
-		ret = ath12k_wmi_set_dual_mac_config(ab, ath12k_dual_mac_scan_cfg,
-						     ath12k_dual_mac_fw_mode_cfg);
+		if (ath12k_dual_mac_config == 2)
+			ret = ath12k_wmi_set_mac_config(ab, ath12k_dual_mac_scan_cfg,
+							ath12k_dual_mac_fw_mode_cfg);
+		else
+			ret = ath12k_wmi_set_dual_mac_config(ab, ath12k_dual_mac_scan_cfg,
+							     ath12k_dual_mac_fw_mode_cfg);
 		if (ret)
 			ath12k_warn(ab, "failed to send dual mac config: %d (continuing)\n",
 				    ret);

@@ -2571,6 +2571,21 @@ struct wmi_soc_set_dual_mac_config_resp_event {
 	__le32 status;
 } __packed;
 
+/* WMI_PDEV_SET_MAC_CONFIG_CMDID: the live form of the same command (the SOC form
+ * above is marked deprecated in the firmware header); identical payload.
+ */
+struct ath12k_wmi_pdev_set_mac_config_cmd {
+	__le32 tlv_header;
+	__le32 pdev_id;
+	__le32 concurrent_scan_config_bits;
+	__le32 fw_mode_config_bits;
+} __packed;
+
+struct wmi_pdev_set_mac_config_resp_event {
+	__le32 status;
+	__le32 pdev_id;
+} __packed;
+
 struct ath12k_wmi_ppe_threshold_params {
 	__le32 numss_m1; /** NSS - 1*/
 	__le32 ru_info;
@@ -6602,6 +6617,8 @@ int ath12k_wmi_probe_resp_tmpl(struct ath12k *ar, u32 vdev_id,
 			       struct sk_buff *tmpl);
 int ath12k_wmi_set_dual_mac_config(struct ath12k_base *ab, u32 scan_cfg,
 				   u32 fw_mode_cfg);
+int ath12k_wmi_set_mac_config(struct ath12k_base *ab, u32 scan_cfg,
+			      u32 fw_mode_cfg);
 int ath12k_wmi_set_hw_mode(struct ath12k_base *ab,
 			   enum wmi_host_hw_mode_config_type mode);
 int ath12k_wmi_set_bios_cmd(struct ath12k_base *ab, u32 param_id,

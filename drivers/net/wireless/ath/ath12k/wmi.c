@@ -183,6 +183,8 @@ static const struct ath12k_wmi_tlv_policy ath12k_wmi_tlv_policies[] = {
 		.min_len = sizeof(struct wmi_pdev_hw_mode_transition_event) },
 	[WMI_TAG_SOC_SET_DUAL_MAC_CONFIG_RESPONSE_EVENT] = {
 		.min_len = sizeof(struct wmi_soc_set_dual_mac_config_resp_event) },
+	[WMI_TAG_PDEV_SET_MAC_CONFIG_RESPONSE_EVENT] = {
+		.min_len = sizeof(__le32) },
 	[WMI_TAG_RFKILL_EVENT] = {
 		.min_len = sizeof(struct wmi_rfkill_state_change_event) },
 	[WMI_TAG_PDEV_CTL_FAILSAFE_CHECK_EVENT] = {
@@ -4307,6 +4309,35 @@ int ath12k_wmi_set_dual_mac_config(struct ath12k_base *ab, u32 scan_cfg,
 	return ret;
 }
 
+int ath12k_wmi_set_mac_config(struct ath12k_base *ab, u32 scan_cfg,
+			      u32 fw_mode_cfg)
+{
+	struct ath12k_wmi_pdev_set_mac_config_cmd *cmd;
+	struct ath12k_wmi_base *wmi_ab = &ab->wmi_ab;
+	struct sk_buff *skb;
+	int ret;
+
+	skb = ath12k_wmi_alloc_skb(wmi_ab, sizeof(*cmd));
+	if (!skb)
+		return -ENOMEM;
+
+	cmd = (struct ath12k_wmi_pdev_set_mac_config_cmd *)skb->data;
+	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_PDEV_SET_MAC_CONFIG_CMD,
+						 sizeof(*cmd));
+	cmd->pdev_id = cpu_to_le32(WMI_PDEV_ID_SOC);
+	cmd->concurrent_scan_config_bits = cpu_to_le32(scan_cfg);
+	cmd->fw_mode_config_bits = cpu_to_le32(fw_mode_cfg);
+
+	ret = ath12k_wmi_cmd_send(&wmi_ab->wmi[0], skb,
+				  WMI_PDEV_SET_MAC_CONFIG_CMDID);
+	if (ret) {
+		ath12k_warn(ab, "failed to send WMI_PDEV_SET_MAC_CONFIG_CMDID\n");
+		dev_kfree_skb(skb);
+	}
+
+	return ret;
+}
+
 int ath12k_wmi_cmd_init(struct ath12k_base *ab)
 {
 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
@@ -4648,6 +4679,19 @@ static int ath12k_wmi_hw_mode_caps(struct ath12k_base *soc,
 
 	ath12k_dbg(soc, ATH12K_DBG_WMI, "num hw modes %u preferred_hw_mode %d\n",
 		   svc_ext_info->num_hw_modes, soc->wmi_ab.preferred_hw_mode);
+
+	/* What the firmware would run if the host said nothing: the vendor
+	 * driver records default_dbs_hw_mode_index and leaves it, and echoes the
+	 * two default config words back (masked by its ini) in
+	 * WMI_PDEV_SET_MAC_CONFIG. Upstream ath12k parses all three and uses none.
+	 */
+	ath12k_info(soc, "hw mode: firmware advertised %u modes (driver preferred %d); firmware defaults: dbs hw_mode_index %u, conc_scan_config 0x%08x, fw_config 0x%08x; dual-band-simultaneous service %s\n",
+		    svc_ext_info->num_hw_modes, soc->wmi_ab.preferred_hw_mode,
+		    soc->target_caps.default_dbs_hw_mode_index,
+		    svc_rdy_ext->arg.default_conc_scan_config_bits,
+		    svc_rdy_ext->arg.default_fw_config_bits,
+		    test_bit(WMI_TLV_SERVICE_DUAL_BAND_SIMULTANEOUS_SUPPORT,
+			     soc->wmi_ab.svc_map) ? "yes" : "no");
 
 	if (soc->wmi_ab.preferred_hw_mode == WMI_HOST_HW_MODE_MAX)
 		return -EINVAL;
@@ -9062,6 +9106,32 @@ static void ath12k_soc_set_dual_mac_config_resp_event(struct ath12k_base *ab,
 	kfree(tb);
 }
 
+static void ath12k_pdev_set_mac_config_resp_event(struct ath12k_base *ab,
+						  struct sk_buff *skb)
+{
+	const struct wmi_pdev_set_mac_config_resp_event *ev;
+	const void **tb;
+
+	tb = ath12k_wmi_tlv_parse_alloc(ab, skb, GFP_ATOMIC);
+	if (IS_ERR(tb)) {
+		ath12k_warn(ab, "failed to parse mac config response tlv: %ld\n",
+			    PTR_ERR(tb));
+		return;
+	}
+
+	ev = tb[WMI_TAG_PDEV_SET_MAC_CONFIG_RESPONSE_EVENT];
+	if (!ev) {
+		ath12k_warn(ab, "mac config response without its fixed param (%u bytes)\n",
+			    skb->len);
+		kfree(tb);
+		return;
+	}
+
+	ath12k_info(ab, "hw mode: firmware answered WMI_PDEV_SET_MAC_CONFIG word0 %u word1 %u (status, then pdev_id, per the firmware header)\n",
+		    le32_to_cpu(ev->status), le32_to_cpu(ev->pdev_id));
+	kfree(tb);
+}
+
 static void ath12k_rfkill_state_change_event(struct ath12k_base *ab,
 					     struct sk_buff *skb)
 {
@@ -10051,6 +10121,9 @@ static void ath12k_wmi_op_rx(struct ath12k_base *ab, struct sk_buff *skb)
 		break;
 	case WMI_SOC_SET_DUAL_MAC_CONFIG_RESP_EVENTID:
 		ath12k_soc_set_dual_mac_config_resp_event(ab, skb);
+		break;
+	case WMI_PDEV_SET_MAC_CONFIG_RESP_EVENTID:
+		ath12k_pdev_set_mac_config_resp_event(ab, skb);
 		break;
 	case WMI_TWT_ENABLE_EVENTID:
 		ath12k_wmi_twt_enable_event(ab, skb);
