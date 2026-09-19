@@ -6966,6 +6966,25 @@ static int ath12k_reg_chan_list_event(struct ath12k_base *ab, struct sk_buff *sk
 		goto mem_free;
 	}
 
+	/* The radio this event answers is known as soon as the event parses,
+	 * so record it BEFORE validation: an answer the driver goes on to
+	 * DROP (the firmware refused the requested country and stayed where it
+	 * was, or the country already matches the default regd) is still the
+	 * answer ath12k_regd_update() is waiting for. With pdev_idx left at its
+	 * sentinel on those paths, 'ar' stayed NULL at 'out' and the completion
+	 * was never signalled, so the next ath12k_regd_update() -- run at every
+	 * station authorization to re-apply the reg rules -- waited out the
+	 * full ATH12K_REG_UPDATE_TIMEOUT_HZ. Measured on a WCN7850 whose 802.11d
+	 * scan learns "00" (rejected by the firmware, status FAIL): every
+	 * association then carried "Timeout while waiting for regulatory
+	 * update" 3 s later, and the regd re-application ran 3.0-3.1 s after
+	 * "connection done" instead of 5-12 ms. The bound keeps a phy_id the
+	 * firmware reports for a radio this host does not have (the second FAIL
+	 * event arrives with phy 1 on a single-pdev chip) off ab->pdevs[].
+	 */
+	if (reg_info->phy_id < ab->num_radios)
+		pdev_idx = reg_info->phy_id;
+
 	ret = ath12k_reg_validate_reg_info(ab, reg_info);
 	if (ret == ATH12K_REG_STATUS_FALLBACK) {
 		ath12k_warn(ab, "failed to validate reg info %d\n", ret);
@@ -6981,8 +7000,9 @@ static int ath12k_reg_chan_list_event(struct ath12k_base *ab, struct sk_buff *sk
 		goto mem_free;
 	}
 
-	/* free old reg_info if it exist */
-	pdev_idx = reg_info->phy_id;
+	/* free old reg_info if it exist (pdev_idx was bounded and set above;
+	 * a VALID verdict guarantees phy_id < num_radios)
+	 */
 	if (ab->reg_info[pdev_idx]) {
 		ath12k_reg_reset_reg_info(ab->reg_info[pdev_idx]);
 		kfree(ab->reg_info[pdev_idx]);
