@@ -16,6 +16,7 @@
 #include "iris_vb2.h"
 #include "iris_vpu_buffer.h"
 #include "iris_platform_common.h"
+#include "iris_hfi_gen2.h"
 
 #define IRIS_DRV_NAME "iris_driver"
 #define IRIS_BUS_NAME "platform:iris_icc"
@@ -121,6 +122,20 @@ iris_m2m_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_
 	dst_vq->drv_priv = inst;
 	dst_vq->buf_struct_size = sizeof(struct iris_buffer);
 	dst_vq->min_reqbufs_allocation = MIN_BUFFERS;
+	/*
+	 * Threaded video clients can retain more than 32 decoded surfaces before
+	 * returning them to the decoder; VLC's default frame threading is the
+	 * documented example. vb2's default ceiling of 32 stops them allocating the
+	 * capture pool they need, and the client then starves rather than deadlock.
+	 *
+	 * Adapted from Xilin Wu's iris patch 0002 (radxa-pkg/libva-v4l2, 2026-09-08).
+	 * Upstream gates on an `iris_hfi_gen2_data` symbol this tree does not have;
+	 * here the generation is carried by the platform data's command-ops
+	 * initialiser, which is the same distinction by a different name.
+	 */
+	if (inst->core->iris_platform_data->init_hfi_command_ops ==
+	    iris_hfi_gen2_command_ops_init)
+		dst_vq->max_num_buffers = DEFAULT_MAX_HOST_BUF_COUNT;
 	dst_vq->dev = inst->core->dev;
 	dst_vq->lock = &inst->ctx_q_lock;
 
