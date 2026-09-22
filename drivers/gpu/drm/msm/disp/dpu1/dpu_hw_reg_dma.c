@@ -490,6 +490,15 @@ out:
 #define SELFTEST_RUN			BIT(0)
 #define SELFTEST_NO_TRIGGER		BIT(1)
 #define SELFTEST_SOURCE_PIPE		BIT(2)
+/*
+ * Two more source-pipe arms that differ from each other in ONE thing: whether
+ * the pipe is carrying a plane.  Source-pipe registers are shadowed and latch on
+ * the control block's flush for the frame that uses the pipe, and the transfer
+ * is started from that same control block -- so a pipe in no active path is a
+ * plausible reason for a write to go nowhere, and it was never held constant.
+ */
+#define SELFTEST_LIVE_DMA_PIPE		BIT(3)
+#define SELFTEST_IDLE_DMA_PIPE		BIT(4)
 
 /*
  * The source pipes' inverse-gamma block, which is the block the colour-operation
@@ -518,6 +527,48 @@ out:
 /* twelve-bit values, distinctive, that nothing else has any reason to write */
 static const u32 selftest_vig_sentinel[SELFTEST_VIG_IGC_LAST_N] = {
 	0xa51, 0xb62, 0xc73,
+};
+
+/*
+ * The DMA source pipes' inverse-gamma block.
+ *
+ * This is a DIFFERENT SHAPE from the video pipes' block, and the difference is
+ * exactly what makes it the right place to ask whether the engine reaches a
+ * source pipe at all.  The vendor writes this lookup table as a run of ORDINARY
+ * CONSECUTIVE REGISTERS, where the video pipes' table goes through a single
+ * auto-advancing index port.  Ordinary registers can be read straight back
+ * through the register mapping, so the read-back can prove the transfer rather
+ * than merely fail to disprove it.
+ *
+ * Offsets, from this device's own description of itself:
+ *   qcom,sde-dma-igc     = <0xa00 0x50000>    the block, as the CPU reaches it
+ *   qcom,sde-dma-top-off = <0x800>            this pipe class's own anchor shift
+ * and the engine's base is the block's base minus that shift.
+ *
+ * 🔴 THE SHIFT IS 0x800 HERE AND 0xa00 ON THE VIDEO PIPES.  It is a property of
+ * the pipe class, not a constant, so it cannot be carried across from the other
+ * arm.
+ *
+ * Nothing here enables inverse gamma: that is a separate masked modify of a
+ * different register, which this deliberately does not do.  Lookup table
+ * contents with the feature disabled change no pixel, so this arm has nothing to
+ * see and nothing to put back beyond the values it found.
+ */
+#define SELFTEST_DMA_IGC_CPU_OFF	0xa00
+#define SELFTEST_DMA_IGC_DMA_OFF	(0xa00 - 0x800)
+#define SELFTEST_DMA_IGC_N		3
+
+/*
+ * Both patterns keep each sixteen-bit half below 0x1000, because these registers
+ * hold two packed twelve-bit table entries and anything wider is masked away --
+ * a sentinel the hardware truncates would read back changed and be scored as a
+ * failure it did not cause.
+ */
+static const u32 selftest_dma_cpu_pattern[SELFTEST_DMA_IGC_N] = {
+	0x01230456, 0x07890abc, 0x0def0111,
+};
+static const u32 selftest_dma_sentinel[SELFTEST_DMA_IGC_N] = {
+	0x0a510b62, 0x0c730d84, 0x0e950fa6,
 };
 
 static int lutdma_selftest;
@@ -573,7 +624,7 @@ static const struct kernel_param_ops lutdma_selftest_ops = {
 };
 module_param_cb(lutdma_selftest, &lutdma_selftest_ops, &lutdma_selftest, 0644);
 MODULE_PARM_DESC(lutdma_selftest,
-	"register-DMA engine self-test: 1=post-blend colour block, 5=source pipe inverse gamma, +2 queues without starting the engine (control), 0=restore");
+	"register-DMA engine self-test: 1=post-blend colour block, 5=video source pipe inverse gamma, 9=DMA source pipe carrying the desktop, 17=DMA source pipe carrying nothing, +2 queues without starting the engine (control), 0=restore");
 
 static u32 selftest_decode_sel_for(enum dpu_dspp idx)
 {
@@ -587,18 +638,36 @@ static u32 selftest_decode_sel_for(enum dpu_dspp idx)
 }
 
 /*
- * The first source pipe that takes video. Located through the catalogue rather
- * than by a constant, so the offset used is the one this driver believes in.
+ * A source pipe, located through the catalogue rather than by a constant, so the
+ * offset used is the one this driver believes in.
  */
-static const struct dpu_sspp_cfg *selftest_find_vig0(struct dpu_kms *dpu_kms)
+static const struct dpu_sspp_cfg *selftest_find_sspp(struct dpu_kms *dpu_kms,
+						     enum dpu_sspp id)
 {
 	int i;
 
 	for (i = 0; i < dpu_kms->catalog->sspp_count; i++)
-		if (dpu_kms->catalog->sspp[i].id == SSPP_VIG0)
+		if (dpu_kms->catalog->sspp[i].id == id)
 			return &dpu_kms->catalog->sspp[i];
 
 	return NULL;
+}
+
+static u32 selftest_decode_sel_for_sspp(enum dpu_sspp id)
+{
+	switch (id) {
+	case SSPP_VIG0: return DPU_REG_DMA_BLK_VIG0;
+	case SSPP_VIG1: return DPU_REG_DMA_BLK_VIG1;
+	case SSPP_VIG2: return DPU_REG_DMA_BLK_VIG2;
+	case SSPP_VIG3: return DPU_REG_DMA_BLK_VIG3;
+	case SSPP_DMA0: return DPU_REG_DMA_BLK_DMA0;
+	case SSPP_DMA1: return DPU_REG_DMA_BLK_DMA1;
+	case SSPP_DMA2: return DPU_REG_DMA_BLK_DMA2;
+	case SSPP_DMA3: return DPU_REG_DMA_BLK_DMA3;
+	case SSPP_DMA4: return DPU_REG_DMA_BLK_DMA4;
+	case SSPP_DMA5: return DPU_REG_DMA_BLK_DMA5;
+	default:        return 0;
+	}
 }
 
 /*
@@ -619,7 +688,7 @@ static void selftest_source_pipe(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *ctl
 	bool pass = true;
 	int i, ret;
 
-	vig = selftest_find_vig0(dpu_kms);
+	vig = selftest_find_sspp(dpu_kms, SSPP_VIG0);
 	if (!vig) {
 		DPU_ERROR("no video source pipe in the catalogue\n");
 		return;
@@ -670,6 +739,114 @@ static void selftest_source_pipe(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *ctl
 		 pass ? "PASS" : "FAIL", ret);
 }
 
+/*
+ * Ask the engine to write a run of ordinary registers inside a DMA source pipe's
+ * inverse-gamma block, and read them back through the register mapping.
+ *
+ * WHY THIS ARM EXISTS
+ * A previous attempt wrote a video pipe and its read-back reported nothing
+ * either way, and the two arms that produced a pass and a failure differed in a
+ * variable nobody had held constant: the passing one targeted a post-blend block
+ * that is in the display path every frame, the failing one a video pipe that was
+ * carrying no plane at all.  This arm is run twice against the SAME block type
+ * at the SAME offsets with the SAME operation -- once on the pipe carrying the
+ * desktop, once on a pipe carrying nothing -- so that whether the pipe is live is
+ * the only thing that differs.
+ *
+ * Nothing sets a flush bit by hand.  The live pipe's flush already happens every
+ * frame because the desktop is on it, and the idle pipe's correctly does not;
+ * forcing one would blur the very thing being separated.
+ */
+static void selftest_dma_pipe(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *ctl,
+			      bool trigger, enum dpu_sspp id, const char *liveness)
+{
+	struct dpu_reg_dma *rdma = &lutdma_selftest_engine;
+	const struct dpu_sspp_cfg *sspp;
+	struct dpu_hw_blk_reg_map hw;
+	u32 orig[SELFTEST_DMA_IGC_N];
+	u32 before[SELFTEST_DMA_IGC_N], after[SELFTEST_DMA_IGC_N];
+	bool writable = true, pass = true;
+	u32 blk;
+	int i, ret;
+
+	sspp = selftest_find_sspp(dpu_kms, id);
+	if (!sspp) {
+		DPU_ERROR("source pipe %d is not in the catalogue\n", id);
+		return;
+	}
+
+	blk = selftest_decode_sel_for_sspp(id);
+	if (!blk) {
+		DPU_ERROR("no decode-select bit for source pipe %d\n", id);
+		return;
+	}
+
+	memset(&hw, 0, sizeof(hw));
+	hw.blk_addr = dpu_kms->mmio + sspp->base;
+	hw.log_mask = DPU_DBG_MASK_SSPP;
+
+	/*
+	 * 🔴 THE CONTROL THE PREVIOUS ATTEMPT WAS MISSING.  Write a distinctive
+	 * NON-ZERO value from the CPU and confirm it reads back, so the target is
+	 * known to be a real, reachable, writable register before the engine is
+	 * asked for anything.  Without it a wrong offset, a block that answers
+	 * nothing and a register that cannot be written all produce the same zero,
+	 * and all of them look exactly like the engine having failed.
+	 */
+	for (i = 0; i < SELFTEST_DMA_IGC_N; i++)
+		orig[i] = DPU_REG_READ(&hw, SELFTEST_DMA_IGC_CPU_OFF + i * sizeof(u32));
+	for (i = 0; i < SELFTEST_DMA_IGC_N; i++)
+		DPU_REG_WRITE(&hw, SELFTEST_DMA_IGC_CPU_OFF + i * sizeof(u32),
+			      selftest_dma_cpu_pattern[i]);
+	for (i = 0; i < SELFTEST_DMA_IGC_N; i++) {
+		before[i] = DPU_REG_READ(&hw, SELFTEST_DMA_IGC_CPU_OFF + i * sizeof(u32));
+		if (before[i] != selftest_dma_cpu_pattern[i])
+			writable = false;
+	}
+
+	dpu_reg_dma_buf_reset(rdma);
+	ret = dpu_reg_dma_decode_sel(rdma, blk);
+	if (!ret)
+		ret = dpu_reg_dma_block_write(rdma, SELFTEST_DMA_IGC_DMA_OFF,
+					      selftest_dma_sentinel,
+					      SELFTEST_DMA_IGC_N);
+	if (ret) {
+		DPU_ERROR("failed to build the command buffer: %d\n", ret);
+		return;
+	}
+
+	ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, trigger);
+
+	for (i = 0; i < SELFTEST_DMA_IGC_N; i++)
+		after[i] = DPU_REG_READ(&hw, SELFTEST_DMA_IGC_CPU_OFF + i * sizeof(u32));
+
+	/*
+	 * Started, the engine's values must be there.  Not started, the CPU's
+	 * pattern must still be there -- which is a stronger control than reading
+	 * zero, because a register that simply refuses every write would also read
+	 * zero and would pass a weaker one.
+	 */
+	for (i = 0; i < SELFTEST_DMA_IGC_N; i++)
+		if (after[i] != (trigger ? selftest_dma_sentinel[i]
+					 : selftest_dma_cpu_pattern[i]))
+			pass = false;
+
+	DRM_INFO("selftest: %s pipe %s (base %#x) ctl%d %s | cpu-writable %s | before %#x %#x %#x | expected %#x %#x %#x | read %#x %#x %#x | %s | kick_off %d\n",
+		 liveness, sspp->name, sspp->base, ctl->idx - CTL_0,
+		 trigger ? "engine started" : "ENGINE NOT STARTED (control)",
+		 writable ? "YES" : "NO -- the read-back below decides nothing",
+		 before[0], before[1], before[2],
+		 trigger ? selftest_dma_sentinel[0] : selftest_dma_cpu_pattern[0],
+		 trigger ? selftest_dma_sentinel[1] : selftest_dma_cpu_pattern[1],
+		 trigger ? selftest_dma_sentinel[2] : selftest_dma_cpu_pattern[2],
+		 after[0], after[1], after[2],
+		 (pass && writable) ? "PASS" : "FAIL", ret);
+
+	/* put the block back exactly as it was found */
+	for (i = 0; i < SELFTEST_DMA_IGC_N; i++)
+		DPU_REG_WRITE(&hw, SELFTEST_DMA_IGC_CPU_OFF + i * sizeof(u32), orig[i]);
+}
+
 /**
  * dpu_reg_dma_selftest_run - run a pending engine self-test
  *
@@ -712,6 +889,18 @@ void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
 
 	if (!rdma->ready) {
 		DPU_ERROR("the engine was not set up\n");
+		return;
+	}
+
+	if (lutdma_selftest & SELFTEST_LIVE_DMA_PIPE) {
+		selftest_dma_pipe(dpu_kms, ctl, trigger, SSPP_DMA0,
+				  "LIVE (carries the desktop)");
+		return;
+	}
+
+	if (lutdma_selftest & SELFTEST_IDLE_DMA_PIPE) {
+		selftest_dma_pipe(dpu_kms, ctl, trigger, SSPP_DMA2,
+				  "IDLE (carries nothing)");
 		return;
 	}
 
