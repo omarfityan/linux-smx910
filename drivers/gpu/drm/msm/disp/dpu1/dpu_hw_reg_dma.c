@@ -507,6 +507,19 @@ out:
  * freely writable, and the last-entry registers are not.
  */
 #define SELFTEST_VIG_PLAIN_REGS		BIT(5)
+/*
+ * The device's own v6 inverse-gamma sequence, in two shapes.
+ *
+ * The first submits the enable and the last-point write as separate transfers,
+ * so that the second of them is byte for byte a program already known to
+ * complete and write nothing, with a single thing changed ahead of it.  The
+ * second submits the whole vendor sequence, lookup table included, in one
+ * command buffer -- which is what a colour-operation implementation has to send
+ * and is therefore worth knowing about, but changes too much at once to settle
+ * anything on its own.
+ */
+#define SELFTEST_VIG_V6_SPLIT		BIT(6)
+#define SELFTEST_VIG_V6_FULL		BIT(7)
 
 /*
  * The source pipes' inverse-gamma block, which is the block the colour-operation
@@ -655,7 +668,7 @@ static const struct kernel_param_ops lutdma_selftest_ops = {
 };
 module_param_cb(lutdma_selftest, &lutdma_selftest_ops, &lutdma_selftest, 0644);
 MODULE_PARM_DESC(lutdma_selftest,
-	"register-DMA engine self-test: 1=post-blend colour block, 5=video source pipe last-entry registers, 9=DMA source pipe carrying the desktop, 17=DMA source pipe carrying nothing, 33=video source pipe index and dither registers, +2 queues without starting the engine (control), 0=restore");
+	"register-DMA engine self-test: 1=post-blend colour block, 5=video source pipe last-entry registers, 9=DMA source pipe carrying the desktop, 17=DMA source pipe carrying nothing, 33=video source pipe index and dither registers, 65=enable inverse gamma then write the curve's last point, as two transfers, 129=the device's whole v6 inverse-gamma sequence in one transfer, +2 queues without starting the engine (control), 0=restore");
 
 static u32 selftest_decode_sel_for(enum dpu_dspp idx)
 {
@@ -983,6 +996,376 @@ static void selftest_vig_plain_regs(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *
 	DPU_REG_WRITE(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DITHER, orig_dither);
 }
 
+/* ------------------------------------------------------------------------ *
+ * The vendor's v6 inverse-gamma sequence
+ *
+ * The lookup table in this block is what the colour-operation work has to
+ * program, and the three registers holding the curve's last point are the one
+ * part of it nothing has ever been able to write -- not the engine, not the CPU.
+ * The standing explanation is that the device's own driver writes them only
+ * AFTER a masked modify that turns inverse gamma on and picks a table bank, and
+ * nothing here has ever turned anything on.
+ *
+ * Transcribed from this device's own writer -- reg_dmav1_setup_vig_igcv6() and
+ * reg_dmav1_setup_vig_igc_common() -- rather than derived:
+ *
+ *   1  name the pipe
+ *   2  index := 0                          single write        | per channel
+ *   3  128 dwords through the data port    indexed run         | ch = 0, 1, 2
+ *   4  dither                              single write
+ *   5  opmode                              masked modify   <-- turns it ON
+ *   6  the curve's last point, 3 registers consecutive run
+ *   7  start the engine
+ * ------------------------------------------------------------------------ */
+
+/*
+ * The opmode register at the block's base, and the mask the vendor modifies it
+ * under.
+ *
+ * THE MASK NAMES THE BITS TO KEEP, NOT THE BITS TO WRITE, and this device's own
+ * driver settles that without being asked.  The register is shared with the
+ * gamut block -- this device declares both at the same offset -- and the two
+ * features modify it under complementary masks: gamut keeps 0x300, which is
+ * exactly inverse gamma's two bits, and inverse gamma keeps 0x1001f, which is
+ * exactly the field gamut reads its own mode out of.  Under the other reading
+ * each feature would be overwriting the other's.
+ *
+ * So bit 8 enables the lookup table, bit 9 chooses which of two banks it uses,
+ * and bits 0-4 and 16 belong to gamut and have to survive.
+ */
+#define SELFTEST_VIG_IGC_OPMODE		0x000
+#define SELFTEST_VIG_IGC_OP_MASK	0x1001f
+#define SELFTEST_VIG_IGC_LUT_ENABLE	BIT(8)
+#define SELFTEST_VIG_IGC_LUT_SEL	BIT(9)
+
+/* the table's data port: one register per channel, each with its own index */
+#define SELFTEST_VIG_IGC_DATA		0x1b4
+
+/* 256 entries a channel, packed two to a register, plus a separately held last point */
+#define SELFTEST_VIG_IGC_ENTRIES	256
+#define SELFTEST_VIG_IGC_DWORDS		(SELFTEST_VIG_IGC_ENTRIES / 2)
+#define SELFTEST_VIG_IGC_CHANNELS	3
+#define SELFTEST_VIG_IGC_ENTRY_MASK	(BIT(12) - 1)
+
+/* a four-bit strength beside an enable bit, encoded the way the vendor encodes it */
+#define SELFTEST_VIG_DITHER_V6		0x16
+
+/* the entry the read-back asks for by name, chosen away from both ends of the table */
+#define SELFTEST_VIG_IGC_PROBE_INDEX	64
+
+/*
+ * The table this writes into the block.
+ *
+ * It is the identity curve for eight-bit input held in a twelve-bit table --
+ * entry k is k * 16 -- displaced by the channel number, so a value read back
+ * names both the entry it came from and the channel it came through while the
+ * curve itself remains one that changes no picture.  That second property is
+ * not decoration: step 5 turns inverse gamma ON, and if a plane ever did land
+ * on this pipe with a table loaded, an identity curve is the difference between
+ * an invisible test and a visibly wrong screen.
+ */
+static u32 selftest_igc_entry(u32 channel, u32 k)
+{
+	return (k * 16 + channel) & SELFTEST_VIG_IGC_ENTRY_MASK;
+}
+
+/* built once per channel and copied into the command buffer before it is reused */
+static u32 selftest_igc_lut[SELFTEST_VIG_IGC_DWORDS];
+
+static void selftest_igc_fill(u32 channel)
+{
+	u32 j;
+
+	for (j = 0; j < SELFTEST_VIG_IGC_DWORDS; j++)
+		selftest_igc_lut[j] = selftest_igc_entry(channel, 2 * j) |
+				      selftest_igc_entry(channel, 2 * j + 1) << 16;
+}
+
+/*
+ * Read one named entry of the table back.
+ *
+ * The data port is a single register and the index register beside it says
+ * which entry that port is pointing at.  Setting the index and then reading
+ * names the entry, which is a stronger read-back than reading the port
+ * repeatedly and trusting it to advance -- and, unlike that, it does not rest
+ * on the advancing being real.
+ */
+static u32 selftest_igc_read_entry(struct dpu_hw_blk_reg_map *hw, u32 channel,
+				   u32 index)
+{
+	DPU_REG_WRITE(hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX, index);
+	return DPU_REG_READ(hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DATA +
+			    channel * sizeof(u32));
+}
+
+/*
+ * Put the block back the way it was found, and say which route did it.
+ *
+ * The vendor's own off path is the same masked modify carrying zero, so that is
+ * tried first.  A CPU write of the original value follows as a second route,
+ * because the engine turning the feature ON and then failing to turn it off
+ * again is the one outcome of this arm that would outlive the commit.
+ */
+static void selftest_vig_igc_restore(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *ctl,
+				     struct dpu_hw_blk_reg_map *hw, u32 orig_opmode,
+				     u32 orig_index, u32 orig_dither)
+{
+	struct dpu_reg_dma *rdma = &lutdma_selftest_engine;
+	u32 by_engine, by_cpu;
+	int ret;
+
+	dpu_reg_dma_buf_reset(rdma);
+	ret = dpu_reg_dma_decode_sel(rdma, DPU_REG_DMA_BLK_VIG0);
+	if (!ret)
+		ret = dpu_reg_dma_single_modify(rdma, SELFTEST_VIG_IGC_DMA_OFF +
+						SELFTEST_VIG_IGC_OPMODE,
+						SELFTEST_VIG_IGC_OP_MASK, 0);
+	if (!ret)
+		ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, true);
+
+	by_engine = DPU_REG_READ(hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_OPMODE);
+
+	DPU_REG_WRITE(hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_OPMODE, orig_opmode);
+	by_cpu = DPU_REG_READ(hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_OPMODE);
+
+	DPU_REG_WRITE(hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX, orig_index);
+	DPU_REG_WRITE(hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DITHER, orig_dither);
+
+	DRM_INFO("selftest: v6 restore | wanted %#x | after the engine's off path %#x (%s) | after a cpu write %#x (%s) | kick_off %d\n",
+		 orig_opmode, by_engine,
+		 by_engine == orig_opmode ? "restored" : "NOT restored",
+		 by_cpu,
+		 by_cpu == orig_opmode ? "restored" : "STILL NOT RESTORED -- INVERSE GAMMA MAY BE LEFT ON",
+		 ret);
+}
+
+/**
+ * selftest_vig_igc_v6 - run the device's own v6 inverse-gamma sequence
+ * @split: submit the enable and the last-point write as TWO transfers instead
+ *         of one, and leave the lookup table out
+ *
+ * WHY THERE ARE TWO SHAPES OF THIS
+ * The last-point registers refused a write in a program that was three
+ * operations long and refused it again in a program that was one operation
+ * long, so program length is not what distinguishes them.  What has never been
+ * held constant is whether the feature was enabled first.
+ *
+ * @split submits exactly the program that already completed cleanly and wrote
+ * nothing -- name the pipe, write the three registers -- with one thing changed
+ * ahead of it: a transfer that turned the feature on.  One variable against a
+ * result already in hand.
+ *
+ * Without @split this is the whole vendor sequence in a single command buffer,
+ * lookup table included, which is what a colour-operation implementation would
+ * actually have to submit.  It is the useful program; it is not the clean
+ * experiment, because it changes several things at once.
+ */
+static void selftest_vig_igc_v6(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *ctl,
+				bool trigger, bool split)
+{
+	struct dpu_reg_dma *rdma = &lutdma_selftest_engine;
+	const struct dpu_sspp_cfg *vig;
+	struct dpu_hw_blk_reg_map hw;
+	u32 orig_opmode, orig_index, orig_dither, probe;
+	u32 opmode_after, index_after, dither_after;
+	u32 last[SELFTEST_VIG_IGC_LAST_N];
+	u32 lut_before, lut_at_0, lut_next, lut_at_probe, lut_c1, lut_c2, lut_when_off;
+	u32 enable_val, lut_enable, lut_sel;
+	bool opmode_cpu_writable;
+	int ch, i, ret, ret_second = 0;
+
+	vig = selftest_find_sspp(dpu_kms, SSPP_VIG0);
+	if (!vig) {
+		DPU_ERROR("no video source pipe in the catalogue\n");
+		return;
+	}
+
+	memset(&hw, 0, sizeof(hw));
+	hw.blk_addr = dpu_kms->mmio + vig->base;
+	hw.log_mask = DPU_DBG_MASK_SSPP;
+
+	orig_opmode = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_OPMODE);
+	orig_index  = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX);
+	orig_dither = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DITHER);
+
+	/*
+	 * Refuse rather than guess.  The modify keeps only the bits in the mask
+	 * and clears the rest, so any bit set outside the mask and outside the
+	 * two bits being written is a bit this arm would destroy and the vendor's
+	 * own off path would not put back.  Every video pipe read zero here when
+	 * this was written; that is a reason to check it, not to assume it.
+	 */
+	if (orig_opmode & ~SELFTEST_VIG_IGC_OP_MASK) {
+		DRM_INFO("selftest: v6 REFUSED -- %s opmode reads %#x, which has bits outside the mask %#x this modify would clear and the off path would not restore\n",
+			 vig->name, orig_opmode, SELFTEST_VIG_IGC_OP_MASK);
+		return;
+	}
+
+	/*
+	 * Whether the CPU can write this register at all, established before it
+	 * matters.  Bit 9 only chooses between two table banks and the table is
+	 * disabled, so the probe cannot change a pixel; the point is to know
+	 * whether there is a second way back before taking the first one.
+	 */
+	DPU_REG_WRITE(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_OPMODE,
+		      orig_opmode | SELFTEST_VIG_IGC_LUT_SEL);
+	probe = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_OPMODE);
+	opmode_cpu_writable = probe == (orig_opmode | SELFTEST_VIG_IGC_LUT_SEL);
+	DPU_REG_WRITE(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_OPMODE, orig_opmode);
+
+	/* what the table's first entry reads as with the feature off, which is the
+	 * state the only previous reading of this port was taken in */
+	lut_before = selftest_igc_read_entry(&hw, 0, 0);
+
+	/*
+	 * The value the modify carries, worked out the way the device's own
+	 * driver works it out.  Its second line is written `(~lut_sel) && BIT(0)`
+	 * in the original, which is a logical and rather than a bitwise one and
+	 * therefore always yields 1; it is transcribed as it stands, because a
+	 * tidied version would be a different program from the one the hardware
+	 * is known to accept.
+	 */
+	lut_enable = (orig_opmode >> 8) & BIT(0);
+	lut_sel = (orig_opmode >> 9) & BIT(0);
+	if (lut_enable)
+		lut_sel = 1;
+	enable_val = SELFTEST_VIG_IGC_LUT_ENABLE | (lut_sel << 9);
+
+	dpu_reg_dma_buf_reset(rdma);
+	ret = dpu_reg_dma_decode_sel(rdma, DPU_REG_DMA_BLK_VIG0);
+
+	if (!split) {
+		for (ch = 0; ch < SELFTEST_VIG_IGC_CHANNELS && !ret; ch++) {
+			ret = dpu_reg_dma_single_write(rdma, SELFTEST_VIG_IGC_DMA_OFF +
+						       SELFTEST_VIG_IGC_INDEX, 0);
+			if (ret)
+				break;
+			selftest_igc_fill(ch);
+			ret = dpu_reg_dma_indexed_write(rdma, SELFTEST_VIG_IGC_DMA_OFF +
+							SELFTEST_VIG_IGC_DATA +
+							ch * sizeof(u32),
+							selftest_igc_lut,
+							SELFTEST_VIG_IGC_DWORDS);
+		}
+		if (!ret)
+			ret = dpu_reg_dma_single_write(rdma, SELFTEST_VIG_IGC_DMA_OFF +
+						       SELFTEST_VIG_IGC_DITHER,
+						       SELFTEST_VIG_DITHER_V6);
+	}
+
+	if (!ret)
+		ret = dpu_reg_dma_single_modify(rdma, SELFTEST_VIG_IGC_DMA_OFF +
+						SELFTEST_VIG_IGC_OPMODE,
+						SELFTEST_VIG_IGC_OP_MASK, enable_val);
+
+	/*
+	 * Split, the last-point write goes in its own transfer so that what is
+	 * submitted is byte for byte the program that has already run and
+	 * completed, with the enable ahead of it as the only difference.
+	 */
+	if (!split && !ret)
+		ret = dpu_reg_dma_block_write(rdma, SELFTEST_VIG_IGC_DMA_OFF +
+					      SELFTEST_VIG_IGC_LAST,
+					      selftest_vig_sentinel,
+					      SELFTEST_VIG_IGC_LAST_N);
+	if (ret) {
+		DPU_ERROR("failed to build the command buffer: %d\n", ret);
+		return;
+	}
+
+	ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, trigger);
+
+	/* read the enable before submitting anything else, so the second transfer
+	 * is known to have gone out with the feature in the state it reports */
+	opmode_after = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_OPMODE);
+
+	if (split) {
+		dpu_reg_dma_buf_reset(rdma);
+		ret_second = dpu_reg_dma_decode_sel(rdma, DPU_REG_DMA_BLK_VIG0);
+		if (!ret_second)
+			ret_second = dpu_reg_dma_block_write(rdma,
+							     SELFTEST_VIG_IGC_DMA_OFF +
+							     SELFTEST_VIG_IGC_LAST,
+							     selftest_vig_sentinel,
+							     SELFTEST_VIG_IGC_LAST_N);
+		if (!ret_second)
+			ret_second = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, trigger);
+	}
+
+	/*
+	 * The index register before anything touches it.  The sequence resets it
+	 * to zero and then pushes 128 values through the port, so a value near
+	 * 128 here is the table load reporting itself, independently of reading a
+	 * single entry back.
+	 */
+	index_after  = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX);
+	dither_after = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DITHER);
+	for (i = 0; i < SELFTEST_VIG_IGC_LAST_N; i++)
+		last[i] = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF +
+				       SELFTEST_VIG_IGC_LAST + i * sizeof(u32));
+
+	/* and only now the reads that move the index themselves */
+	lut_at_0 = selftest_igc_read_entry(&hw, 0, 0);
+	lut_next = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DATA);
+	lut_at_probe = selftest_igc_read_entry(&hw, 0, SELFTEST_VIG_IGC_PROBE_INDEX);
+	lut_c1 = selftest_igc_read_entry(&hw, 1, 0);
+	lut_c2 = selftest_igc_read_entry(&hw, 2, 0);
+
+	DRM_INFO("selftest: v6 %s on %s (base %#x) ctl%d %s | opmode cpu-writable %s | opmode %#x -> wrote %#x under keep-mask %#x -> read %#x (%s) | index %#x -> %#x (%s) | dither %#x -> %#x | last point: expected %#x %#x %#x read %#x %#x %#x -- %s | kick_off %d/%d\n",
+		 split ? "ENABLE THEN LAST POINT, two transfers"
+		       : "FULL SEQUENCE, one transfer",
+		 vig->name, vig->base, ctl->idx - CTL_0,
+		 trigger ? "engine started" : "ENGINE NOT STARTED (control)",
+		 opmode_cpu_writable ? "YES" : "no",
+		 orig_opmode, enable_val, SELFTEST_VIG_IGC_OP_MASK, opmode_after,
+		 (opmode_after & SELFTEST_VIG_IGC_LUT_ENABLE) ? "INVERSE GAMMA ON"
+							      : "still off",
+		 orig_index, index_after,
+		 split ? "no table written in this shape"
+		       : "expected near 0x80 if the table load ran",
+		 orig_dither, dither_after,
+		 selftest_vig_sentinel[0], selftest_vig_sentinel[1], selftest_vig_sentinel[2],
+		 last[0], last[1], last[2],
+		 (trigger && last[0] == selftest_vig_sentinel[0] &&
+		  last[1] == selftest_vig_sentinel[1] &&
+		  last[2] == selftest_vig_sentinel[2]) ? "LANDED" : "did not land",
+		 ret, ret_second);
+
+	DRM_INFO("selftest: v6 %s table read-back on %s (%s) | port with the feature off beforehand %#x | entry 0 %#x, would be %#x | next read %#x, differs from entry 0 if the port advances | entry %d %#x, would be %#x | channel 1 entry 0 %#x, would be %#x | channel 2 entry 0 %#x, would be %#x\n",
+		 split ? "ENABLE THEN LAST POINT" : "FULL SEQUENCE", vig->name,
+		 split ? "NO TABLE WRITTEN IN THIS SHAPE -- the would-be values are the other shape's"
+		       : "table written",
+		 lut_before,
+		 lut_at_0,
+		 selftest_igc_entry(0, 0) | selftest_igc_entry(0, 1) << 16,
+		 lut_next,
+		 SELFTEST_VIG_IGC_PROBE_INDEX, lut_at_probe,
+		 selftest_igc_entry(0, 2 * SELFTEST_VIG_IGC_PROBE_INDEX) |
+			selftest_igc_entry(0, 2 * SELFTEST_VIG_IGC_PROBE_INDEX + 1) << 16,
+		 lut_c1, selftest_igc_entry(1, 0) | selftest_igc_entry(1, 1) << 16,
+		 lut_c2, selftest_igc_entry(2, 0) | selftest_igc_entry(2, 1) << 16);
+
+	/*
+	 * Turn it back off before reading the port one last time, so what the
+	 * table holds with the feature disabled is on the record beside what it
+	 * held with the feature enabled.  A control arm never enabled anything
+	 * and has nothing to undo beyond the two registers it probed.
+	 */
+	if (trigger)
+		selftest_vig_igc_restore(dpu_kms, ctl, &hw, orig_opmode,
+					 orig_index, orig_dither);
+	else
+		DPU_REG_WRITE(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX,
+			      orig_index);
+
+	lut_when_off = selftest_igc_read_entry(&hw, 0, 0);
+	DPU_REG_WRITE(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX, orig_index);
+
+	DRM_INFO("selftest: v6 %s table entry 0 with the feature off again %#x (it read %#x before the run and %#x while enabled)\n",
+		 split ? "ENABLE THEN LAST POINT" : "FULL SEQUENCE",
+		 lut_when_off, lut_before, lut_at_0);
+}
+
 /**
  * dpu_reg_dma_selftest_run - run a pending engine self-test
  *
@@ -1025,6 +1408,16 @@ void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
 
 	if (!rdma->ready) {
 		DPU_ERROR("the engine was not set up\n");
+		return;
+	}
+
+	if (lutdma_selftest & SELFTEST_VIG_V6_SPLIT) {
+		selftest_vig_igc_v6(dpu_kms, ctl, trigger, true);
+		return;
+	}
+
+	if (lutdma_selftest & SELFTEST_VIG_V6_FULL) {
+		selftest_vig_igc_v6(dpu_kms, ctl, trigger, false);
 		return;
 	}
 
