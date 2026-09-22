@@ -499,6 +499,14 @@ out:
  */
 #define SELFTEST_LIVE_DMA_PIPE		BIT(3)
 #define SELFTEST_IDLE_DMA_PIPE		BIT(4)
+/*
+ * A video pipe, aimed at registers the CPU can actually verify.  The earlier
+ * video-pipe arm targeted the only registers in that block the CPU CANNOT write,
+ * so its read-back could never have told a transfer that landed from one that did
+ * not -- measured from userspace: the index and dither registers beside them are
+ * freely writable, and the last-entry registers are not.
+ */
+#define SELFTEST_VIG_PLAIN_REGS		BIT(5)
 
 /*
  * The source pipes' inverse-gamma block, which is the block the colour-operation
@@ -523,6 +531,29 @@ out:
  */
 #define SELFTEST_VIG_IGC_LAST		0x1c4
 #define SELFTEST_VIG_IGC_LAST_N		3
+
+/*
+ * Two ordinary configuration registers in the same block, which the vendor writes
+ * as plain single-register writes and which the CPU can read AND write -- measured
+ * from userspace on this device, against the last-entry register above as a
+ * control that correctly reported itself unwritable.
+ *
+ * The index register selects which entry of the lookup table the block's data
+ * port will next touch; the dither register holds a four-bit strength plus an
+ * enable bit.  Writing either changes no pixel while inverse gamma is disabled,
+ * which it is on every video pipe here.
+ *
+ * 🔴 THE SENTINELS ARE NARROW ON PURPOSE.  The dither field is four bits wide plus
+ * BIT(4), so a wider value would be truncated by the hardware and read back
+ * changed -- scoring as a failure the transfer did not cause.  The index counts
+ * dwords into a 128-entry table, so seven bits.  Both patterns fit their field.
+ */
+#define SELFTEST_VIG_IGC_INDEX		0x1b0
+#define SELFTEST_VIG_IGC_DITHER		0x1c0
+#define SELFTEST_VIG_INDEX_CPU		0x2a
+#define SELFTEST_VIG_INDEX_ENGINE	0x55
+#define SELFTEST_VIG_DITHER_CPU		0x0b
+#define SELFTEST_VIG_DITHER_ENGINE	0x16
 
 /* twelve-bit values, distinctive, that nothing else has any reason to write */
 static const u32 selftest_vig_sentinel[SELFTEST_VIG_IGC_LAST_N] = {
@@ -624,7 +655,7 @@ static const struct kernel_param_ops lutdma_selftest_ops = {
 };
 module_param_cb(lutdma_selftest, &lutdma_selftest_ops, &lutdma_selftest, 0644);
 MODULE_PARM_DESC(lutdma_selftest,
-	"register-DMA engine self-test: 1=post-blend colour block, 5=video source pipe inverse gamma, 9=DMA source pipe carrying the desktop, 17=DMA source pipe carrying nothing, +2 queues without starting the engine (control), 0=restore");
+	"register-DMA engine self-test: 1=post-blend colour block, 5=video source pipe last-entry registers, 9=DMA source pipe carrying the desktop, 17=DMA source pipe carrying nothing, 33=video source pipe index and dither registers, +2 queues without starting the engine (control), 0=restore");
 
 static u32 selftest_decode_sel_for(enum dpu_dspp idx)
 {
@@ -847,6 +878,111 @@ static void selftest_dma_pipe(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *ctl,
 		DPU_REG_WRITE(&hw, SELFTEST_DMA_IGC_CPU_OFF + i * sizeof(u32), orig[i]);
 }
 
+/*
+ * Ask the engine to write two ordinary configuration registers inside a VIDEO
+ * pipe's inverse-gamma block, and read them back through the register mapping.
+ *
+ * WHY THIS ARM EXISTS
+ * The video pipes are the ones the colour-operation work needs, and the earlier
+ * attempt to reach one could not report: it targeted the block's last-entry
+ * registers, which are the only ones in it the CPU cannot write either, so a
+ * transfer that landed and one that did not both read zero.  The index and dither
+ * registers beside them are freely CPU-writable, which makes the read-back mean
+ * something and lets the arm establish its own target before using it.
+ *
+ * Two independent registers rather than one, because each field is narrow and a
+ * narrow sentinel is weak on its own.
+ */
+static void selftest_vig_plain_regs(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *ctl,
+				    bool trigger)
+{
+	struct dpu_reg_dma *rdma = &lutdma_selftest_engine;
+	const struct dpu_sspp_cfg *vig;
+	struct dpu_hw_blk_reg_map hw;
+	u32 orig_index, orig_dither;
+	u32 before_index, before_dither, after_index, after_dither;
+	u32 last[SELFTEST_VIG_IGC_LAST_N];
+	u32 want_index, want_dither;
+	bool writable = true, pass = true;
+	int i, ret;
+
+	vig = selftest_find_sspp(dpu_kms, SSPP_VIG0);
+	if (!vig) {
+		DPU_ERROR("no video source pipe in the catalogue\n");
+		return;
+	}
+
+	memset(&hw, 0, sizeof(hw));
+	hw.blk_addr = dpu_kms->mmio + vig->base;
+	hw.log_mask = DPU_DBG_MASK_SSPP;
+
+	orig_index  = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX);
+	orig_dither = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DITHER);
+
+	/* establish the target is real, reachable and writable before using it */
+	DPU_REG_WRITE(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX,
+		      SELFTEST_VIG_INDEX_CPU);
+	DPU_REG_WRITE(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DITHER,
+		      SELFTEST_VIG_DITHER_CPU);
+	before_index  = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX);
+	before_dither = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DITHER);
+	if (before_index != SELFTEST_VIG_INDEX_CPU ||
+	    before_dither != SELFTEST_VIG_DITHER_CPU)
+		writable = false;
+
+	dpu_reg_dma_buf_reset(rdma);
+	ret = dpu_reg_dma_decode_sel(rdma, DPU_REG_DMA_BLK_VIG0);
+	if (!ret)
+		ret = dpu_reg_dma_single_write(rdma,
+					       SELFTEST_VIG_IGC_DMA_OFF + SELFTEST_VIG_IGC_INDEX,
+					       SELFTEST_VIG_INDEX_ENGINE);
+	if (!ret)
+		ret = dpu_reg_dma_single_write(rdma,
+					       SELFTEST_VIG_IGC_DMA_OFF + SELFTEST_VIG_IGC_DITHER,
+					       SELFTEST_VIG_DITHER_ENGINE);
+	/*
+	 * The last-entry registers the earlier arm used, written in the same
+	 * program purely so the two can be compared in one run. They are reported
+	 * separately and do NOT score this arm: the CPU cannot write them, so
+	 * whatever they read proves nothing either way.
+	 */
+	if (!ret)
+		ret = dpu_reg_dma_block_write(rdma,
+					      SELFTEST_VIG_IGC_DMA_OFF + SELFTEST_VIG_IGC_LAST,
+					      selftest_vig_sentinel,
+					      SELFTEST_VIG_IGC_LAST_N);
+	if (ret) {
+		DPU_ERROR("failed to build the command buffer: %d\n", ret);
+		return;
+	}
+
+	ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, trigger);
+
+	after_index  = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX);
+	after_dither = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DITHER);
+	for (i = 0; i < SELFTEST_VIG_IGC_LAST_N; i++)
+		last[i] = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF +
+				       SELFTEST_VIG_IGC_LAST + i * sizeof(u32));
+
+	want_index  = trigger ? SELFTEST_VIG_INDEX_ENGINE  : SELFTEST_VIG_INDEX_CPU;
+	want_dither = trigger ? SELFTEST_VIG_DITHER_ENGINE : SELFTEST_VIG_DITHER_CPU;
+	if (after_index != want_index || after_dither != want_dither)
+		pass = false;
+
+	DRM_INFO("selftest: video pipe %s (base %#x) ctl%d %s | cpu-writable %s | index %#x -> expected %#x read %#x | dither %#x -> expected %#x read %#x | %s | last-entry regs (NOT SCORED, the cpu cannot write them) read %#x %#x %#x | kick_off %d\n",
+		 vig->name, vig->base, ctl->idx - CTL_0,
+		 trigger ? "engine started" : "ENGINE NOT STARTED (control)",
+		 writable ? "YES" : "NO -- the read-back below decides nothing",
+		 before_index, want_index, after_index,
+		 before_dither, want_dither, after_dither,
+		 (pass && writable) ? "PASS" : "FAIL",
+		 last[0], last[1], last[2], ret);
+
+	/* put the block back exactly as it was found */
+	DPU_REG_WRITE(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_INDEX, orig_index);
+	DPU_REG_WRITE(&hw, SELFTEST_VIG_IGC_CPU_OFF + SELFTEST_VIG_IGC_DITHER, orig_dither);
+}
+
 /**
  * dpu_reg_dma_selftest_run - run a pending engine self-test
  *
@@ -889,6 +1025,11 @@ void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
 
 	if (!rdma->ready) {
 		DPU_ERROR("the engine was not set up\n");
+		return;
+	}
+
+	if (lutdma_selftest & SELFTEST_VIG_PLAIN_REGS) {
+		selftest_vig_plain_regs(dpu_kms, ctl, trigger);
 		return;
 	}
 
