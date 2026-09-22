@@ -608,6 +608,48 @@ const struct dpu_csc_cfg dpu_csc10_YUV2RGB_601L = {
 	{ 0x00, 0x3ff, 0x00, 0x3ff, 0x00, 0x3ff,},
 };
 
+/*
+ * BT.709 limited-range YCbCr -> RGB.
+ *
+ * The coefficients are Rec. ITU-R BT.709, quantised to the same S15.16 grid the BT.601 tables
+ * above use (every entry a multiple of 0x80); the largest resulting error is 0.0009. They are a
+ * standard, not a value chosen for any particular device.
+ *
+ * The bias and clamp rows are COPIED BYTE-FOR-BYTE from the corresponding 601L table, and that
+ * is correct rather than lazy: those rows encode the RANGE (bias -16/-128/-128; clamp 16..235
+ * luma, 16..240 chroma), and BT.709 limited has the same range as BT.601 limited. Only the 3x3
+ * matrix differs between the two encodings.
+ */
+const struct dpu_csc_cfg dpu_csc_YUV2RGB_709L = {
+	{
+		/* S15.16 format */
+		0x00012A00, 0x00000000, 0x0001CB00,
+		0x00012A00, 0xFFFFC980, 0xFFFF7780,
+		0x00012A00, 0x00021D00, 0x00000000,
+	},
+	/* signed bias */
+	{ 0xfff0, 0xff80, 0xff80,},
+	{ 0x0, 0x0, 0x0,},
+	/* unsigned clamp */
+	{ 0x10, 0xeb, 0x10, 0xf0, 0x10, 0xf0,},
+	{ 0x00, 0xff, 0x00, 0xff, 0x00, 0xff,},
+};
+
+const struct dpu_csc_cfg dpu_csc10_YUV2RGB_709L = {
+	{
+		/* S15.16 format */
+		0x00012A00, 0x00000000, 0x0001CB00,
+		0x00012A00, 0xFFFFC980, 0xFFFF7780,
+		0x00012A00, 0x00021D00, 0x00000000,
+	},
+	/* signed bias */
+	{ 0xffc0, 0xfe00, 0xfe00,},
+	{ 0x0, 0x0, 0x0,},
+	/* unsigned clamp */
+	{ 0x40, 0x3ac, 0x40, 0x3c0, 0x40, 0x3c0,},
+	{ 0x00, 0x3ff, 0x00, 0x3ff, 0x00, 0x3ff,},
+};
+
 const struct dpu_csc_cfg dpu_csc10_rgb2yuv_601l = {
 	{
 		TO_S15D16(0x0083), TO_S15D16(0x0102), TO_S15D16(0x0032),

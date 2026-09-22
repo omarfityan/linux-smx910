@@ -513,19 +513,27 @@ static void _dpu_plane_setup_pixel_ext(struct dpu_hw_scaler3_cfg *scale_cfg,
 }
 
 static const struct dpu_csc_cfg *_dpu_plane_get_csc(struct dpu_sw_pipe *pipe,
-						    const struct msm_format *fmt)
+						    const struct msm_format *fmt,
+						    enum drm_color_encoding encoding)
 {
-	const struct dpu_csc_cfg *csc_ptr;
+	bool csc10 = BIT(DPU_SSPP_CSC_10BIT) & pipe->sspp->cap->features;
 
 	if (!MSM_FORMAT_IS_YUV(fmt))
 		return NULL;
 
-	if (BIT(DPU_SSPP_CSC_10BIT) & pipe->sspp->cap->features)
-		csc_ptr = &dpu_csc10_YUV2RGB_601L;
-	else
-		csc_ptr = &dpu_csc_YUV2RGB_601L;
-
-	return csc_ptr;
+	/*
+	 * Only limited range is advertised (see dpu_plane_init_common), so the range does not
+	 * select a table here; the encoding does. Anything the plane does not advertise falls
+	 * back to BT.601 limited, which is what this function returned unconditionally before
+	 * COLOR_ENCODING existed -- so a client that sets nothing sees no change in behaviour.
+	 */
+	switch (encoding) {
+	case DRM_COLOR_YCBCR_BT709:
+		return csc10 ? &dpu_csc10_YUV2RGB_709L : &dpu_csc_YUV2RGB_709L;
+	case DRM_COLOR_YCBCR_BT601:
+	default:
+		return csc10 ? &dpu_csc10_YUV2RGB_601L : &dpu_csc_YUV2RGB_601L;
+	}
 }
 
 static void _dpu_plane_setup_scaler(struct dpu_sw_pipe *pipe,
@@ -1332,7 +1340,7 @@ static void dpu_plane_flush_csc(struct dpu_plane *pdpu, struct dpu_sw_pipe *pipe
 	if (!pipe->sspp || !pipe->sspp->ops.setup_csc)
 		return;
 
-	csc_ptr = _dpu_plane_get_csc(pipe, format);
+	csc_ptr = _dpu_plane_get_csc(pipe, format, pdpu->base.state->color_encoding);
 	if (!csc_ptr)
 		return;
 
@@ -1760,6 +1768,7 @@ static struct drm_plane *dpu_plane_init_common(struct drm_device *dev,
 					       enum drm_plane_type type,
 					       unsigned long possible_crtcs,
 					       bool inline_rotation,
+					       bool has_csc,
 					       const uint32_t *format_list,
 					       uint32_t num_formats,
 					       enum dpu_sspp pipe)
@@ -1804,6 +1813,28 @@ static struct drm_plane *dpu_plane_init_common(struct drm_device *dev,
 
 	drm_plane_enable_fb_damage_clips(plane);
 
+	/*
+	 * COLOR_ENCODING / COLOR_RANGE are attached only where there is a CSC block to honour
+	 * them. The DMA pipes carry no CSC bit at all, so advertising the property on one would
+	 * claim a capability that silently does nothing -- and a compositor that trusts it would
+	 * hand over YUV expecting a conversion that never happens.
+	 *
+	 * LIMITED range only: the driver carries no full-range matrices, and a bitmask that
+	 * advertised FULL without one would be the same lie in the other axis. BT.601 limited is
+	 * the default so that a client which sets nothing gets exactly the behaviour this driver
+	 * had before these properties existed.
+	 */
+	if (has_csc) {
+		ret = drm_plane_create_color_properties(plane,
+						BIT(DRM_COLOR_YCBCR_BT601) |
+						BIT(DRM_COLOR_YCBCR_BT709),
+						BIT(DRM_COLOR_YCBCR_LIMITED_RANGE),
+						DRM_COLOR_YCBCR_BT601,
+						DRM_COLOR_YCBCR_LIMITED_RANGE);
+		if (ret)
+			DPU_ERROR("failed to install color properties, rc = %d\n", ret);
+	}
+
 	DPU_DEBUG("%s created for pipe:%u id:%u\n", plane->name,
 					pipe, plane->base.id);
 	return plane;
@@ -1837,6 +1868,8 @@ struct drm_plane *dpu_plane_init(struct drm_device *dev,
 
 	plane = dpu_plane_init_common(dev, type, possible_crtcs,
 				      pipe_hw->cap->features & BIT(DPU_SSPP_INLINE_ROTATION),
+				      pipe_hw->cap->features & (BIT(DPU_SSPP_CSC) |
+							       BIT(DPU_SSPP_CSC_10BIT)),
 				      pipe_hw->cap->sblk->format_list,
 				      pipe_hw->cap->sblk->num_formats,
 				      pipe);
@@ -1867,6 +1900,7 @@ struct drm_plane *dpu_plane_init_virtual(struct drm_device *dev,
 	struct msm_drm_private *priv = dev->dev_private;
 	struct dpu_kms *kms = to_dpu_kms(priv->kms);
 	bool has_inline_rotation = false;
+	bool has_csc = false;
 	const u32 *format_list = NULL;
 	u32 num_formats = 0;
 	int i;
@@ -1883,10 +1917,21 @@ struct drm_plane *dpu_plane_init_virtual(struct drm_device *dev,
 			format_list = cfg->sblk->format_list;
 			num_formats = cfg->sblk->num_formats;
 		}
+
+		/*
+		 * A virtual plane has no SSPP until atomic check assigns one, so it advertises
+		 * the largest configuration available -- which already includes the YUV format
+		 * list of a CSC-capable pipe, selected just above. The colour properties have to
+		 * follow the same rule, or the plane offers YUV formats it cannot say how to
+		 * interpret.
+		 */
+		if (cfg->sblk->csc_blk.len)
+			has_csc = true;
 	}
 
 	plane = dpu_plane_init_common(dev, type, possible_crtcs,
 				      has_inline_rotation,
+				      has_csc,
 				      format_list,
 				      num_formats,
 				      SSPP_NONE);
