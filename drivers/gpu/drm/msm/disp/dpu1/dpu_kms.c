@@ -33,6 +33,7 @@
 #include "dpu_formats.h"
 #include "dpu_hw_vbif.h"
 #include "dpu_kms.h"
+#include "dpu_hw_reg_dma.h"
 #include "dpu_plane.h"
 #include "dpu_vbif.h"
 #include "dpu_writeback.h"
@@ -888,6 +889,9 @@ static void _dpu_kms_hw_destroy(struct dpu_kms *dpu_kms)
 {
 	int i;
 
+	/* release the engine's mapping and its buffer before the address space goes */
+	dpu_reg_dma_selftest_unbind(dpu_kms);
+
 	dpu_kms->hw_intr = NULL;
 
 	/* safe to call these more than once during shutdown */
@@ -1285,6 +1289,12 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 	}
 
 	dpu_vbif_init_memtypes(dpu_kms);
+
+	/*
+	 * Let the register-DMA engine's self-test allocate against this device
+	 * from process context rather than from inside an atomic commit.
+	 */
+	dpu_reg_dma_selftest_bind(dpu_kms);
 
 	pm_runtime_put_sync(&dpu_kms->pdev->dev);
 

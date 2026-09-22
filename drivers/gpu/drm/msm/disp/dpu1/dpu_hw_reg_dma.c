@@ -33,6 +33,7 @@
 
 /* the double-buffered submission block sits at the start of that region */
 #define DPU_REG_DMA_DB_OFF		0x0
+#define DPU_REG_DMA_ADDR_ALIGN		256
 
 /*
  * Engine registers, relative to a submission block's base.
@@ -64,6 +65,11 @@
 #define REG_DMA_DECODE_SEL_OP		0x180ac114
 
 #define REG_DMA_OP_SINGLE_WRITE		BIT(28)
+#define REG_DMA_OP_SINGLE_MODIFY	BIT(29)
+/* writes a run of registers, the engine advancing the address itself */
+#define REG_DMA_OP_BLOCK_WRITE		BIT(30)
+/* writes a run of values through one address, the block advancing its own index */
+#define REG_DMA_OP_INDEXED_WRITE	(BIT(28) | BIT(29))
 #define REG_DMA_MAX_REL_OFF		(BIT(21) - 1)
 #define REG_DMA_MAX_DWORDS		(BIT(14) - 1)
 
@@ -144,6 +150,13 @@ int dpu_reg_dma_init(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 		rdma->base = NULL;
 		return vaddr ? PTR_ERR(vaddr) : -ENOMEM;
 	}
+
+	/*
+	 * The engine fetches from an aligned address. Page-granular allocation
+	 * satisfies this today, which is a reason to check it rather than a
+	 * reason to assume it.
+	 */
+	WARN_ON(rdma->buf.iova & (DPU_REG_DMA_ADDR_ALIGN - 1));
 
 	rdma->buf.vaddr = vaddr;
 	rdma->buf.size = buf_size;
@@ -243,6 +256,97 @@ int dpu_reg_dma_single_write(struct dpu_reg_dma *rdma, u32 blk_off, u32 val)
 	return 0;
 }
 
+/*
+ * The two run-writing operations share a header: an opcode carrying the
+ * block-relative offset, a word giving the payload length, then the payload.
+ * They differ only in what the engine does with the address between values.
+ */
+static int dpu_reg_dma_run(struct dpu_reg_dma *rdma, u32 opcode, u32 blk_off,
+			   const u32 *data, u32 count)
+{
+	u32 payload = count * sizeof(u32);
+	u32 *loc;
+	int ret;
+
+	if (blk_off > REG_DMA_MAX_REL_OFF) {
+		DPU_ERROR("offset %#x exceeds the block-relative range\n", blk_off);
+		return -EINVAL;
+	}
+
+	if (!count || count > REG_DMA_MAX_DWORDS) {
+		DPU_ERROR("invalid run length %u\n", count);
+		return -EINVAL;
+	}
+
+	ret = dpu_reg_dma_room(rdma, 2 * sizeof(u32) + payload);
+	if (ret)
+		return ret;
+
+	loc = (u32 *)((u8 *)rdma->buf.vaddr + rdma->buf.index);
+	loc[0] = opcode | (blk_off & REG_DMA_MAX_REL_OFF);
+	loc[1] = count;
+	rdma->buf.index += 2 * sizeof(u32);
+
+	memcpy((u8 *)rdma->buf.vaddr + rdma->buf.index, data, payload);
+	rdma->buf.index += payload;
+
+	return 0;
+}
+
+/**
+ * dpu_reg_dma_block_write - write consecutive registers from @blk_off onwards
+ *
+ * The engine advances the address itself, one register per value.
+ */
+int dpu_reg_dma_block_write(struct dpu_reg_dma *rdma, u32 blk_off,
+			    const u32 *data, u32 count)
+{
+	return dpu_reg_dma_run(rdma, REG_DMA_OP_BLOCK_WRITE, blk_off, data, count);
+}
+
+/**
+ * dpu_reg_dma_indexed_write - write a run of values through ONE register
+ *
+ * The address does not move; the block keeps its own index and advances it on
+ * each write. This is how the source pipes' lookup tables are loaded, and it is
+ * the reason those tables cannot sensibly be written by the CPU: the whole run
+ * has to land as one unit, in order, alongside a frame.
+ */
+int dpu_reg_dma_indexed_write(struct dpu_reg_dma *rdma, u32 blk_off,
+			      const u32 *data, u32 count)
+{
+	return dpu_reg_dma_run(rdma, REG_DMA_OP_INDEXED_WRITE, blk_off, data, count);
+}
+
+/**
+ * dpu_reg_dma_single_modify - read-modify-write one register under @mask
+ *
+ * Three words rather than two: the mask sits between the opcode and the value.
+ */
+int dpu_reg_dma_single_modify(struct dpu_reg_dma *rdma, u32 blk_off, u32 mask,
+			      u32 val)
+{
+	u32 *loc;
+	int ret;
+
+	if (blk_off > REG_DMA_MAX_REL_OFF) {
+		DPU_ERROR("offset %#x exceeds the block-relative range\n", blk_off);
+		return -EINVAL;
+	}
+
+	ret = dpu_reg_dma_room(rdma, 3 * sizeof(u32));
+	if (ret)
+		return ret;
+
+	loc = (u32 *)((u8 *)rdma->buf.vaddr + rdma->buf.index);
+	loc[0] = REG_DMA_OP_SINGLE_MODIFY | (blk_off & REG_DMA_MAX_REL_OFF);
+	loc[1] = mask;
+	loc[2] = val;
+	rdma->buf.index += 3 * sizeof(u32);
+
+	return 0;
+}
+
 /**
  * dpu_reg_dma_kick_off - submit the command buffer and wait for the engine
  * @trigger: false submits the transfer but never starts it, so a caller can
@@ -310,8 +414,15 @@ int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 	wmb();
 
 	if (!trigger) {
-		DRM_INFO("queued %u dwords on ctl%u, NOT triggered\n",
-			 dwords, ctl_index);
+		/*
+		 * Read the engine's own status even here. Without it the control
+		 * can only say the register did not change, which is also what a
+		 * transfer that ran and wrote somewhere else would look like.
+		 */
+		status = DPU_REG_READ(&rdma->db, REG_DMA_INTR_STATUS);
+		err = DPU_REG_READ(&rdma->db, REG_DMA_INTR_ERR_STATUS);
+		DRM_INFO("ctl%u: %u dwords queued at iova %#llx, NOT triggered (status %#x err %#x -- both must stay clear)\n",
+			 ctl_index, dwords, rdma->buf.iova, status, err);
 		goto out;
 	}
 
@@ -378,18 +489,82 @@ out:
 
 #define SELFTEST_RUN			BIT(0)
 #define SELFTEST_NO_TRIGGER		BIT(1)
+#define SELFTEST_SOURCE_PIPE		BIT(2)
+
+/*
+ * The source pipes' inverse-gamma block, which is the block the colour-operation
+ * work needs and the reason this engine exists: on this hardware revision it has
+ * no CPU write path at all.
+ *
+ * 🔴 IT HAS TWO DIFFERENT OFFSETS AND THEY ARE BOTH CORRECT.
+ * The CPU reaches it at the block offset this device's description gives
+ * (qcom,sde-vig-igc = <0x1d00 ...>). The engine reaches it at that offset MINUS
+ * the pipe's top offset (qcom,sde-vig-top-off = <0xa00>), because the hardware
+ * decoder anchors source-pipe sub-blocks differently from the register mapping.
+ * Using the CPU's number in a command buffer writes 0xa00 too high, and the
+ * read-back then looks exactly like a transfer that never happened.
+ */
+#define SELFTEST_VIG_IGC_CPU_OFF	0x1d00
+#define SELFTEST_VIG_IGC_DMA_OFF	(0x1d00 - 0xa00)
+/*
+ * The last-entry registers at the end of that block are ordinary registers
+ * written as a run, so unlike the lookup table itself they can be read straight
+ * back through the register mapping -- which is what makes them a target that
+ * can prove the transfer rather than merely not disprove it.
+ */
+#define SELFTEST_VIG_IGC_LAST		0x1c4
+#define SELFTEST_VIG_IGC_LAST_N		3
+
+/* twelve-bit values, distinctive, that nothing else has any reason to write */
+static const u32 selftest_vig_sentinel[SELFTEST_VIG_IGC_LAST_N] = {
+	0xa51, 0xb62, 0xc73,
+};
 
 static int lutdma_selftest;
 static int lutdma_selftest_pending;
 static struct dpu_reg_dma lutdma_selftest_engine;
+static struct dpu_kms *lutdma_selftest_kms;
 
+void dpu_reg_dma_selftest_bind(struct dpu_kms *dpu_kms)
+{
+	lutdma_selftest_kms = dpu_kms;
+}
+
+void dpu_reg_dma_selftest_unbind(struct dpu_kms *dpu_kms)
+{
+	if (lutdma_selftest_kms != dpu_kms)
+		return;
+
+	dpu_reg_dma_fini(dpu_kms, &lutdma_selftest_engine);
+	lutdma_selftest_kms = NULL;
+	lutdma_selftest_pending = 0;
+}
+
+/*
+ * Allocate here rather than in the commit path. A sysfs write is ordinary
+ * process context; the atomic commit is not somewhere to be asking for memory.
+ */
 static int lutdma_selftest_set(const char *val, const struct kernel_param *kp)
 {
 	int ret = param_set_int(val, kp);
 
-	if (!ret)
-		lutdma_selftest_pending = 1;
-	return ret;
+	if (ret)
+		return ret;
+
+	if (lutdma_selftest & SELFTEST_RUN) {
+		if (!lutdma_selftest_kms) {
+			DPU_ERROR("no display device bound\n");
+			return -ENODEV;
+		}
+
+		ret = dpu_reg_dma_init(lutdma_selftest_kms,
+				       &lutdma_selftest_engine, PAGE_SIZE);
+		if (ret)
+			return ret;
+	}
+
+	lutdma_selftest_pending = 1;
+	return 0;
 }
 
 static const struct kernel_param_ops lutdma_selftest_ops = {
@@ -398,7 +573,7 @@ static const struct kernel_param_ops lutdma_selftest_ops = {
 };
 module_param_cb(lutdma_selftest, &lutdma_selftest_ops, &lutdma_selftest, 0644);
 MODULE_PARM_DESC(lutdma_selftest,
-	"register-DMA engine self-test (1=run, 3=run without starting the engine (negative control), 0=restore)");
+	"register-DMA engine self-test: 1=post-blend colour block, 5=source pipe inverse gamma, +2 queues without starting the engine (control), 0=restore");
 
 static u32 selftest_decode_sel_for(enum dpu_dspp idx)
 {
@@ -411,13 +586,97 @@ static u32 selftest_decode_sel_for(enum dpu_dspp idx)
 	}
 }
 
+/*
+ * The first source pipe that takes video. Located through the catalogue rather
+ * than by a constant, so the offset used is the one this driver believes in.
+ */
+static const struct dpu_sspp_cfg *selftest_find_vig0(struct dpu_kms *dpu_kms)
+{
+	int i;
+
+	for (i = 0; i < dpu_kms->catalog->sspp_count; i++)
+		if (dpu_kms->catalog->sspp[i].id == SSPP_VIG0)
+			return &dpu_kms->catalog->sspp[i];
+
+	return NULL;
+}
+
+/*
+ * Ask the engine to write three ordinary registers inside a video pipe's
+ * inverse-gamma block, and read them back through the register mapping. This is
+ * the block the colour-operation work has to reach, on the pipes that carry
+ * video, through a different operation than the post-blend arm used -- so it
+ * exercises the run-writing path and the source-pipe offset as well as the
+ * engine.
+ */
+static void selftest_source_pipe(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *ctl,
+				 bool trigger)
+{
+	struct dpu_reg_dma *rdma = &lutdma_selftest_engine;
+	const struct dpu_sspp_cfg *vig;
+	struct dpu_hw_blk_reg_map hw;
+	u32 before[SELFTEST_VIG_IGC_LAST_N], after[SELFTEST_VIG_IGC_LAST_N];
+	bool pass = true;
+	int i, ret;
+
+	vig = selftest_find_vig0(dpu_kms);
+	if (!vig) {
+		DPU_ERROR("no video source pipe in the catalogue\n");
+		return;
+	}
+
+	memset(&hw, 0, sizeof(hw));
+	hw.blk_addr = dpu_kms->mmio + vig->base;
+	hw.log_mask = DPU_DBG_MASK_SSPP;
+
+	/* a known starting value, so the read at the end has something to differ from */
+	for (i = 0; i < SELFTEST_VIG_IGC_LAST_N; i++)
+		DPU_REG_WRITE(&hw, SELFTEST_VIG_IGC_CPU_OFF +
+			      SELFTEST_VIG_IGC_LAST + i * sizeof(u32), 0);
+	for (i = 0; i < SELFTEST_VIG_IGC_LAST_N; i++)
+		before[i] = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF +
+					 SELFTEST_VIG_IGC_LAST + i * sizeof(u32));
+
+	dpu_reg_dma_buf_reset(rdma);
+	ret = dpu_reg_dma_decode_sel(rdma, DPU_REG_DMA_BLK_VIG0);
+	if (!ret)
+		ret = dpu_reg_dma_block_write(rdma,
+					      SELFTEST_VIG_IGC_DMA_OFF + SELFTEST_VIG_IGC_LAST,
+					      selftest_vig_sentinel,
+					      SELFTEST_VIG_IGC_LAST_N);
+	if (ret) {
+		DPU_ERROR("failed to build the command buffer: %d\n", ret);
+		return;
+	}
+
+	ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, trigger);
+
+	for (i = 0; i < SELFTEST_VIG_IGC_LAST_N; i++)
+		after[i] = DPU_REG_READ(&hw, SELFTEST_VIG_IGC_CPU_OFF +
+					SELFTEST_VIG_IGC_LAST + i * sizeof(u32));
+
+	for (i = 0; i < SELFTEST_VIG_IGC_LAST_N; i++)
+		if (after[i] != (trigger ? selftest_vig_sentinel[i] : 0))
+			pass = false;
+
+	DRM_INFO("selftest: source pipe (base %#x) ctl%d %s | before %#x %#x %#x | expected %#x %#x %#x | read %#x %#x %#x | %s | kick_off %d\n",
+		 vig->base, ctl->idx - CTL_0,
+		 trigger ? "engine started" : "ENGINE NOT STARTED (control)",
+		 before[0], before[1], before[2],
+		 trigger ? selftest_vig_sentinel[0] : 0,
+		 trigger ? selftest_vig_sentinel[1] : 0,
+		 trigger ? selftest_vig_sentinel[2] : 0,
+		 after[0], after[1], after[2],
+		 pass ? "PASS" : "FAIL", ret);
+}
+
 /**
  * dpu_reg_dma_selftest_run - run a pending engine self-test
  *
- * Called from the atomic commit so the register is read back in the same
- * context that submitted the transfer, before a later frame's colour
- * programming can overwrite it.  Does nothing unless the parameter was written
- * since the last commit.
+ * Called from the atomic commit so the registers are read back in the same
+ * context that submitted the transfer, before a later frame's programming could
+ * touch them. Does nothing unless the parameter was written since the last
+ * commit.
  */
 void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
 			      struct dpu_hw_dspp *dspp, struct dpu_hw_ctl *ctl)
@@ -431,37 +690,51 @@ void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
 		return;
 	lutdma_selftest_pending = 0;
 
-	if (!dspp || !ctl || !dspp->cap || !dspp->cap->sblk ||
-	    !dspp->cap->sblk->pcc.base) {
+	if (!ctl) {
+		DPU_ERROR("no control block to submit through\n");
+		return;
+	}
+
+	trigger = !(lutdma_selftest & SELFTEST_NO_TRIGGER);
+
+	/* a write of 0 restores the colour block and leaves the engine alone */
+	if (!(lutdma_selftest & SELFTEST_RUN)) {
+		if (dspp && dspp->cap && dspp->cap->sblk &&
+		    dspp->cap->sblk->pcc.base) {
+			DPU_REG_WRITE(&dspp->hw, dspp->cap->sblk->pcc.base, 0);
+			if (ctl->ops.update_pending_flush_dspp)
+				ctl->ops.update_pending_flush_dspp(ctl, dspp->idx,
+								   DPU_DSPP_PCC);
+		}
+		DRM_INFO("selftest: colour block restored\n");
+		return;
+	}
+
+	if (!rdma->ready) {
+		DPU_ERROR("the engine was not set up\n");
+		return;
+	}
+
+	if (lutdma_selftest & SELFTEST_SOURCE_PIPE) {
+		selftest_source_pipe(dpu_kms, ctl, trigger);
+		return;
+	}
+
+	if (!dspp || !dspp->cap || !dspp->cap->sblk || !dspp->cap->sblk->pcc.base) {
 		DPU_ERROR("no colour block to test against\n");
 		return;
 	}
 
 	pcc = dspp->cap->sblk->pcc.base;
-
-	/* a write of 0 restores the block and leaves the engine alone */
-	if (!(lutdma_selftest & SELFTEST_RUN)) {
-		DPU_REG_WRITE(&dspp->hw, pcc, 0);
-		if (ctl->ops.update_pending_flush_dspp)
-			ctl->ops.update_pending_flush_dspp(ctl, dspp->idx,
-							   DPU_DSPP_PCC);
-		DRM_INFO("selftest: colour block restored\n");
-		return;
-	}
-
 	blk = selftest_decode_sel_for(dspp->idx);
 	if (!blk) {
 		DPU_ERROR("no decode-select bit for this colour block\n");
 		return;
 	}
 
-	ret = dpu_reg_dma_init(dpu_kms, rdma, PAGE_SIZE);
-	if (ret)
-		return;
-
 	/*
-	 * Establish a known starting value through the CPU's own mapping, and
-	 * confirm it landed.  Without this the read at the end cannot tell a
+	 * Establish a known starting value through the register mapping, and
+	 * confirm it landed. Without this the read at the end cannot tell a
 	 * transfer that did not happen from a register that was never anything
 	 * else.
 	 */
@@ -482,8 +755,6 @@ void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
 		DPU_ERROR("failed to build the command buffer: %d\n", ret);
 		return;
 	}
-
-	trigger = !(lutdma_selftest & SELFTEST_NO_TRIGGER);
 
 	ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, trigger);
 

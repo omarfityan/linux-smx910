@@ -87,6 +87,12 @@ void dpu_reg_dma_fini(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma);
 void dpu_reg_dma_buf_reset(struct dpu_reg_dma *rdma);
 int dpu_reg_dma_decode_sel(struct dpu_reg_dma *rdma, u32 blk_mask);
 int dpu_reg_dma_single_write(struct dpu_reg_dma *rdma, u32 blk_off, u32 val);
+int dpu_reg_dma_block_write(struct dpu_reg_dma *rdma, u32 blk_off,
+			    const u32 *data, u32 count);
+int dpu_reg_dma_indexed_write(struct dpu_reg_dma *rdma, u32 blk_off,
+			      const u32 *data, u32 count);
+int dpu_reg_dma_single_modify(struct dpu_reg_dma *rdma, u32 blk_off, u32 mask,
+			      u32 val);
 
 int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 			 struct dpu_hw_ctl *ctl, bool trigger);
@@ -94,5 +100,12 @@ int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 struct dpu_hw_dspp;
 void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
 			      struct dpu_hw_dspp *dspp, struct dpu_hw_ctl *ctl);
+/*
+ * Give the self-test a device to allocate against outside the commit path, and
+ * take it away again so a driver rebind cannot leave the engine holding a
+ * mapping and an address from a torn-down device.
+ */
+void dpu_reg_dma_selftest_bind(struct dpu_kms *dpu_kms);
+void dpu_reg_dma_selftest_unbind(struct dpu_kms *dpu_kms);
 
 #endif /* _DPU_HW_REG_DMA_H */
