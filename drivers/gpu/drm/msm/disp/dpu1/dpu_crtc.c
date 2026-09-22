@@ -29,6 +29,7 @@
 #include "dpu_hw_ctl.h"
 #include "dpu_hw_dspp.h"
 #include "dpu_crtc.h"
+#include "dpu_hw_reg_dma.h"
 #include "dpu_plane.h"
 #include "dpu_encoder.h"
 #include "dpu_vbif.h"
@@ -1156,6 +1157,28 @@ static void _dpu_crtc_oneui_dspp_inject(struct drm_crtc *crtc)
 	}
 }
 
+/*
+ * Hand the register-DMA engine's self-test the colour block and control block
+ * of the first mixer, from inside the powered atomic commit.  It returns
+ * immediately unless its parameter has been written since the last commit.
+ */
+static void _dpu_crtc_lutdma_selftest(struct drm_crtc *crtc)
+{
+	struct dpu_crtc_state *cstate = to_dpu_crtc_state(crtc->state);
+	struct dpu_crtc_mixer *mixer = cstate->mixers;
+	struct dpu_kms *dpu_kms = _dpu_crtc_get_kms(crtc);
+	struct dpu_hw_dspp *dspp;
+
+	if (!cstate->num_mixers)
+		return;
+
+	dspp = mixer[0].hw_dspp;
+	if (!dspp && dpu_kms->rm.dspp_blks[0])
+		dspp = to_dpu_hw_dspp(dpu_kms->rm.dspp_blks[0]);
+
+	dpu_reg_dma_selftest_run(dpu_kms, dspp, mixer[0].lm_ctl);
+}
+
 static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
 		struct drm_atomic_state *state)
 {
@@ -1189,6 +1212,8 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
 	_dpu_crtc_setup_cp_blocks(crtc);
 
 	_dpu_crtc_oneui_dspp_inject(crtc);
+
+	_dpu_crtc_lutdma_selftest(crtc);
 
 	/*
 	 * PP_DONE irq is only used by command mode for now.
