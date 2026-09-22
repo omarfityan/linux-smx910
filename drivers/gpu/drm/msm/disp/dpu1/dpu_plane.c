@@ -921,6 +921,25 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 
 	pstate->needs_qos_remap = drm_atomic_crtc_needs_modeset(crtc_state);
 
+	/*
+	 * The colour pipeline is checked HERE, and not in dpu_plane_atomic_check,
+	 * because a VIRTUAL plane never reaches that function --
+	 * dpu_plane_virtual_atomic_check calls this one directly -- and virtual
+	 * planes are the ones that exist by default.  A hook in the other path
+	 * would simply never run, and an unconvertible matrix would reach the
+	 * flush path where it can no longer be refused.
+	 *
+	 * Nothing here depends on which SSPP the plane ends up on: both
+	 * conversions read only the compositor's own blobs.
+	 */
+	ret = dpu_plane_colorop_check(new_plane_state->state, new_plane_state);
+	if (ret)
+		return ret;
+
+	pstate->has_pipeline_csc = dpu_plane_colorop_csc(new_plane_state->state,
+							new_plane_state,
+							&pstate->pipeline_csc);
+
 	return 0;
 }
 
@@ -1137,13 +1156,6 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
 	ret = dpu_plane_atomic_check_nosspp(plane, new_plane_state, crtc_state);
 	if (ret)
 		return ret;
-
-	ret = dpu_plane_colorop_check(state, new_plane_state);
-	if (ret)
-		return ret;
-
-	pstate->has_pipeline_csc = dpu_plane_colorop_csc(state, new_plane_state,
-							&pstate->pipeline_csc);
 
 	if (!new_plane_state->visible)
 		return 0;

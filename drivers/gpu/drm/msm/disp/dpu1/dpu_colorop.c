@@ -285,11 +285,18 @@ int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out)
  * fc67ed23c7, which moves the YCbCr conversion into the pipeline and deletes
  * that refusal.  The two land together or neither, and this parameter is what
  * makes "together" expressible without shipping a regression in between.
+ *
+ * 🔴 IT IS READ WHEN THE PLANES ARE CREATED, which is once, at probe.  Writing
+ * /sys/module/msm/parameters/plane_colorops on a running system therefore
+ * SUCCEEDS AND DOES NOTHING -- the planes already exist.  Turning it on means
+ * msm.plane_colorops=1 on the kernel command line, which on this device lives in
+ * the boot image and needs a flash.  The file is left writable so its value can
+ * be READ BACK to confirm what the running kernel was told.
  */
 static bool dpu_plane_colorops;
 module_param_named(plane_colorops, dpu_plane_colorops, bool, 0600);
 MODULE_PARM_DESC(plane_colorops,
-	"advertise per-plane colour operations on the video pipes (needs a compositor that converts YCbCr inside the pipeline; off by default because advertising it to one that does not LOSES the working YCbCr path)");
+	"advertise per-plane colour operations on the video pipes; needs msm.plane_colorops=1 on the COMMAND LINE because it is read at plane creation, and needs a compositor that converts YCbCr inside the pipeline -- off by default because advertising it to one that does not LOSES the working YCbCr path");
 
 /**
  * dpu_plane_init_colorops - advertise this pipe's colour blocks as a DRM pipeline
