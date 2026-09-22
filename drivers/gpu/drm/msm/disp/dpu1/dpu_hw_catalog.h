@@ -299,6 +299,7 @@ struct dpu_caps {
  * @qseed_ver: qseed version
  * @scaler_blk:
  * @csc_blk:
+ * @igc_blk: per-pipe inverse gamma block, where the part has one
  * @format_list: Pointer to list of supported formats
  * @num_formats: Number of supported formats
  * @dpu_rotation_cfg: inline rotation configuration
@@ -308,6 +309,7 @@ struct dpu_sspp_sub_blks {
 	u32 qseed_ver;
 	struct dpu_scaler_blk scaler_blk;
 	struct dpu_pp_blk csc_blk;
+	struct dpu_pp_blk igc_blk;
 	struct dpu_sspp_v13_rec_blk sspp_rec0_blk;
 	struct dpu_sspp_v13_rec_blk sspp_rec1_blk;
 

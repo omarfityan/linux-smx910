@@ -340,6 +340,39 @@ static const struct dpu_sspp_sub_blks dpu_vig_sblk_qseed3_3_1 =
 static const struct dpu_sspp_sub_blks dpu_vig_sblk_qseed3_3_2 =
 				_VIG_SBLK(SSPP_SCALER_VER(3, 2));
 
+/*
+ * As _VIG_SBLK, plus the per-pipe inverse-gamma block.
+ *
+ * The offset is this device's own: its device tree declares
+ *   qcom,sde-vig-csc-off = <0x1a00>
+ *   qcom,sde-vig-igc     = <0x1d00 0x60000>     (version 6)
+ *   qcom,sde-vig-gamut   = <0x1d00 0x60001>
+ * for each of its four VIG pipes.  IGC and GAMUT share a base and are told apart
+ * by the version word, which is the downstream <offset version> convention.
+ *
+ * This is a SEPARATE sub-block rather than a field added to _VIG_SBLK because
+ * dpu_vig_sblk_qseed3_3_2 is shared with sar2130p, whose device tree has never
+ * been read here.  Adding the offset to the shared macro would assert a register
+ * location for a part nobody checked.
+ */
+#define _VIG_SBLK_IGC(scaler_ver) \
+	{ \
+	.scaler_blk = {.name = "scaler", \
+		.version = scaler_ver, \
+		.base = 0xa00, .len = 0xa0,}, \
+	.csc_blk = {.name = "csc", \
+		.base = 0x1a00, .len = 0x100,}, \
+	.igc_blk = {.name = "igc", \
+		.version = 0x60000, \
+		.base = 0x1d00, .len = 0x100,}, \
+	.format_list = plane_formats_yuv, \
+	.num_formats = ARRAY_SIZE(plane_formats_yuv), \
+	.rotation_cfg = NULL, \
+	}
+
+static const struct dpu_sspp_sub_blks dpu_vig_sblk_qseed3_3_2_igc =
+				_VIG_SBLK_IGC(SSPP_SCALER_VER(3, 2));
+
 static const struct dpu_sspp_sub_blks dpu_vig_sblk_qseed3_3_3 =
 				_VIG_SBLK(SSPP_SCALER_VER(3, 3));
 

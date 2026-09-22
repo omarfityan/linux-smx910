@@ -26,6 +26,7 @@
 #include "dpu_trace.h"
 #include "dpu_crtc.h"
 #include "dpu_vbif.h"
+#include "dpu_colorop.h"
 #include "dpu_plane.h"
 
 #define DPU_DEBUG_PLANE(pl, fmt, ...) DRM_DEBUG_ATOMIC("plane%d " fmt,\
@@ -1137,6 +1138,13 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
 	if (ret)
 		return ret;
 
+	ret = dpu_plane_colorop_check(state, new_plane_state);
+	if (ret)
+		return ret;
+
+	pstate->has_pipeline_csc = dpu_plane_colorop_csc(state, new_plane_state,
+							&pstate->pipeline_csc);
+
 	if (!new_plane_state->visible)
 		return 0;
 
@@ -1335,10 +1343,21 @@ static void dpu_plane_flush_csc(struct dpu_plane *pdpu, struct dpu_sw_pipe *pipe
 {
 	const struct msm_format *format =
 		msm_framebuffer_format(pdpu->base.state->fb);
+	const struct dpu_plane_state *pstate = to_dpu_plane_state(pdpu->base.state);
 	const struct dpu_csc_cfg *csc_ptr;
 
 	if (!pipe->sspp || !pipe->sspp->ops.setup_csc)
 		return;
+
+	/*
+	 * A colour pipeline, where the plane has one, is what the compositor
+	 * asked for explicitly and it outranks the COLOR_ENCODING default.  It
+	 * was converted at check time precisely so that this path cannot fail.
+	 */
+	if (pstate->has_pipeline_csc) {
+		pipe->sspp->ops.setup_csc(pipe->sspp, &pstate->pipeline_csc);
+		return;
+	}
 
 	csc_ptr = _dpu_plane_get_csc(pipe, format, pdpu->base.state->color_encoding);
 	if (!csc_ptr)
@@ -1876,6 +1895,10 @@ struct drm_plane *dpu_plane_init(struct drm_device *dev,
 	if (IS_ERR(plane))
 		return plane;
 
+	dpu_plane_init_colorops(plane,
+				pipe_hw->cap->sblk->csc_blk.len &&
+				pipe_hw->cap->sblk->igc_blk.len);
+
 	drm_plane_helper_add(plane, &dpu_plane_helper_funcs);
 
 	DPU_DEBUG("%s created for pipe:%u id:%u\n", plane->name,
@@ -1901,6 +1924,7 @@ struct drm_plane *dpu_plane_init_virtual(struct drm_device *dev,
 	struct dpu_kms *kms = to_dpu_kms(priv->kms);
 	bool has_inline_rotation = false;
 	bool has_csc = false;
+	bool has_colorops = false;
 	const u32 *format_list = NULL;
 	u32 num_formats = 0;
 	int i;
@@ -1927,6 +1951,9 @@ struct drm_plane *dpu_plane_init_virtual(struct drm_device *dev,
 		 */
 		if (cfg->sblk->csc_blk.len)
 			has_csc = true;
+
+		if (cfg->sblk->csc_blk.len && cfg->sblk->igc_blk.len)
+			has_colorops = true;
 	}
 
 	plane = dpu_plane_init_common(dev, type, possible_crtcs,
@@ -1937,6 +1964,8 @@ struct drm_plane *dpu_plane_init_virtual(struct drm_device *dev,
 				      SSPP_NONE);
 	if (IS_ERR(plane))
 		return plane;
+
+	dpu_plane_init_colorops(plane, has_colorops);
 
 	drm_plane_helper_add(plane, &dpu_plane_virtual_helper_funcs);
 

@@ -42,6 +42,16 @@ struct dpu_plane_state {
 
 	bool needs_dirtyfb;
 
+	/*
+	 * The colour matrix the plane's DRM colour pipeline asks for, worked out
+	 * at check time.  It has to be done there and kept: the flush path runs
+	 * with only plane->state and cannot reach a colorop's atomic state, and
+	 * a conversion that can fail must fail while the commit can still be
+	 * refused -- not halfway through programming the hardware.
+	 */
+	bool has_pipeline_csc;
+	struct dpu_csc_cfg pipeline_csc;
+
 	struct dpu_hw_fmt_layout layout;
 };
 
