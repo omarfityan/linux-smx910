@@ -139,6 +139,80 @@ const struct msm_format *msm_framebuffer_format(struct drm_framebuffer *fb)
 	return msm_fb->format;
 }
 
+/*
+ * 🔴 LOGGING ONLY -- NAME EVERY DISTINCT FRAMEBUFFER FORMAT USERSPACE EVER CREATES.
+ *
+ * msm_kms.c registers this file's msm_framebuffer_create() as .fb_create, so EVERY
+ * drm_mode_addfb2 on this device passes through here.  That makes it the one place
+ * that can answer "did the compositor ever import the video buffer at all?" --
+ * a question three other instruments could not reach:
+ *
+ *   the uprobe kit          pinned to a libkwin sha that has moved twice
+ *   the compositor's own    prepareAtomicPlane carries NO qCDebug on its refusal path,
+ *     debug logging         so a refusal is indistinguishable from code that never ran
+ *   the framebuffer debugfs a scanned-out client's framebuffer is byte-indistinguishable
+ *     dump                  from the compositor's own -- same format, same size, and
+ *                           `allocated by` always names whoever called ADDFB2
+ *
+ * REPORTED ONCE PER DISTINCT (FORMAT, WIDTH, HEIGHT), EVER -- not on change.  A
+ * compositor cycling two formats would make an on-change report flap at the refresh
+ * rate; a first-sighting report is monotonic and cannot.
+ *
+ * Keyed on the SIZE as well as the format, because that is what gives the measurement
+ * a LIVE control.  Every format the compositor uses is already named during boot, so a
+ * format-only key would leave an arm that prints nothing indistinguishable from a hook
+ * that has stopped running.  With the size in the key, a player opened at a resolution
+ * nothing has used yet prints -- proving the reporter is still alive at the moment the
+ * real question is being asked.
+ *
+ * The racing case is benign: two simultaneous creates of a new format print it twice.
+ * A lock here would cost more than the duplicate line it prevents.
+ */
+struct msm_fb_reported {
+	u32 fourcc;
+	u32 width;
+	u32 height;
+};
+static struct msm_fb_reported reported_fbs[64];
+static unsigned int reported_fb_count;
+static bool reported_fb_table_full;
+
+static void msm_fb_report_new_format(const struct drm_format_info *info,
+				     const struct drm_mode_fb_cmd2 *mode_cmd)
+{
+	unsigned int i;
+
+	for (i = 0; i < reported_fb_count; i++)
+		if (reported_fbs[i].fourcc == mode_cmd->pixel_format &&
+		    reported_fbs[i].width  == mode_cmd->width &&
+		    reported_fbs[i].height == mode_cmd->height)
+			return;
+
+	/*
+	 * 🔴 SAY SO WHEN THE TABLE FILLS, rather than going quiet.  A silent
+	 * reporter that has stopped reporting is indistinguishable from one that
+	 * has nothing to report, and that is the exact shape of instrument failure
+	 * this driver's log has been bitten by before.
+	 */
+	if (reported_fb_count >= ARRAY_SIZE(reported_fbs)) {
+		if (!reported_fb_table_full) {
+			reported_fb_table_full = true;
+			DRM_INFO("colorop: framebuffer report table FULL at %zu entries -- no further formats will be named\n",
+				 ARRAY_SIZE(reported_fbs));
+		}
+		return;
+	}
+	reported_fbs[reported_fb_count].fourcc = mode_cmd->pixel_format;
+	reported_fbs[reported_fb_count].width  = mode_cmd->width;
+	reported_fbs[reported_fb_count].height = mode_cmd->height;
+	reported_fb_count++;
+
+	DRM_INFO("colorop: framebuffer CREATED, first of its format: %p4cc mod 0x%llx %ux%u %u-plane%s\n",
+		 &mode_cmd->pixel_format, mode_cmd->modifier[0],
+		 mode_cmd->width, mode_cmd->height, info->num_planes,
+		 info->is_yuv ? "  <== YUV" : "");
+}
+
 struct drm_framebuffer *msm_framebuffer_create(struct drm_device *dev,
 		struct drm_file *file, const struct drm_format_info *info,
 		const struct drm_mode_fb_cmd2 *mode_cmd)
@@ -146,6 +220,8 @@ struct drm_framebuffer *msm_framebuffer_create(struct drm_device *dev,
 	struct drm_gem_object *bos[4] = {0};
 	struct drm_framebuffer *fb;
 	int ret, i, n = info->num_planes;
+
+	msm_fb_report_new_format(info, mode_cmd);
 
 	for (i = 0; i < n; i++) {
 		bos[i] = drm_gem_object_lookup(file, mode_cmd->handles[i]);
