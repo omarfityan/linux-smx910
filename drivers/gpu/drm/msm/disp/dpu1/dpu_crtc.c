@@ -28,6 +28,7 @@
 #include "dpu_hw_lm.h"
 #include "dpu_hw_ctl.h"
 #include "dpu_hw_dspp.h"
+#include "dpu_colorop.h"
 #include "dpu_crtc.h"
 #include "dpu_hw_reg_dma.h"
 #include "dpu_plane.h"
@@ -1279,6 +1280,17 @@ static void dpu_crtc_atomic_flush(struct drm_crtc *crtc,
 			dpu_plane_set_error(plane, true);
 		dpu_plane_flush(plane);
 	}
+
+	/*
+	 * And the other half of any plane colour pipeline: the inverse-gamma
+	 * tables, which go through the register-DMA engine rather than the
+	 * register mapping and therefore need this CRTC's control block to
+	 * trigger the transfer.  It comes after the loop above rather than
+	 * inside it because a pipe is not owned by a plane -- see the comment on
+	 * the function, which also has to turn OFF the pipes this frame stopped
+	 * using.
+	 */
+	dpu_colorop_crtc_flush(crtc, cstate->mixers[0].lm_ctl);
 
 	/* Kickoff will be scheduled by outer layer */
 }

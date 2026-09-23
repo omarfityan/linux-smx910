@@ -38,12 +38,14 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_colorop.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_print.h>
 #include <drm/drm_property.h>
 
 #include "dpu_colorop.h"
 #include "dpu_hw_catalog.h"
+#include "dpu_hw_reg_dma.h"
 #include "dpu_hw_sspp.h"
 #include "dpu_kms.h"
 #include "dpu_plane.h"
@@ -65,6 +67,13 @@
  * (-64) and 0xfe00 (-512), which is exactly x1024.
  */
 #define DPU_CSC_BIAS_SCALE_SHIFT	10
+
+/*
+ * dpu_kms tracks which pipes have inverse gamma switched on as a bit per pipe
+ * in a u32.  Seventeen today; say so out loud rather than discover it on a part
+ * with more, where the overflow would silently stop pipes being turned off.
+ */
+static_assert(SSPP_MAX <= 32, "the inverse-gamma on-mask is a u32, one bit a pipe");
 
 /**
  * dpu_ctm_entry_to_s15_16 - decode one DRM colour-matrix coefficient
@@ -299,6 +308,18 @@ MODULE_PARM_DESC(plane_colorops,
 	"advertise per-plane colour operations on the video pipes; needs msm.plane_colorops=1 on the COMMAND LINE because it is read at plane creation, and needs a compositor that converts YCbCr inside the pipeline -- off by default because advertising it to one that does not LOSES the working YCbCr path");
 
 /**
+ * dpu_plane_colorops_enabled - is the colour-operation path advertised at all?
+ *
+ * The register-DMA engine the table needs is a device-lifetime resource, and
+ * allocating it on a machine that will never advertise a pipeline is a page and
+ * a register mapping for nothing.
+ */
+bool dpu_plane_colorops_enabled(void)
+{
+	return dpu_plane_colorops;
+}
+
+/**
  * dpu_plane_init_colorops - advertise this pipe's colour blocks as a DRM pipeline
  * @plane:      the plane
  * @has_blocks: whether the pipe (or, for a virtual plane, the largest pipe)
@@ -367,6 +388,17 @@ int dpu_plane_init_colorops(struct drm_plane *plane, bool has_blocks)
 	if (ret)
 		goto err;
 
+	/*
+	 * 🔴 THE POSITIVE CONTROL FOR EVERYTHING BELOW.  A clean compile says
+	 * nothing about whether code is reached, and on this device finding that
+	 * out costs a build, a flash and a reboot.  This line establishes that
+	 * the property exists on a real plane, so that a run with no further
+	 * colorop output means the COMPOSITOR did not ask -- not that the driver
+	 * never offered.
+	 */
+	DRM_INFO("colorop: %s advertises a colour pipeline: 3x4 matrix (id %u) -> %u-entry 1D LUT (id %u)\n",
+		 plane->name, csc_op->base.id, DPU_IGC_LUT_LEN, igc_op->base.id);
+
 	return 0;
 
 err:
@@ -381,6 +413,25 @@ err:
 	DPU_ERROR("failed to advertise colour operations on %s: %d\n",
 		  plane->name, ret);
 	return ret;
+}
+
+/**
+ * dpu_colorop_effective_state - the state this colour operation is actually in
+ *
+ * A colorop the client did not touch is not in the commit, and its COMMITTED state
+ * is what the hardware is left with.  Refusing then would turn "this client only
+ * set COLOR_PIPELINE" into a rejection indistinguishable from the hardware saying
+ * no -- and on this device telling those two apart costs a build, a flash and a
+ * reboot.  KWin does touch every operation in a chain it matches, so this is the
+ * defensive branch rather than the expected one.
+ */
+static struct drm_colorop_state *
+dpu_colorop_effective_state(struct drm_atomic_state *state,
+			    struct drm_colorop *colorop)
+{
+	struct drm_colorop_state *cs = drm_atomic_get_new_colorop_state(state, colorop);
+
+	return cs ? cs : colorop->state;
 }
 
 /**
@@ -402,12 +453,19 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
 	if (!colorop)
 		return false;
 
-	cs = drm_atomic_get_new_colorop_state(state, colorop);
+	cs = dpu_colorop_effective_state(state, colorop);
 	if (!cs || cs->bypass || !cs->data)
 		return false;
 
 	return dpu_colorop_ctm_to_csc(cs->data, out) == 0;
 }
+
+/* what the compositor placed, as booleans -- reported when it changes, never per frame */
+#define DPU_COLOROP_SHAPE_PIPELINE	BIT(0)
+#define DPU_COLOROP_SHAPE_CSC_BYPASS	BIT(1)
+#define DPU_COLOROP_SHAPE_CSC_DATA	BIT(2)
+#define DPU_COLOROP_SHAPE_IGC_BYPASS	BIT(3)
+#define DPU_COLOROP_SHAPE_IGC_DATA	BIT(4)
 
 /**
  * dpu_plane_colorop_check - can this plane's colour pipeline be programmed?
@@ -420,47 +478,246 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
  * Accepting and then programming something approximate would be fast and wrong,
  * and would look like a working feature.
  *
+ * The inverse-gamma table is converted INTO THE PLANE STATE rather than into a
+ * scratch buffer, because the flush path has only plane->state and cannot reach
+ * a colorop's atomic state -- the same reason the colour matrix is kept there.
+ *
  * Return: 0 if the pipeline can be programmed, -EINVAL otherwise.
  */
 int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			    struct drm_plane_state *plane_state)
 {
+	struct dpu_plane_state *pstate = to_dpu_plane_state(plane_state);
 	struct drm_colorop *colorop = plane_state->color_pipeline;
+	struct drm_plane_state *old_plane_state;
 	struct drm_colorop_state *cs;
 	struct dpu_csc_cfg csc;
-	u32 *lut;
-	int ret = 0;
+	u32 shape = 0;
 
-	if (!colorop)
-		return 0;
+	/*
+	 * Reached at all?  Session 484 hooked this check in a function VIRTUAL
+	 * PLANES NEVER REACH and it compiled perfectly.  One line a boot is the
+	 * price of never having to wonder again.
+	 */
+	DRM_INFO_ONCE("colorop: the plane colour-pipeline check is running\n");
 
-	/* first: the colour matrix */
-	cs = drm_atomic_get_new_colorop_state(state, colorop);
-	if (!cs)
-		return -EINVAL;
-	if (!cs->bypass && cs->data && dpu_colorop_ctm_to_csc(cs->data, &csc)) {
-		DPU_ERROR("colour matrix cannot be expressed by this pipe\n");
-		return -EINVAL;
-	}
+	pstate->has_pipeline_igc = false;
+	pstate->pipeline_igc_id = 0;
 
-	/* second: the inverse-gamma table */
-	colorop = colorop->next;
-	if (!colorop)
-		return -EINVAL;
-	cs = drm_atomic_get_new_colorop_state(state, colorop);
-	if (!cs)
-		return -EINVAL;
-	if (!cs->bypass && cs->data) {
-		lut = kmalloc_array(DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2),
-				    sizeof(*lut), GFP_KERNEL);
-		if (!lut)
-			return -ENOMEM;
-		if (dpu_colorop_lut_to_igc(cs->data, lut)) {
-			DPU_ERROR("inverse-gamma table is not the size this pipe takes\n");
-			ret = -EINVAL;
+	if (colorop) {
+		shape |= DPU_COLOROP_SHAPE_PIPELINE;
+
+		/* first: the colour matrix */
+		cs = dpu_colorop_effective_state(state, colorop);
+		if (!cs) {
+			DPU_ERROR("a colour operation has no state at all\n");
+			return -EINVAL;
 		}
-		kfree(lut);
+		if (cs->bypass)
+			shape |= DPU_COLOROP_SHAPE_CSC_BYPASS;
+		if (cs->data)
+			shape |= DPU_COLOROP_SHAPE_CSC_DATA;
+		if (!cs->bypass && cs->data &&
+		    dpu_colorop_ctm_to_csc(cs->data, &csc)) {
+			DPU_ERROR("colour matrix cannot be expressed by this pipe\n");
+			return -EINVAL;
+		}
+
+		/* second: the inverse-gamma table */
+		colorop = colorop->next;
+		if (!colorop)
+			return -EINVAL;
+		cs = dpu_colorop_effective_state(state, colorop);
+		if (!cs) {
+			DPU_ERROR("a colour operation has no state at all\n");
+			return -EINVAL;
+		}
+		if (cs->bypass)
+			shape |= DPU_COLOROP_SHAPE_IGC_BYPASS;
+		if (cs->data)
+			shape |= DPU_COLOROP_SHAPE_IGC_DATA;
+		if (!cs->bypass && cs->data) {
+			if (dpu_colorop_lut_to_igc(cs->data, pstate->pipeline_igc)) {
+				DPU_ERROR("inverse-gamma table is not the size this pipe takes\n");
+				return -EINVAL;
+			}
+			pstate->has_pipeline_igc = true;
+			pstate->pipeline_igc_id = cs->data->base.id;
+		}
 	}
 
-	return ret;
+	pstate->pipeline_shape = shape;
+
+	/*
+	 * 🔴 SAY WHAT THE COMPOSITOR PLACED, not merely that it placed something.
+	 *
+	 * Without this line, "the compositor never asked for a pipeline" and "it
+	 * asked and the hardware refused" are indistinguishable afterwards, and
+	 * on this device finding that out costs a build, a flash and a reboot.
+	 * "A pipeline arrived with both operations bypassed" and "a pipeline
+	 * arrived carrying a real table" are also different worlds, so both
+	 * flags are named rather than summarised.
+	 *
+	 * ⚠️ THIS IS CHECK TIME.  It fires on TEST_ONLY probes that never commit,
+	 * which is exactly what makes it useful -- a compositor trying and being
+	 * refused shows up here -- but it is not evidence that a frame was
+	 * scanned out.  Only the flush path's report is that.
+	 *
+	 * It is emitted when the shape CHANGES, against the old plane state, so
+	 * a clip playing at 120 Hz produces one line and not seven thousand.
+	 */
+	old_plane_state = drm_atomic_get_old_plane_state(state, plane_state->plane);
+	if (!old_plane_state ||
+	    to_dpu_plane_state(old_plane_state)->pipeline_shape != shape)
+		DRM_INFO("colorop: %s at check: %s | matrix %s%s | table %s%s\n",
+			 plane_state->plane->name,
+			 (shape & DPU_COLOROP_SHAPE_PIPELINE)
+				? "A COLOUR PIPELINE WAS SELECTED"
+				: "no colour pipeline",
+			 (shape & DPU_COLOROP_SHAPE_CSC_BYPASS) ? "bypassed" : "in force",
+			 (shape & DPU_COLOROP_SHAPE_CSC_DATA) ? ", has data" : ", NO DATA",
+			 (shape & DPU_COLOROP_SHAPE_IGC_BYPASS) ? "bypassed" : "in force",
+			 (shape & DPU_COLOROP_SHAPE_IGC_DATA) ? ", has data" : ", NO DATA");
+
+	return 0;
+}
+
+/**
+ * dpu_colorop_crtc_flush - put every pipe's inverse gamma where this frame wants it
+ * @crtc: the CRTC being flushed
+ * @ctl:  its control block, which is what triggers the engine's transfer
+ *
+ * Called from the CRTC's flush, immediately after each plane has written its
+ * colour matrix, so the two halves of a pipeline land in the same window.
+ *
+ * 🔴 WHY THIS WALKS PIPES AND NOT PLANES.  A source pipe is not owned by a
+ * plane: a virtual plane is assigned one at check time and can be given a
+ * different one next frame.  A pipe left behind still has inverse gamma on and
+ * the previous clip's curve loaded, and the next surface to land on it comes
+ * out visibly wrong with nothing in the frame to explain why.  So the pipes
+ * this frame wants are collected first and everything else the driver has ever
+ * turned on is turned back off.
+ *
+ * It walks EVERY plane on the device rather than this CRTC's, because the new
+ * states are already swapped in by the time a flush runs -- so plane->state is
+ * current for all of them -- and a pipe another CRTC is using has to be counted
+ * as wanted or this sweep would switch it off underneath that CRTC.  Only
+ * planes on THIS CRTC are programmed, because @ctl is this CRTC's.
+ */
+void dpu_colorop_crtc_flush(struct drm_crtc *crtc, struct dpu_hw_ctl *ctl)
+{
+	struct msm_drm_private *priv = crtc->dev->dev_private;
+	struct dpu_kms *dpu_kms = to_dpu_kms(priv->kms);
+	struct dpu_reg_dma *rdma = &dpu_kms->colorop_rdma;
+	struct drm_plane *plane;
+	u32 wanted = 0;
+	int i, s;
+
+	if (!rdma->ready || !ctl)
+		return;
+
+	DRM_INFO_ONCE("colorop: the inverse-gamma flush path is live on ctl%d\n",
+		      ctl->idx - CTL_0);
+
+	drm_for_each_plane(plane, crtc->dev) {
+		struct dpu_plane_state *pstate;
+
+		if (!plane->state || !plane->state->crtc)
+			continue;
+		pstate = to_dpu_plane_state(plane->state);
+		if (!pstate->has_pipeline_igc)
+			continue;
+
+		for (i = 0; i < PIPES_PER_PLANE; i++) {
+			struct dpu_hw_sspp *sspp = pstate->pipe[i].sspp;
+			bool same;
+			u32 bit;
+			int ret;
+
+			/*
+			 * A plane that is not visible has had its pipes
+			 * cleared by dpu_plane_virtual_atomic_check, which is
+			 * what makes this the whole invisibility test.
+			 */
+			if (!sspp || !sspp->cap->sblk->igc_blk.len)
+				continue;
+			bit = BIT(sspp->idx);
+
+			/*
+			 * Two rectangles of a multirect plane share one pipe,
+			 * so the second time round is the same hardware.
+			 */
+			if (wanted & bit)
+				continue;
+
+			/* a pipe on another CRTC is that CRTC's to program */
+			if (plane->state->crtc != crtc) {
+				wanted |= bit;
+				continue;
+			}
+
+			/*
+			 * Nothing to do when the hardware still HAS this exact
+			 * table.  Asked of the register rather than of a
+			 * remembered bit, because the display controller
+			 * power-collapses whenever the panel blanks and takes
+			 * the curve with it -- see dpu_reg_dma_sspp_igc_is_on.
+			 *
+			 * Skipping is not only a saving: the engine is waited
+			 * on synchronously with a 1 ms bound, and a 384-dword
+			 * transfer inside every commit would be a confound in
+			 * any measurement taken afterwards.
+			 */
+			same = dpu_kms->colorop_igc_lut_id[sspp->idx] ==
+					pstate->pipeline_igc_id;
+			if (same && dpu_reg_dma_sspp_igc_is_on(sspp)) {
+				wanted |= bit;
+				continue;
+			}
+
+			/*
+			 * 🔴 AND DO NOT RETRY A TABLE THAT ALREADY FAILED.
+			 * A failing transfer costs up to a millisecond of a
+			 * 8.3 ms frame plus a read-back and a log line, and it
+			 * would fail again for the same reason every frame --
+			 * which is both a flood and a confound, in exactly the
+			 * outcome a first attempt is most likely to produce.
+			 * The latch lifts when the compositor sends a
+			 * different curve.
+			 */
+			if (same && (dpu_kms->colorop_igc_failed & bit))
+				continue;
+
+			ret = dpu_reg_dma_program_sspp_igc(dpu_kms, rdma, ctl, sspp,
+							   pstate->pipeline_igc, true);
+			dpu_kms->colorop_igc_lut_id[sspp->idx] = pstate->pipeline_igc_id;
+			if (ret) {
+				/*
+				 * The sequence turns the block on before its
+				 * last operation, so a failure part-way leaves
+				 * inverse gamma enabled over a half-written
+				 * curve.  Off is the only safe state to fail to.
+				 */
+				dpu_kms->colorop_igc_failed |= bit;
+				dpu_reg_dma_disable_sspp_igc(dpu_kms, rdma, ctl, sspp);
+				continue;
+			}
+
+			dpu_kms->colorop_igc_failed &= ~bit;
+			wanted |= bit;
+		}
+	}
+
+	for (s = SSPP_NONE + 1; s < SSPP_MAX; s++) {
+		struct dpu_hw_sspp *sspp;
+
+		if (!(dpu_kms->colorop_igc_on & BIT(s)) || (wanted & BIT(s)))
+			continue;
+
+		sspp = dpu_rm_get_sspp(&dpu_kms->rm, s);
+		if (sspp)
+			dpu_reg_dma_disable_sspp_igc(dpu_kms, rdma, ctl, sspp);
+	}
+
+	dpu_kms->colorop_igc_on = wanted;
 }

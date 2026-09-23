@@ -29,6 +29,9 @@
  * @needs_dirtyfb: whether attached CRTC needs pixel data explicitly flushed
  * @layout:     framebuffer memory layout
  */
+/* three channels of 256 twelve-bit entries, packed two to a dword */
+#define DPU_PLANE_IGC_DWORDS	(3 * 128)
+
 struct dpu_plane_state {
 	struct drm_plane_state base;
 	struct dpu_sw_pipe pipe[PIPES_PER_PLANE];
@@ -51,6 +54,28 @@ struct dpu_plane_state {
 	 */
 	bool has_pipeline_csc;
 	struct dpu_csc_cfg pipeline_csc;
+
+	/*
+	 * And the same for the pipeline's inverse-gamma table: converted at
+	 * check time and CARRIED, for the same reason.  It is held packed the
+	 * way the block takes it -- three channels of 128 dwords, two twelve-bit
+	 * entries to a dword -- so the flush path does no arithmetic either.
+	 *
+	 * @pipeline_igc_id is the DRM blob's object id, which changes whenever
+	 * the compositor recomputes the curve.  It is what says whether the
+	 * table on a pipe is still the table that pipe was asked for, so the
+	 * commit path can skip re-sending 384 dwords for every frame of a clip
+	 * whose colour has not changed.
+	 */
+	bool has_pipeline_igc;
+	u32 pipeline_igc_id;
+	u32 pipeline_igc[DPU_PLANE_IGC_DWORDS];
+
+	/*
+	 * What the compositor put in the pipeline, as booleans, purely so a
+	 * change can be reported once instead of every frame.
+	 */
+	u32 pipeline_shape;
 
 	struct dpu_hw_fmt_layout layout;
 };

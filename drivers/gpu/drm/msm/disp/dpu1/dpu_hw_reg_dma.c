@@ -15,6 +15,7 @@
 #include "dpu_hw_catalog.h"
 #include "dpu_hw_ctl.h"
 #include "dpu_hw_dspp.h"
+#include "dpu_hw_sspp.h"
 #include "dpu_hw_top.h"
 #include "dpu_kms.h"
 #include "msm_gem.h"
@@ -460,6 +461,341 @@ out:
 					DPU_CLK_CTRL_REG_DMA, false);
 
 	return ret;
+}
+
+/* ------------------------------------------------------------------------ *
+ * The video pipes' inverse-gamma table
+ *
+ * A DRM plane colour pipeline's second operation is a 1D lookup table, and on
+ * this part that table lives in the source pipe's inverse-gamma block.  The
+ * block has no CPU write path -- writing it is the reason this engine exists.
+ *
+ * 🔴 THE OFFSETS BELOW ARE DELIBERATELY A SECOND COPY of the ones the self-test
+ * at the end of this file names SELFTEST_VIG_IGC_*.  Sharing them would let an
+ * instrument and the feature it is supposed to prove fail together on the same
+ * wrong constant, which is the one thing a control must not do.  The self-test
+ * also hardcodes its block base while this path takes it from the catalogue, so
+ * the two disagree loudly if the catalogue is wrong rather than agreeing
+ * quietly.
+ * ------------------------------------------------------------------------ */
+
+/*
+ * The video pipe class's anchor shift.  This device's device tree declares
+ * qcom,sde-vig-top-off = <0xa00>, and the hardware's command decoder anchors a
+ * source pipe's sub-blocks that much lower than the register mapping does.  A
+ * command buffer built with the CPU's offset writes 0xa00 too high, and the
+ * read-back then looks exactly like a transfer that never happened.
+ *
+ * 🔴 IT IS A PROPERTY OF THE PIPE CLASS, NOT A CONSTANT: the DMA pipes' shift is
+ * 0x800.  This function is for VIG pipes and asserts as much.
+ */
+#define DPU_VIG_TOP_OFF			0xa00
+
+/*
+ * Inside the block: bit 8 enables the lookup table and bit 9 selects which of
+ * two banks it reads, while bits 0-4 and 16 belong to gamut, share the
+ * register, and have to survive -- which is what the mask is for.  The masked
+ * modify keeps the bits named in the mask and takes the rest from the value.
+ */
+#define DPU_VIG_IGC_OPMODE		0x000
+#define DPU_VIG_IGC_OP_MASK		0x1001f
+#define DPU_VIG_IGC_LUT_ENABLE		BIT(8)
+#define DPU_VIG_IGC_LUT_SEL		BIT(9)
+
+/* the table's index and data ports, and the dither the vendor writes beside them */
+#define DPU_VIG_IGC_INDEX		0x1b0
+#define DPU_VIG_IGC_DATA		0x1b4
+#define DPU_VIG_IGC_DITHER		0x1c0
+#define DPU_VIG_IGC_DITHER_V6		0x16
+
+/* the separately held endpoint, one register a channel */
+#define DPU_VIG_IGC_LAST		0x1c4
+#define DPU_VIG_IGC_LAST_N		3
+
+/* 256 twelve-bit entries a channel, packed two to a dword, three channels */
+#define DPU_VIG_IGC_DWORDS		128
+#define DPU_VIG_IGC_CHANNELS		3
+#define DPU_VIG_IGC_ENTRY_MASK		(BIT(12) - 1)
+
+/* an entry chosen away from both ends, so a read-back names what it read */
+#define DPU_VIG_IGC_PROBE_INDEX		64
+
+/* one endpoint register a channel -- the loop below indexes them by channel */
+static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
+	      "one endpoint register per channel");
+
+/**
+ * dpu_reg_dma_blk_for_sspp - the decode-select bit naming a source pipe
+ *
+ * Return: the bit, or 0 for a pipe the engine cannot address.
+ */
+u32 dpu_reg_dma_blk_for_sspp(enum dpu_sspp id)
+{
+	switch (id) {
+	case SSPP_VIG0: return DPU_REG_DMA_BLK_VIG0;
+	case SSPP_VIG1: return DPU_REG_DMA_BLK_VIG1;
+	case SSPP_VIG2: return DPU_REG_DMA_BLK_VIG2;
+	case SSPP_VIG3: return DPU_REG_DMA_BLK_VIG3;
+	case SSPP_DMA0: return DPU_REG_DMA_BLK_DMA0;
+	case SSPP_DMA1: return DPU_REG_DMA_BLK_DMA1;
+	case SSPP_DMA2: return DPU_REG_DMA_BLK_DMA2;
+	case SSPP_DMA3: return DPU_REG_DMA_BLK_DMA3;
+	case SSPP_DMA4: return DPU_REG_DMA_BLK_DMA4;
+	case SSPP_DMA5: return DPU_REG_DMA_BLK_DMA5;
+	default:        return 0;
+	}
+}
+
+/* read one named entry of the table back through the block's own index port */
+static u32 dpu_vig_igc_read_entry(struct dpu_hw_blk_reg_map *hw, u32 cpu_off,
+				  u32 channel, u32 index)
+{
+	DPU_REG_WRITE(hw, cpu_off + DPU_VIG_IGC_INDEX, index);
+	return DPU_REG_READ(hw, cpu_off + DPU_VIG_IGC_DATA + channel * sizeof(u32));
+}
+
+/**
+ * dpu_reg_dma_sspp_igc_is_on - does this pipe's inverse-gamma block have a curve?
+ *
+ * 🔴 THE CACHED ANSWER IS NOT SAFE TO USE.  The display controller power-collapses
+ * whenever the panel blanks, and the block loses both its table and its enable bit;
+ * a driver that remembered "programmed" across that would skip re-sending the curve
+ * and leave the compositor believing a chain had been applied that no longer exists.
+ * The first clip would look right and the second would not, which reads as a
+ * hardware flake.  So this reads the register, in the powered commit, every frame a
+ * pipeline is in force -- one MMIO read, and it is this driver's own standing rule
+ * that an acknowledgement is never a substitute for the effect.
+ *
+ * Return: true when inverse gamma is switched on.
+ */
+bool dpu_reg_dma_sspp_igc_is_on(struct dpu_hw_sspp *sspp)
+{
+	if (!sspp->cap->sblk->igc_blk.len)
+		return false;
+
+	return !!(DPU_REG_READ(&sspp->hw,
+			       sspp->cap->sblk->igc_blk.base + DPU_VIG_IGC_OPMODE) &
+		  DPU_VIG_IGC_LUT_ENABLE);
+}
+
+/**
+ * dpu_reg_dma_program_sspp_igc - load and enable a video pipe's inverse-gamma table
+ * @lut:    DPU_VIG_IGC_CHANNELS * DPU_VIG_IGC_DWORDS dwords, channel-major
+ * @report: read the result back and log it -- true only when something changed,
+ *          because this runs inside the commit and the table does not
+ *
+ * This is the device's own v6 sequence, transcribed at session 483 and proven
+ * there to load the table: name the pipe, then per channel reset the index and
+ * push the run through the data port, then the dither, then the masked modify
+ * that turns inverse gamma on, then the curve's endpoint.
+ *
+ * ⚠️ THE ENDPOINT WRITE HAS NEVER LANDED on this part -- measured alone, after an
+ * enable, and inside the full sequence -- and those registers have been seen
+ * holding THIRTEEN-BIT values, which a twelve-bit curve endpoint cannot be.  It
+ * is submitted anyway because it is what the vendor submits and the transfer
+ * completes cleanly with it; @report is what says whether that ever changes.
+ *
+ * Return: 0 when the engine acknowledged the transfer, negative otherwise.
+ */
+int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
+				 struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,
+				 const u32 *lut, bool report)
+{
+	struct dpu_hw_blk_reg_map *hw = &sspp->hw;
+	u32 last[DPU_VIG_IGC_LAST_N];
+	u32 blk, cpu_off, dma_off, orig_opmode, enable_val, lut_sel;
+	int ch, ret;
+
+	if (!sspp->cap->sblk->igc_blk.len)
+		return -ENODEV;
+
+	blk = dpu_reg_dma_blk_for_sspp(sspp->idx);
+	if (!blk)
+		return -ENODEV;
+
+	cpu_off = sspp->cap->sblk->igc_blk.base;
+	if (cpu_off < DPU_VIG_TOP_OFF) {
+		DPU_ERROR("%s: inverse gamma at %#x is below the pipe's anchor shift\n",
+			  sspp->cap->name, cpu_off);
+		return -EINVAL;
+	}
+	dma_off = cpu_off - DPU_VIG_TOP_OFF;
+
+	orig_opmode = DPU_REG_READ(hw, cpu_off + DPU_VIG_IGC_OPMODE);
+
+	/*
+	 * Refuse rather than guess.  A bit set outside the mask and outside the
+	 * two being written is a bit this modify would clear and nothing would
+	 * put back -- gamut's, if anything ever programs it.
+	 */
+	if (orig_opmode & ~DPU_VIG_IGC_OP_MASK) {
+		DPU_ERROR("%s: inverse-gamma opmode %#x has bits outside the mask %#x\n",
+			  sspp->cap->name, orig_opmode, DPU_VIG_IGC_OP_MASK);
+		return -EINVAL;
+	}
+
+	/*
+	 * The bank to select, worked out the way the device's own driver works
+	 * it out: keep the current bank, except that a block already enabled is
+	 * moved to bank 1.
+	 */
+	lut_sel = (orig_opmode >> 9) & BIT(0);
+	if ((orig_opmode >> 8) & BIT(0))
+		lut_sel = 1;
+	enable_val = DPU_VIG_IGC_LUT_ENABLE | (lut_sel << 9);
+
+	/*
+	 * The endpoint is the curve's own last sample rather than a fresh
+	 * number: with 256 entries against this block's 257 knots, repeating the
+	 * top entry makes the final segment flat, where leaving it at zero would
+	 * crush the top of the tone curve toward black.
+	 */
+	for (ch = 0; ch < DPU_VIG_IGC_CHANNELS; ch++)
+		last[ch] = (lut[ch * DPU_VIG_IGC_DWORDS + DPU_VIG_IGC_DWORDS - 1] >> 16) &
+			   DPU_VIG_IGC_ENTRY_MASK;
+
+	dpu_reg_dma_buf_reset(rdma);
+	ret = dpu_reg_dma_decode_sel(rdma, blk);
+
+	for (ch = 0; ch < DPU_VIG_IGC_CHANNELS && !ret; ch++) {
+		ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_INDEX, 0);
+		if (ret)
+			break;
+		ret = dpu_reg_dma_indexed_write(rdma,
+						dma_off + DPU_VIG_IGC_DATA +
+						ch * sizeof(u32),
+						lut + ch * DPU_VIG_IGC_DWORDS,
+						DPU_VIG_IGC_DWORDS);
+	}
+	if (!ret)
+		ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_DITHER,
+					       DPU_VIG_IGC_DITHER_V6);
+	if (!ret)
+		ret = dpu_reg_dma_single_modify(rdma, dma_off + DPU_VIG_IGC_OPMODE,
+						DPU_VIG_IGC_OP_MASK, enable_val);
+	if (!ret)
+		ret = dpu_reg_dma_block_write(rdma, dma_off + DPU_VIG_IGC_LAST,
+					      last, DPU_VIG_IGC_LAST_N);
+	if (ret) {
+		DPU_ERROR("%s: failed to build the inverse-gamma program: %d\n",
+			  sspp->cap->name, ret);
+		return ret;
+	}
+
+	ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, true);
+
+	if (report) {
+		u32 opmode_after, index_after, read_last[DPU_VIG_IGC_LAST_N];
+		u32 got[DPU_VIG_IGC_CHANNELS], want[DPU_VIG_IGC_CHANNELS];
+		bool table_ok = true;
+		int i;
+
+		/* everything that does not move the index, first */
+		opmode_after = DPU_REG_READ(hw, cpu_off + DPU_VIG_IGC_OPMODE);
+		index_after  = DPU_REG_READ(hw, cpu_off + DPU_VIG_IGC_INDEX);
+		for (i = 0; i < DPU_VIG_IGC_LAST_N; i++)
+			read_last[i] = DPU_REG_READ(hw, cpu_off + DPU_VIG_IGC_LAST +
+						    i * sizeof(u32));
+
+		/*
+		 * Then the table itself, which is the instrument with a
+		 * demonstrated two-sided response: it showed the block's own
+		 * garbage before session 483's run and the exact expected words
+		 * after.  The endpoint registers cannot do that and are reported
+		 * beside it as secondary evidence only.
+		 */
+		for (i = 0; i < DPU_VIG_IGC_CHANNELS; i++) {
+			want[i] = lut[i * DPU_VIG_IGC_DWORDS + DPU_VIG_IGC_PROBE_INDEX];
+			got[i] = dpu_vig_igc_read_entry(hw, cpu_off, i,
+							DPU_VIG_IGC_PROBE_INDEX);
+			if (got[i] != want[i])
+				table_ok = false;
+		}
+		DPU_REG_WRITE(hw, cpu_off + DPU_VIG_IGC_INDEX, index_after);
+
+		DRM_INFO("colorop: %s inverse gamma ctl%d | opmode %#x -> wrote %#x under keep-mask %#x -> read %#x (%s) | index %#x | dword %d of each channel: expected %#x %#x %#x read %#x %#x %#x -- %s | endpoint: wrote %#x %#x %#x read %#x %#x %#x -- %s | kick_off %d\n",
+			 sspp->cap->name, ctl->idx - CTL_0,
+			 orig_opmode, enable_val, DPU_VIG_IGC_OP_MASK, opmode_after,
+			 (opmode_after & DPU_VIG_IGC_LUT_ENABLE) ? "INVERSE GAMMA ON"
+								 : "STILL OFF",
+			 index_after,
+			 DPU_VIG_IGC_PROBE_INDEX,
+			 want[0], want[1], want[2], got[0], got[1], got[2],
+			 table_ok ? "TABLE LANDED" : "TABLE DID NOT LAND",
+			 last[0], last[1], last[2],
+			 read_last[0], read_last[1], read_last[2],
+			 (read_last[0] == last[0] && read_last[1] == last[1] &&
+			  read_last[2] == last[2]) ? "endpoint landed"
+						  : "endpoint did not land",
+			 ret);
+	}
+
+	return ret;
+}
+
+/**
+ * dpu_reg_dma_disable_sspp_igc - turn a video pipe's inverse gamma back off
+ *
+ * 🔴 TWO ROUTES, AND THE SECOND ONE IS NOT BELT AND BRACES.  The engine's masked
+ * modify has been measured completing cleanly and doing nothing -- once in four
+ * attempts at session 483 -- and a pipe left with inverse gamma ON and a stale
+ * table is a visibly wrong picture with no obvious cause, which outlives the
+ * commit that caused it.  So the engine is asked first, because that is the
+ * vendor's own off path, and the result is READ BACK and corrected by the CPU
+ * when it did not take.
+ *
+ * Return: 0 if inverse gamma is off when this returns, -EIO if it is not.
+ */
+int dpu_reg_dma_disable_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
+				 struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp)
+{
+	struct dpu_hw_blk_reg_map *hw = &sspp->hw;
+	u32 blk, cpu_off, dma_off, by_engine, by_cpu;
+	int ret;
+
+	if (!sspp->cap->sblk->igc_blk.len)
+		return -ENODEV;
+
+	blk = dpu_reg_dma_blk_for_sspp(sspp->idx);
+	if (!blk)
+		return -ENODEV;
+
+	cpu_off = sspp->cap->sblk->igc_blk.base;
+	if (cpu_off < DPU_VIG_TOP_OFF)
+		return -EINVAL;
+	dma_off = cpu_off - DPU_VIG_TOP_OFF;
+
+	/*
+	 * Already off costs nothing.  The retire sweep this serves runs over
+	 * every pipe the driver has ever enabled, so without this it would
+	 * submit a transfer for pipes that have been off for minutes.
+	 */
+	if (!(DPU_REG_READ(hw, cpu_off + DPU_VIG_IGC_OPMODE) & DPU_VIG_IGC_LUT_ENABLE))
+		return 0;
+
+	dpu_reg_dma_buf_reset(rdma);
+	ret = dpu_reg_dma_decode_sel(rdma, blk);
+	if (!ret)
+		ret = dpu_reg_dma_single_modify(rdma, dma_off + DPU_VIG_IGC_OPMODE,
+						DPU_VIG_IGC_OP_MASK, 0);
+	if (!ret)
+		ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, true);
+
+	by_engine = DPU_REG_READ(hw, cpu_off + DPU_VIG_IGC_OPMODE);
+	if (!(by_engine & DPU_VIG_IGC_LUT_ENABLE))
+		return 0;
+
+	DPU_REG_WRITE(hw, cpu_off + DPU_VIG_IGC_OPMODE,
+		      by_engine & ~(DPU_VIG_IGC_LUT_ENABLE | DPU_VIG_IGC_LUT_SEL));
+	by_cpu = DPU_REG_READ(hw, cpu_off + DPU_VIG_IGC_OPMODE);
+
+	DRM_INFO("colorop: %s inverse gamma off | the engine's own path left %#x, a cpu write left %#x -- %s | kick_off %d\n",
+		 sspp->cap->name, by_engine, by_cpu,
+		 (by_cpu & DPU_VIG_IGC_LUT_ENABLE) ? "STILL ON -- THE PICTURE IS WRONG"
+						   : "off",
+		 ret);
+
+	return (by_cpu & DPU_VIG_IGC_LUT_ENABLE) ? -EIO : 0;
 }
 
 /* ------------------------------------------------------------------------ *

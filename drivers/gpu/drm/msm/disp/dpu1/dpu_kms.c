@@ -27,6 +27,7 @@
 #include "msm_gem.h"
 #include "disp/msm_disp_snapshot.h"
 
+#include "dpu_colorop.h"
 #include "dpu_core_irq.h"
 #include "dpu_crtc.h"
 #include "dpu_encoder.h"
@@ -891,6 +892,9 @@ static void _dpu_kms_hw_destroy(struct dpu_kms *dpu_kms)
 
 	/* release the engine's mapping and its buffer before the address space goes */
 	dpu_reg_dma_selftest_unbind(dpu_kms);
+	dpu_reg_dma_fini(dpu_kms, &dpu_kms->colorop_rdma);
+	dpu_kms->colorop_igc_on = 0;
+	dpu_kms->colorop_igc_failed = 0;
 
 	dpu_kms->hw_intr = NULL;
 
@@ -1295,6 +1299,25 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 	 * from process context rather than from inside an atomic commit.
 	 */
 	dpu_reg_dma_selftest_bind(dpu_kms);
+
+	/*
+	 * And set up the engine the plane colour operations use, here rather
+	 * than lazily, because the commit path is no place to be mapping
+	 * registers or asking for memory.  A page is far more than the whole
+	 * inverse-gamma program needs -- it is about 408 dwords of 1024.
+	 *
+	 * Only when the operations are advertised at all: on an ordinary boot
+	 * this costs nothing.  A failure here is not fatal; the planes simply
+	 * cannot carry a table, and dpu_colorop_crtc_flush declines to run.
+	 */
+	if (dpu_plane_colorops_enabled()) {
+		int engine = dpu_reg_dma_init(dpu_kms, &dpu_kms->colorop_rdma,
+					      PAGE_SIZE);
+
+		if (engine)
+			DPU_ERROR("plane colour operations have no register-DMA engine: %d\n",
+				  engine);
+	}
 
 	pm_runtime_put_sync(&dpu_kms->pdev->dev);
 

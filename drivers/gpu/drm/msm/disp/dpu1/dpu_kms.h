@@ -23,6 +23,7 @@
 #include "dpu_hw_top.h"
 #include "dpu_rm.h"
 #include "dpu_core_perf.h"
+#include "dpu_hw_reg_dma.h"
 
 #define DRMID(x) ((x) ? (x)->base.id : -1)
 
@@ -101,6 +102,32 @@ struct dpu_kms {
 	atomic_t bandwidth_ref;
 	struct icc_path *path[2];
 	u32 num_paths;
+
+	/*
+	 * The register-DMA engine the plane colour operations use, and what it
+	 * has been asked to leave switched on.
+	 *
+	 * It is a device-lifetime resource rather than something the commit path
+	 * sets up, because the commit path is no place to be mapping registers
+	 * or asking for memory.  It is only allocated when the colour operations
+	 * are advertised at all, so an ordinary boot costs nothing.
+	 *
+	 * @colorop_igc_on is a bit per source pipe, and it exists because a pipe
+	 * is not owned by a plane: a virtual plane is assigned one at check time
+	 * and can be given a different one next frame, so the pipe left behind
+	 * has to be turned off by somebody who is looking at all of them.  It is
+	 * used ONLY to decide what to sweep; whether a pipe still carries its
+	 * curve is asked of the register, because a power collapse clears the
+	 * block and would leave any remembered answer wrong.
+	 *
+	 * @colorop_igc_failed latches a pipe whose table would not go in, so a
+	 * transfer that fails does not burn up to a millisecond of every frame
+	 * failing again.  It lifts when the compositor sends a different curve.
+	 */
+	struct dpu_reg_dma colorop_rdma;
+	u32 colorop_igc_on;
+	u32 colorop_igc_failed;
+	u32 colorop_igc_lut_id[SSPP_MAX];
 };
 
 struct vsync_info {

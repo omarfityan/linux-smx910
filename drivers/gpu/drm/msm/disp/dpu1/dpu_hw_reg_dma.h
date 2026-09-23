@@ -19,10 +19,12 @@
 #define _DPU_HW_REG_DMA_H
 
 #include <linux/types.h>
+#include "dpu_hw_mdss.h"
 #include "dpu_hw_util.h"
 
 struct dpu_kms;
 struct dpu_hw_ctl;
+struct dpu_hw_sspp;
 
 /*
  * Decode-select block identifiers.
@@ -96,6 +98,19 @@ int dpu_reg_dma_single_modify(struct dpu_reg_dma *rdma, u32 blk_off, u32 mask,
 
 int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 			 struct dpu_hw_ctl *ctl, bool trigger);
+
+/*
+ * The video pipes' inverse-gamma table, which is what a DRM plane colour
+ * pipeline's 1D lookup-table operation lands on.  The block has no CPU write
+ * path, so these go through the engine above.
+ */
+u32 dpu_reg_dma_blk_for_sspp(enum dpu_sspp id);
+bool dpu_reg_dma_sspp_igc_is_on(struct dpu_hw_sspp *sspp);
+int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
+				 struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,
+				 const u32 *lut, bool report);
+int dpu_reg_dma_disable_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
+				 struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp);
 
 struct dpu_hw_dspp;
 void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
