@@ -817,6 +817,15 @@ static struct dpu_hw_sspp *dpu_rm_try_sspp(struct dpu_rm *rm,
 		if (reqs->yuv && !hw_sspp->cap->sblk->csc_blk.len)
 			continue;
 
+		/*
+		 * Both blocks, matching what the plane advertised: a pipeline
+		 * offering less than the whole chain is worse than none at all,
+		 * so the advertisement demands both and so does this.
+		 */
+		if (reqs->colorop && (!hw_sspp->cap->sblk->csc_blk.len ||
+				      !hw_sspp->cap->sblk->igc_blk.len))
+			continue;
+
 		if (reqs->rot90 && !(hw_sspp->cap->features & DPU_SSPP_INLINE_ROTATION))
 			continue;
 

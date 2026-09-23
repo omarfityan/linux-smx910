@@ -1019,6 +1019,31 @@ static int dpu_plane_atomic_check_sspp(struct drm_plane *plane,
 	struct dpu_sw_pipe_cfg *r_pipe_cfg = &pstate->pipe_cfg[1];
 	int ret = 0;
 
+	/*
+	 * Belt and braces on the pipe the resource manager actually handed
+	 * over.  dpu_rm_sspp_requirements::colorop is what keeps a pipeline off
+	 * a pipe that cannot run it; this says so again against the assignment
+	 * itself, because the failure it guards is silent -- both programming
+	 * paths simply do nothing and the picture comes out wrong.  Refusing
+	 * here costs a composited frame, which is slower and CORRECT.
+	 */
+	if (pstate->has_pipeline_csc || pstate->has_pipeline_igc) {
+		int i;
+
+		for (i = 0; i < PIPES_PER_PLANE; i++) {
+			const struct dpu_hw_sspp *sspp = pstate->pipe[i].sspp;
+
+			if (!sspp)
+				continue;
+			if (sspp->cap->sblk->csc_blk.len &&
+			    sspp->cap->sblk->igc_blk.len)
+				continue;
+			DPU_ERROR("%s: a colour pipeline was assigned to %s, which has no colour blocks\n",
+				  plane->name, sspp->cap->name);
+			return -EINVAL;
+		}
+	}
+
 	ret = dpu_plane_atomic_check_pipe(pdpu, pipe, pipe_cfg,
 					  &crtc_state->adjusted_mode,
 					  new_plane_state);
@@ -1301,6 +1326,7 @@ static int dpu_plane_virtual_assign_resources(struct drm_crtc *crtc,
 		(plane_state->src_h >> 16 != plane_state->crtc_h);
 
 	reqs.rot90 = drm_rotation_90_or_270(plane_state->rotation);
+	reqs.colorop = pstate->has_pipeline_csc || pstate->has_pipeline_igc;
 
 	for (i = 0; i < STAGES_PER_PLANE; i++) {
 		if (prev_adjacent_pstate[i] &&

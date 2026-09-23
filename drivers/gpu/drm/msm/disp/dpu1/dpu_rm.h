@@ -45,6 +45,21 @@ struct dpu_rm_sspp_requirements {
 	bool yuv;
 	bool scale;
 	bool rot90;
+	/*
+	 * The plane carries a DRM colour pipeline with at least one operation in
+	 * force, so it needs a pipe with the colour blocks to put them in.
+	 *
+	 * 🔴 WITHOUT THIS A PIPELINE CAN LAND ON A PIPE THAT CANNOT RUN IT, AND
+	 * NOTHING SAYS SO.  A DMA pipe is TRIED FIRST and has neither block; an
+	 * RGB surface with a non-identity pipeline does not set @yuv, so nothing
+	 * else keeps it off one.  Both programming paths then quietly do nothing
+	 * -- the matrix because the pipe has no setup_csc, the table because it
+	 * has no inverse-gamma block -- while the compositor goes on believing
+	 * the plane applied the whole chain.  The result is a wrong picture that
+	 * looks like a working feature, which is the exact outcome the colour
+	 * pipeline's check refuses to commit.
+	 */
+	bool colorop;
 };
 
 /**
