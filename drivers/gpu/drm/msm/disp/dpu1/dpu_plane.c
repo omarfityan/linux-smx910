@@ -77,6 +77,7 @@ static const uint32_t qcom_compressed_supported_formats[] = {
  * @csc_ptr: Points to dpu_csc_cfg structure to use for current
  * @catalog: Points to dpu catalog structure
  * @revalidate: force revalidation of all the plane properties
+ * @reported_fb_fourcc: LOGGING ONLY -- the framebuffer format last reported
  */
 struct dpu_plane {
 	struct drm_plane base;
@@ -87,6 +88,17 @@ struct dpu_plane {
 	bool is_error;
 	bool is_rt_pipe;
 	const struct dpu_mdss_cfg *catalog;
+
+	/*
+	 * LOGGING ONLY -- the framebuffer format last reported for this plane.
+	 *
+	 * It lives on the PLANE and not on the plane STATE deliberately.  A
+	 * failed atomic check throws its state away, so a compositor that
+	 * retries the SAME refused format every frame would re-report it at
+	 * the refresh rate.  Kept here, the report fires once per genuine
+	 * format change and never in a loop.
+	 */
+	u32 reported_fb_fourcc;
 };
 
 static const uint64_t supported_format_modifiers[] = {
@@ -837,6 +849,7 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	struct dpu_sw_pipe_cfg *r_pipe_cfg;
 	struct drm_rect fb_rect = { 0 };
 	uint32_t max_linewidth;
+	const struct msm_format *fb_fmt;
 
 	min_scale = FRAC_16_16(1, MAX_UPSCALE_RATIO);
 	max_scale = MAX_DOWNSCALE_RATIO << 16;
@@ -851,6 +864,48 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	}
 	if (!new_plane_state->visible)
 		return 0;
+
+	/*
+	 * 🔴 SAY WHAT FRAMEBUFFER ARRIVED, AND SAY IT *HERE*.
+	 *
+	 * Five refusals sit between this line and dpu_plane_colorop_check()
+	 * at the tail of this function: -EINVAL for the blend stage, -E2BIG
+	 * for the image size, the plane-size populate, -E2BIG for the pitch,
+	 * and -E2BIG for the line width -- the last of which is K1, the very
+	 * refusal a full-width YUV plane is expected to hit.  A report placed
+	 * at the tail would never see a plane turned away by any of them, so
+	 * "THIS KERNEL refused the plane" and "the COMPOSITOR never proposed
+	 * one" would read identically in the log afterwards.  That is the
+	 * misattribution 479 nearly recorded and 480 spent three on-device
+	 * arms discovering, so the report goes where nothing can bypass it.
+	 *
+	 * Together with the colour-pipeline report at the tail this reads
+	 * four ways, not two:
+	 *
+	 *   YUV here + a pipeline at the tail  the compositor asked, and the
+	 *                                      hardware was given the job
+	 *   YUV here + NO pipeline at the tail the compositor proposed the
+	 *                                      buffer with an IDENTITY pipeline
+	 *   YUV here + no tail line at all     THIS driver refused it in
+	 *                                      between -- read the return path
+	 *   no YUV here at all                 the commit never reached the
+	 *                                      kernel carrying one
+	 *
+	 * Emitted only when the format CHANGES, so a clip playing at 120 Hz
+	 * produces one line and not seven thousand.
+	 */
+	if (new_plane_state->fb->format->format != pdpu->reported_fb_fourcc) {
+		pdpu->reported_fb_fourcc = new_plane_state->fb->format->format;
+		fb_fmt = msm_framebuffer_format(new_plane_state->fb);
+		DRM_INFO("colorop: %s fb at check: %p4cc %s%s%s %ux%u\n",
+			 plane->name,
+			 &new_plane_state->fb->format->format,
+			 fb_fmt && MSM_FORMAT_IS_YUV(fb_fmt) ? "YUV" : "RGB",
+			 fb_fmt && MSM_FORMAT_IS_DX(fb_fmt) ? " 10-bit" : "",
+			 fb_fmt && MSM_FORMAT_IS_UBWC(fb_fmt) ? " UBWC" : "",
+			 new_plane_state->fb->width,
+			 new_plane_state->fb->height);
+	}
 
 	pstate->stage = DPU_STAGE_0 + pstate->base.normalized_zpos;
 	if (pstate->stage >= pdpu->catalog->caps->max_mixer_blendstages) {
