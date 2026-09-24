@@ -603,6 +603,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 {
 	struct dpu_hw_blk_reg_map *hw = &sspp->hw;
 	u32 last[DPU_VIG_IGC_LAST_N];
+	u32 before[DPU_VIG_IGC_CHANNELS] = {};
 	u32 blk, cpu_off, dma_off, orig_opmode, enable_val, lut_sel;
 	int ch, ret;
 
@@ -691,6 +692,19 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 		return ret;
 	}
 
+	/*
+	 * What the port shows BEFORE the load.  Outside the load the port reads
+	 * zero in every state measured so far, including right after a load that
+	 * landed; whether it is also dark at the moment a load starts is what
+	 * separates "the port is dark" from "the load did not land" for the one
+	 * reading taken inside the commit.  The engine's program resets the index
+	 * before it writes, so moving it here costs nothing.
+	 */
+	if (report)
+		for (ch = 0; ch < DPU_VIG_IGC_CHANNELS; ch++)
+			before[ch] = dpu_vig_igc_read_entry(hw, cpu_off, ch,
+							    DPU_VIG_IGC_PROBE_INDEX);
+
 	ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, true);
 
 	if (report) {
@@ -737,6 +751,49 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 			  read_last[2] == last[2]) ? "endpoint landed"
 						  : "endpoint did not land",
 			 ret);
+
+		/*
+		 * Then the WHOLE table against what was sent, on its own line so
+		 * the line above keeps the exact form the measuring tools parse.
+		 * One dword per channel cannot tell a complete load from one whose
+		 * tail -- the top of the curve, the highlights -- did not land, and
+		 * the pixels have shown power-up-dependent behaviour there.
+		 */
+		{
+			u32 as_written = 0, top_ok = 0, fc = 0, fk = 0, fw = 0, fg = 0;
+			bool any_bad = false;
+			int c, k;
+
+			for (c = 0; c < DPU_VIG_IGC_CHANNELS; c++) {
+				for (k = 0; k < DPU_VIG_IGC_DWORDS; k++) {
+					u32 w = lut[c * DPU_VIG_IGC_DWORDS + k];
+					u32 g = dpu_vig_igc_read_entry(hw, cpu_off, c, k);
+
+					if (g == w) {
+						as_written++;
+						if (k >= DPU_VIG_IGC_DWORDS - 8)
+							top_ok++;
+					} else if (!any_bad) {
+						any_bad = true;
+						fc = c; fk = k; fw = w; fg = g;
+					}
+				}
+			}
+			DPU_REG_WRITE(hw, cpu_off + DPU_VIG_IGC_INDEX, index_after);
+
+			if (any_bad)
+				DRM_INFO("colorop: %s inverse gamma table | before the load, dword %d read %#x %#x %#x | after: %u of %u dwords as written, top 8 of each channel %u of %u | first difference ch%u dword %u wrote %#x read %#x\n",
+					 sspp->cap->name, DPU_VIG_IGC_PROBE_INDEX,
+					 before[0], before[1], before[2],
+					 as_written, DPU_VIG_IGC_CHANNELS * DPU_VIG_IGC_DWORDS,
+					 top_ok, DPU_VIG_IGC_CHANNELS * 8, fc, fk, fw, fg);
+			else
+				DRM_INFO("colorop: %s inverse gamma table | before the load, dword %d read %#x %#x %#x | after: %u of %u dwords as written, top 8 of each channel %u of %u | no difference\n",
+					 sspp->cap->name, DPU_VIG_IGC_PROBE_INDEX,
+					 before[0], before[1], before[2],
+					 as_written, DPU_VIG_IGC_CHANNELS * DPU_VIG_IGC_DWORDS,
+					 top_ok, DPU_VIG_IGC_CHANNELS * 8);
+		}
 	}
 
 	return ret;

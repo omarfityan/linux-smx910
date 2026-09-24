@@ -307,6 +307,26 @@ module_param_named(plane_colorops, dpu_plane_colorops, bool, 0600);
 MODULE_PARM_DESC(plane_colorops,
 	"advertise per-plane colour operations on the video pipes; needs msm.plane_colorops=1 on the COMMAND LINE because it is read at plane creation, and needs a compositor that converts YCbCr inside the pipeline -- off by default because advertising it to one that does not LOSES the working YCbCr path");
 
+/*
+ * A TEST SWITCH, off by default: leave a pipe's inverse gamma ON when no plane
+ * wants it any more, instead of switching it off.
+ *
+ * It exists to answer one question.  A table load that follows a switch-off has
+ * been measured NOT to reach the pixels -- the pipeline keeps the previous
+ * curve until the display power-collapses -- and every such load was also not
+ * the first enable since the power-up.  Whether a load lands when the block is
+ * still on (the device's own driver reloads that way, flipping the bank bit)
+ * separates the two, and this switch is how to produce that load.
+ *
+ * 🔴 IT IS NOT SAFE IN GENERAL: a pipe left on shows the next surface it
+ * carries through the previous curve.  It is runtime-writable only so an arm
+ * can turn it on around one measurement and back off.
+ */
+static bool dpu_colorop_igc_keep_on;
+module_param_named(colorop_igc_keep_on, dpu_colorop_igc_keep_on, bool, 0644);
+MODULE_PARM_DESC(colorop_igc_keep_on,
+	"TEST ONLY, default off: leave a video pipe's inverse gamma on when no plane wants it, instead of switching it off");
+
 /**
  * dpu_plane_colorops_enabled - is the colour-operation path advertised at all?
  *
@@ -713,6 +733,12 @@ void dpu_colorop_crtc_flush(struct drm_crtc *crtc, struct dpu_hw_ctl *ctl)
 
 		if (!(dpu_kms->colorop_igc_on & BIT(s)) || (wanted & BIT(s)))
 			continue;
+
+		/* the test switch above: still on, so still tracked as on */
+		if (dpu_colorop_igc_keep_on) {
+			wanted |= BIT(s);
+			continue;
+		}
 
 		sspp = dpu_rm_get_sspp(&dpu_kms->rm, s);
 		if (sspp)
