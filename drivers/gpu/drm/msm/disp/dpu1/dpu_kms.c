@@ -895,6 +895,8 @@ static void _dpu_kms_hw_destroy(struct dpu_kms *dpu_kms)
 	dpu_reg_dma_fini(dpu_kms, &dpu_kms->colorop_rdma);
 	dpu_kms->colorop_igc_on = 0;
 	dpu_kms->colorop_igc_failed = 0;
+	dpu_kms->colorop_igc_bank_known = 0;
+	dpu_kms->colorop_igc_bank1 = 0;
 
 	dpu_kms->hw_intr = NULL;
 

@@ -123,10 +123,21 @@ struct dpu_kms {
 	 * @colorop_igc_failed latches a pipe whose table would not go in, so a
 	 * transfer that fails does not burn up to a millisecond of every frame
 	 * failing again.  It lifts when the compositor sends a different curve.
+	 *
+	 * @colorop_igc_bank_known and @colorop_igc_bank1 record, per pipe, which
+	 * of the table's two banks the pipeline is showing -- which the register
+	 * cannot say, because switching the block off clears its bank-select bit
+	 * while the hardware keeps its own pointer.  They are the only colour
+	 * state that must survive a switch-off, and they are NOT reset by the
+	 * runtime-PM callbacks: idle power collapse can suspend the controller
+	 * while the display's power domain, and the table with it, stays on.  The
+	 * block's own index/data port is the witness of a real power loss instead.
 	 */
 	struct dpu_reg_dma colorop_rdma;
 	u32 colorop_igc_on;
 	u32 colorop_igc_failed;
+	u32 colorop_igc_bank_known;
+	u32 colorop_igc_bank1;
 	u32 colorop_igc_lut_id[SSPP_MAX];
 };
 

@@ -558,6 +558,41 @@ static u32 dpu_vig_igc_read_entry(struct dpu_hw_blk_reg_map *hw, u32 cpu_off,
 }
 
 /**
+ * dpu_vig_igc_port_is_fresh - has this block lost power since it was last enabled?
+ * @hw:      the source pipe's register map
+ * @cpu_off: the inverse-gamma block's offset inside it
+ * @probe:   filled with the three channels' DPU_VIG_IGC_PROBE_INDEX entries, for the report
+ *
+ * The block's index/data port shows its own power-up contents until inverse gamma is first
+ * enabled, and reads zero from then until the display next powers down -- in steady state, after a
+ * switch-off and before a live reload alike (measured).  So a readable port is the one witness, in
+ * the hardware itself, that the power was lost; the controller's runtime-PM state is not, because
+ * idle power collapse suspends the controller while the display's power domain stays on.  Three
+ * entries a channel are sampled, so power-up contents that happen to be zero at one cannot pass
+ * for a dark port.  The engine's program resets the index before it writes, so this costs nothing.
+ *
+ * Return: true when any sampled entry reads non-zero.
+ */
+static bool dpu_vig_igc_port_is_fresh(struct dpu_hw_blk_reg_map *hw, u32 cpu_off, u32 *probe)
+{
+	static const u32 at[] = { 0, DPU_VIG_IGC_PROBE_INDEX, DPU_VIG_IGC_DWORDS - 1 };
+	u32 any = 0;
+	int ch, i;
+
+	for (ch = 0; ch < DPU_VIG_IGC_CHANNELS; ch++) {
+		for (i = 0; i < ARRAY_SIZE(at); i++) {
+			u32 v = dpu_vig_igc_read_entry(hw, cpu_off, ch, at[i]);
+
+			if (at[i] == DPU_VIG_IGC_PROBE_INDEX)
+				probe[ch] = v;
+			any |= v;
+		}
+	}
+
+	return any != 0;
+}
+
+/**
  * dpu_reg_dma_sspp_igc_is_on - does this pipe's inverse-gamma block have a curve?
  *
  * 🔴 THE CACHED ANSWER IS NOT SAFE TO USE.  The display controller power-collapses
@@ -607,7 +642,9 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	struct dpu_hw_blk_reg_map *hw = &sspp->hw;
 	u32 last[DPU_VIG_IGC_LAST_N];
 	u32 before[DPU_VIG_IGC_CHANNELS] = {};
-	u32 blk, cpu_off, dma_off, orig_opmode, enable_val, lut_sel;
+	u32 blk, cpu_off, dma_off, orig_opmode, enable_val, bank, pipe_bit;
+	bool fresh, known, shown1;
+	const char *why;
 	int ch, ret;
 
 	if (!sspp->cap->sblk->igc_blk.len)
@@ -648,14 +685,46 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	}
 
 	/*
-	 * The bank to select, worked out the way the device's own driver works
-	 * it out: keep the current bank, except that a block already enabled is
-	 * moved to bank 1.
+	 * 🔴 WHICH BANK TO SHOW -- the choice this function exists to get right.
+	 *
+	 * The table has two banks, and the hardware, not this driver, decides
+	 * which one the engine writes.  Measured in the pixels (the display
+	 * controller's layer-mixer CRC on static stimuli, three tables):
+	 *
+	 *   the pipeline shows the bank the select bit (9) names;
+	 *   an ENABLED write of the select bit sets the hardware's own pointer;
+	 *   a switch-off leaves that pointer where it was, although it clears
+	 *     the register's bit;
+	 *   once enabled since power-up, the engine writes the bank opposite
+	 *     the pointer; and after a power loss its first write is bank 0.
+	 *
+	 * The device's own driver chose from the register -- `(~lut_sel) &&
+	 * BIT(0)`, a logical and that is always 1 for an enabled block, and the
+	 * cleared bit after a switch-off -- so a second live reload, or a load
+	 * after a switch-off from bank 0, left the PREVIOUS curve on screen
+	 * until the panel next powered down, with nothing in the frame to say
+	 * so.  The bank on display is therefore recorded here, per pipe, and the
+	 * bank enabled is the one opposite it: the one the engine just wrote.
+	 *
+	 * The record is reset only by evidence of a real power loss: a readable
+	 * port.  An unknown record with a dark port -- reachable only after an
+	 * engine error -- can only be guessed; the enable that follows sets the
+	 * pointer, so the NEXT load is right even when this one is not.
 	 */
-	lut_sel = (orig_opmode >> 9) & BIT(0);
-	if ((orig_opmode >> 8) & BIT(0))
-		lut_sel = 1;
-	enable_val = DPU_VIG_IGC_LUT_ENABLE | (lut_sel << 9);
+	pipe_bit = BIT(sspp->idx);
+	fresh = dpu_vig_igc_port_is_fresh(hw, cpu_off, before);
+	if (fresh) {
+		known = true;
+		shown1 = true;		/* as if the pointer were 1: the next write is bank 0 */
+		why = "fresh, the port was readable";
+	} else {
+		known = dpu_kms->colorop_igc_bank_known & pipe_bit;
+		shown1 = dpu_kms->colorop_igc_bank1 & pipe_bit;
+		why = !known ? "UNKNOWN, this load may show the previous curve" :
+		      shown1 ? "tracked, showing 1" : "tracked, showing 0";
+	}
+	bank = known ? !shown1 : 1;
+	enable_val = DPU_VIG_IGC_LUT_ENABLE | (bank << 9);
 
 	/*
 	 * The endpoint is the curve's own last sample rather than a fresh
@@ -695,20 +764,22 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 		return ret;
 	}
 
-	/*
-	 * What the port shows BEFORE the load.  Outside the load the port reads
-	 * zero in every state measured so far, including right after a load that
-	 * landed; whether it is also dark at the moment a load starts is what
-	 * separates "the port is dark" from "the load did not land" for the one
-	 * reading taken inside the commit.  The engine's program resets the index
-	 * before it writes, so moving it here costs nothing.
-	 */
-	if (report)
-		for (ch = 0; ch < DPU_VIG_IGC_CHANNELS; ch++)
-			before[ch] = dpu_vig_igc_read_entry(hw, cpu_off, ch,
-							    DPU_VIG_IGC_PROBE_INDEX);
-
 	ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, true);
+
+	/*
+	 * Record what the pipeline now shows.  A kick-off that failed may have
+	 * stopped before or after the enable, so after one the bank is not
+	 * known -- which is what the guess above is for.
+	 */
+	if (ret) {
+		dpu_kms->colorop_igc_bank_known &= ~pipe_bit;
+	} else {
+		dpu_kms->colorop_igc_bank_known |= pipe_bit;
+		if (bank)
+			dpu_kms->colorop_igc_bank1 |= pipe_bit;
+		else
+			dpu_kms->colorop_igc_bank1 &= ~pipe_bit;
+	}
 
 	if (report) {
 		u32 opmode_after, index_after, read_last[DPU_VIG_IGC_LAST_N];
@@ -725,7 +796,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 		 * it; the port shows the block's own power-up contents before the
 		 * first enable, which is what makes it a witness at all.
 		 */
-		bool port_dark = !(before[0] | before[1] | before[2]);
+		bool port_dark = !fresh;
 		int i;
 
 		/* everything that does not move the index, first */
@@ -751,7 +822,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 		}
 		DPU_REG_WRITE(hw, cpu_off + DPU_VIG_IGC_INDEX, index_after);
 
-		DRM_INFO("colorop: %s inverse gamma ctl%d | opmode %#x -> wrote %#x under keep-mask %#x -> read %#x (%s) | index %#x | dword %d of each channel: expected %#x %#x %#x read %#x %#x %#x -- %s | endpoint: wrote %#x %#x %#x read %#x %#x %#x -- %s | kick_off %d\n",
+		DRM_INFO("colorop: %s inverse gamma ctl%d | opmode %#x -> wrote %#x under keep-mask %#x -> read %#x (%s) | index %#x | dword %d of each channel: expected %#x %#x %#x read %#x %#x %#x -- %s | endpoint: wrote %#x %#x %#x read %#x %#x %#x -- %s | kick_off %d | bank: %s -> showing %u\n",
 			 sspp->cap->name, ctl->idx - CTL_0,
 			 orig_opmode, enable_val, DPU_VIG_IGC_OP_MASK, opmode_after,
 			 (opmode_after & DPU_VIG_IGC_LUT_ENABLE) ? "INVERSE GAMMA ON"
@@ -766,7 +837,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 			 (read_last[0] == last[0] && read_last[1] == last[1] &&
 			  read_last[2] == last[2]) ? "endpoint landed"
 						  : "endpoint did not land",
-			 ret);
+			 ret, why, bank);
 
 		/*
 		 * Then the WHOLE table against what was sent, on its own line so
