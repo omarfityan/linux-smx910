@@ -539,6 +539,18 @@ out:
  *   1  channels 2, 1, 0                                 position, or channel identity?
  *   2  the device's order, with the dither written after each run, between its last
  *      beat and the next index reset                   is it the index write?
+ *   3  a sacrificial 129th beat on the same port after each run (the last entry)
+ *                                                      does the next beat commit it?
+ *   4  each channel's endpoint written right after its run
+ *                                                      does the endpoint write commit it?
+ *   5  an opmode write that keeps every bit, after each run
+ *                                                      does an opmode write commit it?
+ *   6  eight dither writes after each run              is it time, or a count of writes?
+ *
+ * MEASURED (variants 0-2, fresh loads, both pipes, n=2): POSITION -- reversed, the misses move
+ * to channels 2 and 1 and channel 0, now last, lands -- and a single write in between does NOT
+ * cure it.  So a run's last beat is held pending until something specific commits it, and the
+ * next index write discards it; variants 3-6 ask what commits it.
  *
  * The dither value is the one the program writes anyway, so variant 2 changes
  * only WHEN it is written.  Judged by the whole-table report of a load into a
@@ -547,7 +559,7 @@ out:
 static int dpu_reg_dma_igc_test_program;
 module_param_named(colorop_igc_test_program, dpu_reg_dma_igc_test_program, int, 0644);
 MODULE_PARM_DESC(colorop_igc_test_program,
-	"TEST ONLY, default 0: the inverse-gamma load program's shape -- 0 channels 0,1,2 (the device's own), 1 channels 2,1,0, 2 channels 0,1,2 with the dither written after each channel's run");
+	"TEST ONLY, default 0: the inverse-gamma load program's shape -- 0 channels 0,1,2 (the device's own), 1 channels 2,1,0, 2 the dither after each run, 3 a 129th beat after each run, 4 each endpoint after its run, 5 a no-op opmode write after each run, 6 eight dither writes after each run");
 
 /* one endpoint register a channel -- the loop below indexes them by channel */
 static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
@@ -671,7 +683,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	u32 blk, cpu_off, dma_off, orig_opmode, enable_val, bank, pipe_bit;
 	bool fresh, known, shown1;
 	const char *why;
-	int ch, slot, program, ret;
+	int ch, slot, program, pad, ret;
 
 	if (!sspp->cap->sblk->igc_blk.len)
 		return -ENODEV;
@@ -778,6 +790,23 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 						lut + ch * DPU_VIG_IGC_DWORDS,
 						DPU_VIG_IGC_DWORDS);
 		if (!ret && program == 2)
+			ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_DITHER,
+						       DPU_VIG_IGC_DITHER_V6);
+		/* a sacrificial 129th beat on the same port: the last entry again */
+		if (!ret && program == 3)
+			ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_DATA +
+						       ch * sizeof(u32),
+						       lut[ch * DPU_VIG_IGC_DWORDS + DPU_VIG_IGC_DWORDS - 1]);
+		/* this channel's endpoint, written mid-program rather than last */
+		if (!ret && program == 4)
+			ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_LAST +
+						       ch * sizeof(u32), last[ch]);
+		/* an opmode write that keeps every bit: not the enable */
+		if (!ret && program == 5)
+			ret = dpu_reg_dma_single_modify(rdma, dma_off + DPU_VIG_IGC_OPMODE,
+							U32_MAX, 0);
+		/* time: eight writes before the next index reset, as the last run gets */
+		for (pad = 0; !ret && program == 6 && pad < 8; pad++)
 			ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_DITHER,
 						       DPU_VIG_IGC_DITHER_V6);
 	}
