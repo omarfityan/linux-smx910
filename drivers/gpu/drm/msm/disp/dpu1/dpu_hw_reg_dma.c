@@ -523,6 +523,32 @@ out:
 /* how many table differences a load's report names before it says "..." */
 #define DPU_VIG_IGC_REPORT_MAX		8
 
+/*
+ * A TEST SWITCH, 0 by default: the shape of the engine program that loads the
+ * inverse-gamma table.
+ *
+ * Every fresh load on record lands 382 of the 384 table words, and the two it
+ * misses are always the LAST word of channel 0 and of channel 1; channel 2's
+ * last word lands.  In the program, the runs for channels 0 and 1 are each
+ * followed at once by the next channel's index-reset write, and channel 2's by
+ * the dither write -- which fits an index rewrite that arrives before a run's
+ * final data beat has been committed, and fits nothing about the channels
+ * themselves.  The variants separate the two:
+ *
+ *   0  the device's own order: channels 0, 1, 2          (what every load has been)
+ *   1  channels 2, 1, 0                                 position, or channel identity?
+ *   2  the device's order, with the dither written after each run, between its last
+ *      beat and the next index reset                   is it the index write?
+ *
+ * The dither value is the one the program writes anyway, so variant 2 changes
+ * only WHEN it is written.  Judged by the whole-table report of a load into a
+ * fresh block, the one state in which the port can be read back.
+ */
+static int dpu_reg_dma_igc_test_program;
+module_param_named(colorop_igc_test_program, dpu_reg_dma_igc_test_program, int, 0644);
+MODULE_PARM_DESC(colorop_igc_test_program,
+	"TEST ONLY, default 0: the inverse-gamma load program's shape -- 0 channels 0,1,2 (the device's own), 1 channels 2,1,0, 2 channels 0,1,2 with the dither written after each channel's run");
+
 /* one endpoint register a channel -- the loop below indexes them by channel */
 static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
 	      "one endpoint register per channel");
@@ -645,7 +671,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	u32 blk, cpu_off, dma_off, orig_opmode, enable_val, bank, pipe_bit;
 	bool fresh, known, shown1;
 	const char *why;
-	int ch, ret;
+	int ch, slot, program, ret;
 
 	if (!sspp->cap->sblk->igc_blk.len)
 		return -ENODEV;
@@ -739,7 +765,10 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	dpu_reg_dma_buf_reset(rdma);
 	ret = dpu_reg_dma_decode_sel(rdma, blk);
 
-	for (ch = 0; ch < DPU_VIG_IGC_CHANNELS && !ret; ch++) {
+	program = READ_ONCE(dpu_reg_dma_igc_test_program);
+	for (slot = 0; slot < DPU_VIG_IGC_CHANNELS && !ret; slot++) {
+		ch = (program == 1) ? DPU_VIG_IGC_CHANNELS - 1 - slot : slot;
+
 		ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_INDEX, 0);
 		if (ret)
 			break;
@@ -748,6 +777,9 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 						ch * sizeof(u32),
 						lut + ch * DPU_VIG_IGC_DWORDS,
 						DPU_VIG_IGC_DWORDS);
+		if (!ret && program == 2)
+			ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_DITHER,
+						       DPU_VIG_IGC_DITHER_V6);
 	}
 	if (!ret)
 		ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_DITHER,
@@ -822,7 +854,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 		}
 		DPU_REG_WRITE(hw, cpu_off + DPU_VIG_IGC_INDEX, index_after);
 
-		DRM_INFO("colorop: %s inverse gamma ctl%d | opmode %#x -> wrote %#x under keep-mask %#x -> read %#x (%s) | index %#x | dword %d of each channel: expected %#x %#x %#x read %#x %#x %#x -- %s | endpoint: wrote %#x %#x %#x read %#x %#x %#x -- %s | kick_off %d | bank: %s -> showing %u\n",
+		DRM_INFO("colorop: %s inverse gamma ctl%d | opmode %#x -> wrote %#x under keep-mask %#x -> read %#x (%s) | index %#x | dword %d of each channel: expected %#x %#x %#x read %#x %#x %#x -- %s | endpoint: wrote %#x %#x %#x read %#x %#x %#x -- %s | kick_off %d | bank: %s -> showing %u | program %d\n",
 			 sspp->cap->name, ctl->idx - CTL_0,
 			 orig_opmode, enable_val, DPU_VIG_IGC_OP_MASK, opmode_after,
 			 (opmode_after & DPU_VIG_IGC_LUT_ENABLE) ? "INVERSE GAMMA ON"
@@ -837,7 +869,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 			 (read_last[0] == last[0] && read_last[1] == last[1] &&
 			  read_last[2] == last[2]) ? "endpoint landed"
 						  : "endpoint did not land",
-			 ret, why, bank);
+			 ret, why, bank, program);
 
 		/*
 		 * Then the WHOLE table against what was sent, on its own line so
