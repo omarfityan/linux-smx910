@@ -327,6 +327,50 @@ module_param_named(colorop_igc_keep_on, dpu_colorop_igc_keep_on, bool, 0644);
 MODULE_PARM_DESC(colorop_igc_keep_on,
 	"TEST ONLY, default off: leave a video pipe's inverse gamma on when no plane wants it, instead of switching it off");
 
+/*
+ * A TEST SWITCH, off by default: load every video pipe's inverse-gamma table
+ * INVERTED, each twelve-bit entry v as 4095 - v.
+ *
+ * It exists because a measurement of this block needs a THIRD table that
+ * differs from two others in the table and in nothing else.  The block has two
+ * banks, so with only two tables a bank often still holds the "new" one from an
+ * earlier load, and a load that wrote nothing can pass for one that landed.  The
+ * colour matrix is programmed fresh every commit and lives in no bank, so the
+ * third table must come with the SAME matrix -- and the compositor could not
+ * supply one: the transfer tags that survive this decode path give two such
+ * tables, and the ones that would give a third either move a luminance scale
+ * into the matrix or leave the plane path altogether.  Inverting what the
+ * compositor sent is deterministic, keeps its matrix by construction, and
+ * reproduces exactly every time.
+ *
+ * The table's id is tagged while it is on, so an inverted table is never taken
+ * for the one it was made from and a toggle is always a reload.  🔴 NOT SAFE IN
+ * GENERAL: the video is a negative while it is on.  Toggle it only while nothing
+ * is on the plane path, and turn it back off.
+ */
+static bool dpu_colorop_igc_test_invert;
+module_param_named(colorop_igc_test_invert, dpu_colorop_igc_test_invert, bool, 0644);
+MODULE_PARM_DESC(colorop_igc_test_invert,
+	"TEST ONLY, default off: load every video pipe's inverse-gamma table inverted, each entry v as 4095 - v -- a third table with the compositor's own colour matrix; the video is a negative while it is on");
+
+/* DRM object ids are positive ints, so the top bit is free to mark a transformed table */
+#define DPU_COLOROP_IGC_ID_INVERTED	BIT(31)
+
+static_assert(DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) == DPU_PLANE_IGC_DWORDS,
+	      "the inversion walks exactly the plane state's packed table");
+
+static void dpu_colorop_igc_invert(u32 *tbl)
+{
+	u32 i;
+
+	for (i = 0; i < DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2); i++) {
+		u32 lo = tbl[i] & DPU_IGC_ENTRY_MASK;
+		u32 hi = (tbl[i] >> 16) & DPU_IGC_ENTRY_MASK;
+
+		tbl[i] = (DPU_IGC_ENTRY_MASK - lo) | ((DPU_IGC_ENTRY_MASK - hi) << 16);
+	}
+}
+
 /**
  * dpu_plane_colorops_enabled - is the colour-operation path advertised at all?
  *
@@ -563,6 +607,10 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			}
 			pstate->has_pipeline_igc = true;
 			pstate->pipeline_igc_id = cs->data->base.id;
+			if (dpu_colorop_igc_test_invert) {
+				dpu_colorop_igc_invert(pstate->pipeline_igc);
+				pstate->pipeline_igc_id |= DPU_COLOROP_IGC_ID_INVERTED;
+			}
 		}
 	}
 
