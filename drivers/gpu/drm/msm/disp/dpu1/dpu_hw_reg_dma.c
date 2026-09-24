@@ -587,8 +587,8 @@ bool dpu_reg_dma_sspp_igc_is_on(struct dpu_hw_sspp *sspp)
  * @report: read the result back and log it -- true only when something changed,
  *          because this runs inside the commit and the table does not
  *
- * This is the device's own v6 sequence, transcribed at session 483 and proven
- * there to load the table: name the pipe, then per channel reset the index and
+ * This is the device's own v6 sequence, transcribed from its driver and proven
+ * on this hardware to load the table: name the pipe, then per channel reset the index and
  * push the run through the data port, then the dither, then the masked modify
  * that turns inverse gamma on, then the curve's endpoint.
  *
@@ -738,7 +738,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 		/*
 		 * Then the table itself, which is the instrument with a
 		 * demonstrated two-sided response: it showed the block's own
-		 * garbage before session 483's run and the exact expected words
+		 * garbage before the first load ever read back and the exact expected words
 		 * after.  The endpoint registers cannot do that and are reported
 		 * beside it as secondary evidence only.
 		 */
@@ -825,7 +825,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
  *
  * 🔴 TWO ROUTES, AND THE SECOND ONE IS NOT BELT AND BRACES.  The engine's masked
  * modify has been measured completing cleanly and doing nothing -- once in four
- * attempts at session 483 -- and a pipe left with inverse gamma ON and a stale
+ * attempts when first measured -- and a pipe left with inverse gamma ON and a stale
  * table is a visibly wrong picture with no obvious cause, which outlives the
  * commit that caused it.  So the engine is asked first, because that is the
  * vendor's own off path, and the result is READ BACK and corrected by the CPU

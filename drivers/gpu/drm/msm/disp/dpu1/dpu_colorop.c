@@ -559,8 +559,8 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 	u32 shape = 0;
 
 	/*
-	 * Reached at all?  Session 484 hooked this check in a function VIRTUAL
-	 * PLANES NEVER REACH and it compiled perfectly.  One line a boot is the
+	 * Reached at all?  This check was once hooked into a function VIRTUAL
+	 * PLANES NEVER REACH, and it compiled perfectly.  One line a boot is the
 	 * price of never having to wonder again.
 	 */
 	DRM_INFO_ONCE("colorop: the plane colour-pipeline check is running\n");
