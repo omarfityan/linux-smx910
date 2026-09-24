@@ -627,8 +627,17 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	 * Refuse rather than guess.  A bit set outside the mask and outside the
 	 * two being written is a bit this modify would clear and nothing would
 	 * put back -- gamut's, if anything ever programs it.
+	 *
+	 * 🔴 "AND OUTSIDE THE TWO BEING WRITTEN" IS HALF THE TEST.  The enable and
+	 * bank-select bits are this function's own, and a block that is already
+	 * on has the enable bit set.  Counting it as foreign refused EVERY reload
+	 * of a live table, and the caller's failure path then switched inverse
+	 * gamma off and latched the pipe as failed for that table -- measured: a
+	 * change of curve during playback left the video with no inverse gamma at
+	 * all, even across a power collapse.
 	 */
-	if (orig_opmode & ~DPU_VIG_IGC_OP_MASK) {
+	if (orig_opmode & ~(DPU_VIG_IGC_OP_MASK | DPU_VIG_IGC_LUT_ENABLE |
+			    DPU_VIG_IGC_LUT_SEL)) {
 		DPU_ERROR("%s: inverse-gamma opmode %#x has bits outside the mask %#x\n",
 			  sspp->cap->name, orig_opmode, DPU_VIG_IGC_OP_MASK);
 		return -EINVAL;
