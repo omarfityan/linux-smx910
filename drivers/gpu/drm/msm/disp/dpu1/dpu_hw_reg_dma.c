@@ -520,6 +520,9 @@ out:
 /* an entry chosen away from both ends, so a read-back names what it read */
 #define DPU_VIG_IGC_PROBE_INDEX		64
 
+/* how many table differences a load's report names before it says "..." */
+#define DPU_VIG_IGC_REPORT_MAX		8
+
 /* one endpoint register a channel -- the loop below indexes them by channel */
 static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
 	      "one endpoint register per channel");
@@ -711,6 +714,18 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 		u32 opmode_after, index_after, read_last[DPU_VIG_IGC_LAST_N];
 		u32 got[DPU_VIG_IGC_CHANNELS], want[DPU_VIG_IGC_CHANNELS];
 		bool table_ok = true;
+		/*
+		 * 🔴 A DARK PORT CANNOT TESTIFY.  Once this block has been enabled
+		 * since the display last powered up, its index/data port reads zero
+		 * and refuses writes -- in steady state, after a switch-off, and
+		 * before a live reload alike (measured) -- until the next power
+		 * collapse.  A read-back through it then says "did not land" for a
+		 * load the pixels show landed.  So a load that began with the port
+		 * already dark is reported UNVERIFIABLE, and only the pixels judge
+		 * it; the port shows the block's own power-up contents before the
+		 * first enable, which is what makes it a witness at all.
+		 */
+		bool port_dark = !(before[0] | before[1] | before[2]);
 		int i;
 
 		/* everything that does not move the index, first */
@@ -744,7 +759,8 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 			 index_after,
 			 DPU_VIG_IGC_PROBE_INDEX,
 			 want[0], want[1], want[2], got[0], got[1], got[2],
-			 table_ok ? "TABLE LANDED" : "TABLE DID NOT LAND",
+			 port_dark ? "TABLE UNVERIFIABLE" :
+			 table_ok  ? "TABLE LANDED" : "TABLE DID NOT LAND",
 			 last[0], last[1], last[2],
 			 read_last[0], read_last[1], read_last[2],
 			 (read_last[0] == last[0] && read_last[1] == last[1] &&
@@ -757,13 +773,21 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 		 * the line above keeps the exact form the measuring tools parse.
 		 * One dword per channel cannot tell a complete load from one whose
 		 * tail -- the top of the curve, the highlights -- did not land, and
-		 * the pixels have shown power-up-dependent behaviour there.
+		 * the pixels have shown power-up-dependent behaviour there.  EVERY
+		 * difference is named, up to DPU_VIG_IGC_REPORT_MAX: the first alone
+		 * located one of the two words a fresh load misses and hid the other.
+		 * A dark port is not compared at all -- 384 zeros say nothing.
 		 */
-		{
-			u32 as_written = 0, top_ok = 0, fc = 0, fk = 0, fw = 0, fg = 0;
-			bool any_bad = false;
-			int c, k;
+		if (port_dark) {
+			DRM_INFO("colorop: %s inverse gamma table | before the load, dword %d read %#x %#x %#x | the port was dark before the load: this block has been enabled since the display last powered up and the read-back cannot see the table -- UNVERIFIABLE, judge it by the pixels\n",
+				 sspp->cap->name, DPU_VIG_IGC_PROBE_INDEX,
+				 before[0], before[1], before[2]);
+		} else {
+			u32 as_written = 0, top_ok = 0, n_bad = 0;
+			char diffs[DPU_VIG_IGC_REPORT_MAX * 48];
+			int c, k, len = 0;
 
+			diffs[0] = '\0';
 			for (c = 0; c < DPU_VIG_IGC_CHANNELS; c++) {
 				for (k = 0; k < DPU_VIG_IGC_DWORDS; k++) {
 					u32 w = lut[c * DPU_VIG_IGC_DWORDS + k];
@@ -773,26 +797,23 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 						as_written++;
 						if (k >= DPU_VIG_IGC_DWORDS - 8)
 							top_ok++;
-					} else if (!any_bad) {
-						any_bad = true;
-						fc = c; fk = k; fw = w; fg = g;
+						continue;
 					}
+					if (n_bad++ < DPU_VIG_IGC_REPORT_MAX)
+						len += scnprintf(diffs + len, sizeof(diffs) - len,
+								 "%sch%d dword %d wrote %#x read %#x",
+								 len ? "; " : "", c, k, w, g);
 				}
 			}
 			DPU_REG_WRITE(hw, cpu_off + DPU_VIG_IGC_INDEX, index_after);
 
-			if (any_bad)
-				DRM_INFO("colorop: %s inverse gamma table | before the load, dword %d read %#x %#x %#x | after: %u of %u dwords as written, top 8 of each channel %u of %u | first difference ch%u dword %u wrote %#x read %#x\n",
-					 sspp->cap->name, DPU_VIG_IGC_PROBE_INDEX,
-					 before[0], before[1], before[2],
-					 as_written, DPU_VIG_IGC_CHANNELS * DPU_VIG_IGC_DWORDS,
-					 top_ok, DPU_VIG_IGC_CHANNELS * 8, fc, fk, fw, fg);
-			else
-				DRM_INFO("colorop: %s inverse gamma table | before the load, dword %d read %#x %#x %#x | after: %u of %u dwords as written, top 8 of each channel %u of %u | no difference\n",
-					 sspp->cap->name, DPU_VIG_IGC_PROBE_INDEX,
-					 before[0], before[1], before[2],
-					 as_written, DPU_VIG_IGC_CHANNELS * DPU_VIG_IGC_DWORDS,
-					 top_ok, DPU_VIG_IGC_CHANNELS * 8);
+			DRM_INFO("colorop: %s inverse gamma table | before the load, dword %d read %#x %#x %#x | after: %u of %u dwords as written, top 8 of each channel %u of %u | %u difference(s)%s%s%s\n",
+				 sspp->cap->name, DPU_VIG_IGC_PROBE_INDEX,
+				 before[0], before[1], before[2],
+				 as_written, DPU_VIG_IGC_CHANNELS * DPU_VIG_IGC_DWORDS,
+				 top_ok, DPU_VIG_IGC_CHANNELS * 8, n_bad,
+				 n_bad ? ": " : "", diffs,
+				 n_bad > DPU_VIG_IGC_REPORT_MAX ? "; ..." : "");
 		}
 	}
 
