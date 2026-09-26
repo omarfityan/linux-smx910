@@ -58,6 +58,12 @@
 
 #define DEFAULT_REFRESH_RATE	60
 
+/* SPIKE: a same-boot switch that makes every FP16 plane composite (see its check) */
+static bool dpu_fp16_refuse;
+module_param_named(fp16_refuse, dpu_fp16_refuse, bool, 0644);
+MODULE_PARM_DESC(fp16_refuse, "Refuse 16-bit-float framebuffers on every plane (a measurement switch)");
+static bool dpu_fp16_refuse_reported;
+
 static const uint32_t qcom_compressed_supported_formats[] = {
 	DRM_FORMAT_ABGR8888,
 	DRM_FORMAT_ARGB8888,
@@ -66,6 +72,8 @@ static const uint32_t qcom_compressed_supported_formats[] = {
 	DRM_FORMAT_ARGB2101010,
 	DRM_FORMAT_XRGB2101010,
 	DRM_FORMAT_BGR565,
+	/* offered only where a pipe lists it: sm8550 (see plane_formats_fp16) */
+	DRM_FORMAT_ABGR16161616F,
 
 	DRM_FORMAT_NV12,
 	DRM_FORMAT_P010,
@@ -901,7 +909,8 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 			 plane->name,
 			 &new_plane_state->fb->format->format,
 			 fb_fmt && MSM_FORMAT_IS_YUV(fb_fmt) ? "YUV" : "RGB",
-			 fb_fmt && MSM_FORMAT_IS_DX(fb_fmt) ? " 10-bit" : "",
+			 fb_fmt && MSM_FORMAT_IS_DX(fb_fmt) ? " 10-bit" :
+			 fb_fmt && MSM_FORMAT_IS_FP16(fb_fmt) ? " 16-bit float" : "",
 			 fb_fmt && MSM_FORMAT_IS_UBWC(fb_fmt) ? " UBWC" : "",
 			 new_plane_state->fb->width,
 			 new_plane_state->fb->height);
@@ -994,6 +1003,34 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	pstate->has_pipeline_csc = dpu_plane_colorop_csc(new_plane_state->state,
 							new_plane_state,
 							&pstate->pipeline_csc);
+
+	/*
+	 * SPIKE: refuse every 16-bit-float framebuffer while msm.fp16_refuse is
+	 * set, so the compositor composes it -- the "composited" arm of a
+	 * same-boot power bracket against the scanned-out one.
+	 */
+	if (dpu_fp16_refuse &&
+	    MSM_FORMAT_IS_FP16(msm_framebuffer_format(new_plane_state->fb))) {
+		if (!dpu_fp16_refuse_reported) {
+			DRM_INFO("fp16: refusing 16-bit-float framebuffers (msm.fp16_refuse=1)\n");
+			dpu_fp16_refuse_reported = true;
+		}
+		return -EINVAL;
+	}
+	dpu_fp16_refuse_reported = false;
+
+	/*
+	 * The pipe enables its colour matrix for YUV sources only
+	 * (dpu_hw_setup_format_impl), so a matrix in force on an RGB or
+	 * 16-bit-float buffer would be accepted here and never applied.  Refuse:
+	 * the compositor then composes the frame, which is slower and correct.
+	 */
+	if (pstate->has_pipeline_csc &&
+	    !MSM_FORMAT_IS_YUV(msm_framebuffer_format(new_plane_state->fb))) {
+		DRM_INFO_ONCE("colorop: %s refused: a colour matrix in force on an RGB buffer is never applied by this pipe\n",
+			      plane->name);
+		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -1329,7 +1366,14 @@ static int dpu_plane_assign_resource_in_stage(struct dpu_sw_pipe *pipe,
 	if (drm_rect_width(&r_pipe_cfg->src_rect) == 0)
 		return 0;
 
-	if (dpu_plane_try_multirect_parallel(pipe, pipe_cfg, r_pipe, r_pipe_cfg,
+	/*
+	 * A VIG pipe's inverse gamma and colour matrix belong to its FIRST rect
+	 * (this device's tree puts them under vcm@0; vcm@1 has none), and the
+	 * layer-mixer CRC shows the second rect of such a pipe scanned out
+	 * untransformed.  A plane carrying a colour pipeline gets a pipe per half.
+	 */
+	if (!reqs->colorop &&
+	    dpu_plane_try_multirect_parallel(pipe, pipe_cfg, r_pipe, r_pipe_cfg,
 					      pipe->sspp,
 					      msm_framebuffer_format(plane_state->fb),
 					      dpu_kms->catalog->caps->max_linewidth))
@@ -1384,7 +1428,9 @@ static int dpu_plane_virtual_assign_resources(struct drm_crtc *crtc,
 	reqs.colorop = pstate->has_pipeline_csc || pstate->has_pipeline_igc;
 
 	for (i = 0; i < STAGES_PER_PLANE; i++) {
-		if (prev_adjacent_pstate[i] &&
+		if (prev_adjacent_pstate[i] && !reqs.colorop &&
+		    !prev_adjacent_pstate[i]->has_pipeline_csc &&
+		    !prev_adjacent_pstate[i]->has_pipeline_igc &&
 		    dpu_plane_try_multirect_shared(pstate, prev_adjacent_pstate[i], fmt,
 						   dpu_kms->catalog->caps->max_linewidth,
 						   i))

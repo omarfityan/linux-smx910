@@ -255,6 +255,26 @@ static void dpu_hw_sspp_setup_format(struct dpu_sw_pipe *pipe,
 			      hbb << 18);
 	}
 
+	/*
+	 * The pipe's 16-bit-float chain (unmultiply, inverse gamma, colour matrix,
+	 * gamma) is one control register, declared by this device's own device
+	 * tree at pipe + 0x200 (qcom,sde-fp16-*), + 0x280 for a VIG pipe's second
+	 * rect; both rects of a DMA pipe name 0x200.  Held at 0 -- every stage off
+	 * -- so the fetch is measured bare.  Its value before the first write is
+	 * not known from any source, so it is reported once per pipe and rect.
+	 */
+	if (MSM_FORMAT_IS_FP16(fmt)) {
+		static unsigned long reported;
+		bool rect1 = pipe->multirect_index == DPU_SSPP_RECT_1;
+		u32 off = (rect1 && ctx->cap->type == SSPP_TYPE_VIG) ? 0x280 : 0x200;
+		unsigned int bit = ctx->idx * 2 + rect1;
+
+		if (bit < BITS_PER_LONG && !test_and_set_bit(bit, &reported))
+			DRM_INFO("fp16: %s rect%d control @%#x read %#x before the first write of 0\n",
+				 ctx->cap->name, rect1, off, DPU_REG_READ(&ctx->hw, off));
+		DPU_REG_WRITE(&ctx->hw, off, 0);
+	}
+
 	dpu_hw_setup_format_impl(pipe, fmt, flags, ctx, op_mode_off,
 				 unpack_pat_off, format_off,
 				 ubwc_ctrl_off, ubwc_error_off);
@@ -305,8 +325,17 @@ void dpu_hw_setup_format_impl(struct dpu_sw_pipe *pipe, const struct msm_format 
 		(fmt->element[1] << 8) | (fmt->element[0] << 0);
 	src_format |= ((fmt->unpack_count - 1) << 12) |
 		((fmt->flags & MSM_FORMAT_FLAG_UNPACK_TIGHT ? 1 : 0) << 17) |
-		((fmt->flags & MSM_FORMAT_FLAG_UNPACK_ALIGN_MSB ? 1 : 0) << 18) |
-		((fmt->bpp - 1) << 9);
+		((fmt->flags & MSM_FORMAT_FLAG_UNPACK_ALIGN_MSB ? 1 : 0) << 18);
+
+	/*
+	 * The bpp field is two bits wide (9-10).  For an 8-byte pixel (bpp - 1) << 9
+	 * would set bit 11, which is ROT90; this device's own driver encodes 16-bit
+	 * float as the 4-byte field plus bit 16.
+	 */
+	if (MSM_FORMAT_IS_FP16(fmt))
+		src_format |= BIT(16) | (3 << 9);
+	else
+		src_format |= (fmt->bpp - 1) << 9;
 
 	if (fmt->fetch_mode != MDP_FETCH_LINEAR) {
 		u32 hbb = ctx->ubwc->highest_bank_bit - 13;
