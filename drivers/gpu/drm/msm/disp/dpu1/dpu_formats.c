@@ -115,8 +115,28 @@ static int _dpu_format_populate_plane_sizes_ubwc(
 			uv_meta_scanlines, DPU_UBWC_PLANE_SIZE_ALIGNMENT);
 	} else {
 		unsigned int rgb_scanlines, rgb_meta_scanlines, rgb_meta_stride;
+		unsigned int meta_tile_width = 16;
 
 		layout->plane_pitch[0] = round_up(fb->width * fmt->bpp, 256);
+
+		/*
+		 * 8-byte pixels: the tiled pitch is aligned to 64 texels (512 B) and
+		 * the UBWC block is 8x4, per Mesa's fd6_layout.c -- the allocator of
+		 * every such buffer here.  At 4 bytes both rules equal the ones above
+		 * (256 B = 64 texels), which is why they never disagreed before.  The
+		 * pitch is never read from the framebuffer on this path, so a buffer
+		 * laid out any other way is refused rather than fetched wrong.
+		 */
+		if (MSM_FORMAT_IS_FP16(fmt)) {
+			layout->plane_pitch[0] = round_up(fb->width * fmt->bpp, 512);
+			meta_tile_width = 8;
+			if (fb->pitches[0] != layout->plane_pitch[0]) {
+				DRM_INFO_ONCE("fp16: UBWC framebuffer pitch %u, expected %u -- refused\n",
+					 fb->pitches[0], layout->plane_pitch[0]);
+				return -EINVAL;
+			}
+		}
+
 		rgb_scanlines = round_up(fb->height, 16);
 		layout->plane_size[0] = round_up(layout->plane_pitch[0] *
 			rgb_scanlines, DPU_UBWC_PLANE_SIZE_ALIGNMENT);
@@ -127,7 +147,7 @@ static int _dpu_format_populate_plane_sizes_ubwc(
 		/* uAPI leaves plane[1] empty and plane[2] as meta */
 		layout->num_planes += 1;
 
-		rgb_meta_stride = DIV_ROUND_UP(fb->width, 16);
+		rgb_meta_stride = DIV_ROUND_UP(fb->width, meta_tile_width);
 		layout->plane_pitch[2] = round_up(rgb_meta_stride, 64);
 
 		rgb_meta_scanlines = DIV_ROUND_UP(fb->height, 4);
