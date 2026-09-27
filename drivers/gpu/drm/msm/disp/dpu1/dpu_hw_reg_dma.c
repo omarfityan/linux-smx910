@@ -556,6 +556,17 @@ out:
  * default: 1 runs it as it was, so the loss it causes can be shown in the same
  * boot as the fix.
  */
+/*
+ * SPIKE, TEST ONLY: the dither word written beside the table. -1 (default) keeps DPU_VIG_IGC_DITHER_OFF
+ * (0, the fix); 0x16 (enable + strength 6, the old self-test sentinel) reproduces the defect in the same
+ * boot as the fix -- the in-boot control. 0x10 (enable, strength 0) is NOT off. Takes effect at the next
+ * table load; every load logs the word it wrote.
+ */
+static int dpu_reg_dma_igc_dither = -1;
+module_param_named(colorop_igc_dither, dpu_reg_dma_igc_dither, int, 0644);
+MODULE_PARM_DESC(colorop_igc_dither,
+	"TEST ONLY, default -1 (0, off): the inverse-gamma dither word written with each table load; 22 (0x16) reproduces the old defect");
+
 static int dpu_reg_dma_igc_test_program;
 module_param_named(colorop_igc_test_program, dpu_reg_dma_igc_test_program, int, 0644);
 MODULE_PARM_DESC(colorop_igc_test_program,
@@ -789,9 +800,14 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 			ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_LAST +
 						       ch * sizeof(u32), last[ch]);
 	}
-	if (!ret)
-		ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_DITHER,
-					       DPU_VIG_IGC_DITHER_OFF);
+	if (!ret) {
+		u32 dither = dpu_reg_dma_igc_dither >= 0 ? (u32)dpu_reg_dma_igc_dither
+							 : DPU_VIG_IGC_DITHER_OFF;
+
+		DRM_INFO("colorop: %s inverse gamma dither word %#x (%s)\n", sspp->cap->name, dither,
+			 dpu_reg_dma_igc_dither >= 0 ? "colorop_igc_dither" : "default");
+		ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_DITHER, dither);
+	}
 	if (!ret)
 		ret = dpu_reg_dma_single_modify(rdma, dma_off + DPU_VIG_IGC_OPMODE,
 						DPU_VIG_IGC_OP_MASK, enable_val);

@@ -349,6 +349,45 @@ MODULE_PARM_DESC(colorop_igc_test_invert,
 /* DRM object ids are positive ints, so the top bit is free to mark a transformed table */
 #define DPU_COLOROP_IGC_ID_INVERTED	BIT(31)
 
+/*
+ * SPIKE, TEST ONLY: load a KNOWN table -- a DRM-space identity, converted exactly as a compositor's
+ * table is -- in place of the compositor's, so the plane's output for input v can be checked against
+ * v itself (resampled: code == v at every v; its dword 64 reads 0x08100800, slots 2048 and 2064). With
+ * the invert switch as well, the identity is loaded inverted. Toggle it only while nothing is on the
+ * plane path.
+ */
+static bool dpu_colorop_igc_test_identity;
+module_param_named(colorop_igc_test_identity, dpu_colorop_igc_test_identity, bool, 0644);
+MODULE_PARM_DESC(colorop_igc_test_identity,
+	"TEST ONLY, default off: load an identity inverse-gamma table in place of the compositor's");
+
+#define DPU_COLOROP_IGC_ID_IDENTITY	BIT(30)
+
+static void dpu_colorop_igc_identity(u32 *tbl, u32 *last)
+{
+	/*
+	 * A DRM-space identity -- entry j = j / 255 at full scale, exactly what a
+	 * compositor would send for "no change" -- pushed through the SAME
+	 * conversion the compositor's table takes, so an arm with this switch
+	 * tests the conversion, never the switch's own arithmetic.
+	 */
+	u32 ident[DPU_IGC_LUT_LEN];
+	u16 slots[DPU_IGC_SLOTS], endpoint;
+	u32 ch, i;
+
+	for (i = 0; i < DPU_IGC_LUT_LEN; i++)
+		ident[i] = (u32)div_u64((u64)i * 0xffffffffull + (DPU_IGC_LUT_LEN - 1) / 2,
+					DPU_IGC_LUT_LEN - 1);
+	dpu_igc_convert_channel(ident, 1, DPU_IGC_LUT_LEN, slots, &endpoint);
+	for (ch = 0; ch < DPU_IGC_CHANNELS; ch++) {
+		for (i = 0; i < DPU_IGC_LUT_LEN / 2; i++)
+			tbl[ch * (DPU_IGC_LUT_LEN / 2) + i] =
+				(slots[2 * i] & DPU_IGC_ENTRY_MASK) |
+				((slots[2 * i + 1] & DPU_IGC_ENTRY_MASK) << 16);
+		last[ch] = endpoint & DPU_IGC_ENTRY_MASK;
+	}
+}
+
 static_assert(DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) == DPU_PLANE_IGC_DWORDS,
 	      "the inversion walks exactly the plane state's packed table");
 static_assert(DPU_IGC_CHANNELS == DPU_PLANE_IGC_CHANNELS, "one endpoint per channel");
@@ -606,6 +645,11 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			}
 			pstate->has_pipeline_igc = true;
 			pstate->pipeline_igc_id = cs->data->base.id;
+			if (dpu_colorop_igc_test_identity) {
+				dpu_colorop_igc_identity(pstate->pipeline_igc,
+							 pstate->pipeline_igc_last);
+				pstate->pipeline_igc_id |= DPU_COLOROP_IGC_ID_IDENTITY;
+			}
 			if (dpu_colorop_igc_test_invert) {
 				dpu_colorop_igc_invert(pstate->pipeline_igc,
 						       pstate->pipeline_igc_last);
