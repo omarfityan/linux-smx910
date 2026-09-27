@@ -506,7 +506,18 @@ out:
 #define DPU_VIG_IGC_INDEX		0x1b0
 #define DPU_VIG_IGC_DATA		0x1b4
 #define DPU_VIG_IGC_DITHER		0x1c0
-#define DPU_VIG_IGC_DITHER_V6		0x16
+/*
+ * 🔴 DITHER OFF -- the vendor's value unless its client asks for dither
+ * (sde_hw_reg_dma_v1_color_proc.c: strength | BIT(4) only on IGC_DITHER_ENABLE,
+ * else 0), and a DRM colour pipeline has no way to ask.  This used to be 0x16
+ * (enable + strength 6): the 482 register self-test's SENTINEL, carried into
+ * every table load.  Measured in the pixels (the layer-mixer CRC decoded on
+ * the grey dictionary): with 0x16 no plane grey below a PQ curve's clip was a
+ * solid ten-bit value, black was lifted and white arrived late; with 0 every
+ * grey was solid, black exact, and the clip where the curve puts it.  0x10
+ * (enable, strength 0) is NOT off: it still moved most outputs.
+ */
+#define DPU_VIG_IGC_DITHER_OFF		0
 
 /* the separately held endpoint, one register a channel */
 #define DPU_VIG_IGC_LAST		0x1c4
@@ -780,7 +791,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	}
 	if (!ret)
 		ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_DITHER,
-					       DPU_VIG_IGC_DITHER_V6);
+					       DPU_VIG_IGC_DITHER_OFF);
 	if (!ret)
 		ret = dpu_reg_dma_single_modify(rdma, dma_off + DPU_VIG_IGC_OPMODE,
 						DPU_VIG_IGC_OP_MASK, enable_val);
