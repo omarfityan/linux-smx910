@@ -356,6 +356,32 @@ MODULE_PARM_DESC(colorop_igc_test_invert,
 /* DRM object ids are positive ints, so the top bit is free to mark a transformed table */
 #define DPU_COLOROP_IGC_ID_INVERTED	BIT(31)
 
+/*
+ * SPIKE, TEST ONLY: load a KNOWN table -- the identity, entry i = round(i * 4095 / 255) on every
+ * channel -- in place of the compositor's, so the block's own input -> output relation can be read
+ * off the pixels. With the invert switch as well, the identity is loaded inverted. Toggle it only
+ * while nothing is on the plane path.
+ */
+static bool dpu_colorop_igc_test_identity;
+module_param_named(colorop_igc_test_identity, dpu_colorop_igc_test_identity, bool, 0644);
+MODULE_PARM_DESC(colorop_igc_test_identity,
+	"TEST ONLY, default off: load an identity inverse-gamma table in place of the compositor's");
+
+#define DPU_COLOROP_IGC_ID_IDENTITY	BIT(30)
+
+static void dpu_colorop_igc_identity(u32 *tbl)
+{
+	u32 ch, i;
+
+	for (ch = 0; ch < DPU_IGC_CHANNELS; ch++)
+		for (i = 0; i < DPU_IGC_LUT_LEN / 2; i++) {
+			u32 lo = DIV_ROUND_CLOSEST(2 * i * DPU_IGC_ENTRY_MASK, DPU_IGC_LUT_LEN - 1);
+			u32 hi = DIV_ROUND_CLOSEST((2 * i + 1) * DPU_IGC_ENTRY_MASK, DPU_IGC_LUT_LEN - 1);
+
+			tbl[ch * (DPU_IGC_LUT_LEN / 2) + i] = lo | (hi << 16);
+		}
+}
+
 static_assert(DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) == DPU_PLANE_IGC_DWORDS,
 	      "the inversion walks exactly the plane state's packed table");
 
@@ -607,6 +633,10 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			}
 			pstate->has_pipeline_igc = true;
 			pstate->pipeline_igc_id = cs->data->base.id;
+			if (dpu_colorop_igc_test_identity) {
+				dpu_colorop_igc_identity(pstate->pipeline_igc);
+				pstate->pipeline_igc_id |= DPU_COLOROP_IGC_ID_IDENTITY;
+			}
 			if (dpu_colorop_igc_test_invert) {
 				dpu_colorop_igc_invert(pstate->pipeline_igc);
 				pstate->pipeline_igc_id |= DPU_COLOROP_IGC_ID_INVERTED;
