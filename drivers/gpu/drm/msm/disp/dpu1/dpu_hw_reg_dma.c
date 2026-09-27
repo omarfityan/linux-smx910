@@ -646,6 +646,8 @@ bool dpu_reg_dma_sspp_igc_is_on(struct dpu_hw_sspp *sspp)
 /**
  * dpu_reg_dma_program_sspp_igc - load and enable a video pipe's inverse-gamma table
  * @lut:    DPU_VIG_IGC_CHANNELS * DPU_VIG_IGC_DWORDS dwords, channel-major
+ * @last:   DPU_VIG_IGC_LAST_N endpoint values, one a channel, from the same
+ *          conversion as @lut (the block's grid is not DRM's)
  * @report: read the result back and log it -- true only when something changed,
  *          because this runs inside the commit and the table does not
  *
@@ -664,10 +666,9 @@ bool dpu_reg_dma_sspp_igc_is_on(struct dpu_hw_sspp *sspp)
  */
 int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 				 struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,
-				 const u32 *lut, bool report)
+				 const u32 *lut, const u32 *last, bool report)
 {
 	struct dpu_hw_blk_reg_map *hw = &sspp->hw;
-	u32 last[DPU_VIG_IGC_LAST_N];
 	u32 before[DPU_VIG_IGC_CHANNELS] = {};
 	u32 blk, cpu_off, dma_off, orig_opmode, enable_val, bank, pipe_bit;
 	bool fresh, known, shown1;
@@ -754,15 +755,11 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	enable_val = DPU_VIG_IGC_LUT_ENABLE | (bank << 9);
 
 	/*
-	 * The endpoint is the curve's own last sample rather than a fresh
-	 * number: with 256 entries against this block's 257 knots, repeating the
-	 * top entry makes the final segment flat, where leaving it at zero would
-	 * crush the top of the tone curve toward black.
+	 * The endpoint (@last) is the 257th knot, at input 1024: it comes from the
+	 * conversion that resampled the curve onto this block's grid, so input
+	 * 1023 lands on the curve's own last value (dpu_colorop_igc.h).  It used
+	 * to repeat the top slot -- right only while the slots were copied 1:1.
 	 */
-	for (ch = 0; ch < DPU_VIG_IGC_CHANNELS; ch++)
-		last[ch] = (lut[ch * DPU_VIG_IGC_DWORDS + DPU_VIG_IGC_DWORDS - 1] >> 16) &
-			   DPU_VIG_IGC_ENTRY_MASK;
-
 	dpu_reg_dma_buf_reset(rdma);
 	ret = dpu_reg_dma_decode_sel(rdma, blk);
 

@@ -30,7 +30,8 @@
  * @layout:     framebuffer memory layout
  */
 /* three channels of 256 twelve-bit entries, packed two to a dword */
-#define DPU_PLANE_IGC_DWORDS	(3 * 128)
+#define DPU_PLANE_IGC_CHANNELS	3
+#define DPU_PLANE_IGC_DWORDS	(DPU_PLANE_IGC_CHANNELS * 128)
 
 struct dpu_plane_state {
 	struct drm_plane_state base;
@@ -70,6 +71,12 @@ struct dpu_plane_state {
 	bool has_pipeline_igc;
 	u32 pipeline_igc_id;
 	u32 pipeline_igc[DPU_PLANE_IGC_DWORDS];
+	/*
+	 * The endpoint register past each channel's last slot. It comes out of
+	 * the same conversion as the table (dpu_colorop_igc.h) -- the block's
+	 * grid is not DRM's, so it is not simply the table's last entry.
+	 */
+	u32 pipeline_igc_last[DPU_PLANE_IGC_CHANNELS];
 
 	/*
 	 * What the compositor put in the pipeline, as booleans, purely so a

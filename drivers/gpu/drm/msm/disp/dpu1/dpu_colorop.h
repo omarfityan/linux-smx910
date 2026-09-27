@@ -15,7 +15,7 @@ struct dpu_hw_ctl;
 
 int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
 			   struct dpu_csc_cfg *cfg);
-int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out);
+int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out, u32 *last);
 
 bool dpu_plane_colorops_enabled(void);
 int dpu_plane_init_colorops(struct drm_plane *plane, bool has_blocks);

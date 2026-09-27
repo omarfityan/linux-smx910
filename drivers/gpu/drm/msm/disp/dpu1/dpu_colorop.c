@@ -47,6 +47,7 @@
 #include "dpu_hw_catalog.h"
 #include "dpu_hw_reg_dma.h"
 #include "dpu_hw_sspp.h"
+#include "dpu_colorop_igc.h"
 #include "dpu_kms.h"
 #include "dpu_plane.h"
 
@@ -230,15 +231,22 @@ int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
  * dpu_colorop_lut_to_igc - convert a DRM 1D LUT into the pipe's packed table
  * @blob: the DATA blob of a DRM_COLOROP_1D_LUT colorop
  * @out:  DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) dwords to fill
+ * @last: DPU_IGC_CHANNELS endpoint values to fill
  *
- * DRM sends drm_color_lut32 -- 32 bits per channel.  The block stores twelve,
- * two entries to a dword, one table per channel.
+ * DRM sends drm_color_lut32 -- 32 bits per channel, entries spread uniformly
+ * over the input range.  The block stores twelve bits, two entries to a dword,
+ * one table per channel, and reads slot i at ten-bit input 4i with a separate
+ * endpoint past the last slot: so each channel is RESAMPLED onto the block's
+ * grid (dpu_colorop_igc.h, host-tested against the block's measured
+ * behaviour), never copied slot for slot -- copied, every curve was read 0.3 %
+ * compressed, several codes near a PQ curve's knee.
  *
  * Return: 0 on success, -EINVAL if the blob is the wrong size.
  */
-int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out)
+int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out, u32 *last)
 {
 	const struct drm_color_lut32 *lut;
+	u16 slots[DPU_IGC_SLOTS], endpoint;
 	u32 ch, i;
 
 	if (!blob || blob->length != DPU_IGC_LUT_LEN * sizeof(struct drm_color_lut32))
@@ -249,29 +257,14 @@ int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out)
 	for (ch = 0; ch < DPU_IGC_CHANNELS; ch++) {
 		u32 *tbl = out + ch * (DPU_IGC_LUT_LEN / 2);
 
-		for (i = 0; i < DPU_IGC_LUT_LEN / 2; i++) {
-			u32 lo, hi;
-
-			switch (ch) {
-			case 0:
-				lo = lut[2 * i].red;
-				hi = lut[2 * i + 1].red;
-				break;
-			case 1:
-				lo = lut[2 * i].green;
-				hi = lut[2 * i + 1].green;
-				break;
-			default:
-				lo = lut[2 * i].blue;
-				hi = lut[2 * i + 1].blue;
-				break;
-			}
-
-			lo >>= 32 - DPU_IGC_ENTRY_BITS;
-			hi >>= 32 - DPU_IGC_ENTRY_BITS;
-			tbl[i] = (lo & DPU_IGC_ENTRY_MASK) |
-				 ((hi & DPU_IGC_ENTRY_MASK) << 16);
-		}
+		/* red, green and blue are consecutive u32s of each drm_color_lut32 */
+		dpu_igc_convert_channel(&lut[0].red + ch,
+					sizeof(struct drm_color_lut32) / sizeof(u32),
+					DPU_IGC_LUT_LEN, slots, &endpoint);
+		for (i = 0; i < DPU_IGC_LUT_LEN / 2; i++)
+			tbl[i] = (slots[2 * i] & DPU_IGC_ENTRY_MASK) |
+				 ((slots[2 * i + 1] & DPU_IGC_ENTRY_MASK) << 16);
+		last[ch] = endpoint & DPU_IGC_ENTRY_MASK;
 	}
 
 	return 0;
@@ -358,8 +351,10 @@ MODULE_PARM_DESC(colorop_igc_test_invert,
 
 static_assert(DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) == DPU_PLANE_IGC_DWORDS,
 	      "the inversion walks exactly the plane state's packed table");
+static_assert(DPU_IGC_CHANNELS == DPU_PLANE_IGC_CHANNELS, "one endpoint per channel");
+static_assert(DPU_IGC_LUT_LEN == DPU_IGC_SLOTS, "the conversion fills exactly the block's slots");
 
-static void dpu_colorop_igc_invert(u32 *tbl)
+static void dpu_colorop_igc_invert(u32 *tbl, u32 *last)
 {
 	u32 i;
 
@@ -369,6 +364,9 @@ static void dpu_colorop_igc_invert(u32 *tbl)
 
 		tbl[i] = (DPU_IGC_ENTRY_MASK - lo) | ((DPU_IGC_ENTRY_MASK - hi) << 16);
 	}
+	/* the endpoint is part of the curve: inverted the same way */
+	for (i = 0; i < DPU_IGC_CHANNELS; i++)
+		last[i] = DPU_IGC_ENTRY_MASK - (last[i] & DPU_IGC_ENTRY_MASK);
 }
 
 /**
@@ -601,14 +599,16 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 		if (cs->data)
 			shape |= DPU_COLOROP_SHAPE_IGC_DATA;
 		if (!cs->bypass && cs->data) {
-			if (dpu_colorop_lut_to_igc(cs->data, pstate->pipeline_igc)) {
+			if (dpu_colorop_lut_to_igc(cs->data, pstate->pipeline_igc,
+						   pstate->pipeline_igc_last)) {
 				DPU_ERROR("inverse-gamma table is not the size this pipe takes\n");
 				return -EINVAL;
 			}
 			pstate->has_pipeline_igc = true;
 			pstate->pipeline_igc_id = cs->data->base.id;
 			if (dpu_colorop_igc_test_invert) {
-				dpu_colorop_igc_invert(pstate->pipeline_igc);
+				dpu_colorop_igc_invert(pstate->pipeline_igc,
+						       pstate->pipeline_igc_last);
 				pstate->pipeline_igc_id |= DPU_COLOROP_IGC_ID_INVERTED;
 			}
 		}
@@ -757,7 +757,8 @@ void dpu_colorop_crtc_flush(struct drm_crtc *crtc, struct dpu_hw_ctl *ctl)
 				continue;
 
 			ret = dpu_reg_dma_program_sspp_igc(dpu_kms, rdma, ctl, sspp,
-							   pstate->pipeline_igc, true);
+							   pstate->pipeline_igc,
+							   pstate->pipeline_igc_last, true);
 			dpu_kms->colorop_igc_lut_id[sspp->idx] = pstate->pipeline_igc_id;
 			if (ret) {
 				/*

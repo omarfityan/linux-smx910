@@ -108,7 +108,7 @@ u32 dpu_reg_dma_blk_for_sspp(enum dpu_sspp id);
 bool dpu_reg_dma_sspp_igc_is_on(struct dpu_hw_sspp *sspp);
 int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 				 struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,
-				 const u32 *lut, bool report);
+				 const u32 *lut, const u32 *last, bool report);
 int dpu_reg_dma_disable_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 				 struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp);
 
