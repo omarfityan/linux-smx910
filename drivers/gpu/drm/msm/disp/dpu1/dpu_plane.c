@@ -1004,6 +1004,19 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 							new_plane_state,
 							&pstate->pipeline_csc);
 
+	/*
+	 * The pipe enables its colour matrix for YUV sources only (dpu_hw_setup_format_impl; this
+	 * device's own driver does the same), so a matrix in force on an RGB or 16-bit-float buffer would
+	 * be loaded and never applied. Refuse it: the compositor then composes the frame, slower and
+	 * correct. (A bypassed matrix leaves has_pipeline_csc false and is not refused.)
+	 */
+	if (pstate->has_pipeline_csc &&
+	    !MSM_FORMAT_IS_YUV(msm_framebuffer_format(new_plane_state->fb))) {
+		DRM_INFO_ONCE("colorop: %s refused: a colour matrix in force on an RGB buffer is never applied by this pipe\n",
+			      plane->name);
+		return -EINVAL;
+	}
+
 	return 0;
 }
 
@@ -1338,7 +1351,12 @@ static int dpu_plane_assign_resource_in_stage(struct dpu_sw_pipe *pipe,
 	if (drm_rect_width(&r_pipe_cfg->src_rect) == 0)
 		return 0;
 
-	if (dpu_plane_try_multirect_parallel(pipe, pipe_cfg, r_pipe, r_pipe_cfg,
+	/*
+	 * A video pipe's colour blocks belong to its FIRST rect (this device's tree puts them under
+	 * vcm@0; vcm@1 has none), and the layer-mixer CRC showed the second rect of such a pipe scanned
+	 * out untransformed. A plane carrying a colour pipeline gets a pipe per half.
+	 */
+	if (!reqs->colorop && dpu_plane_try_multirect_parallel(pipe, pipe_cfg, r_pipe, r_pipe_cfg,
 					      pipe->sspp,
 					      msm_framebuffer_format(plane_state->fb),
 					      dpu_kms->catalog->caps->max_linewidth))
@@ -1393,7 +1411,9 @@ static int dpu_plane_virtual_assign_resources(struct drm_crtc *crtc,
 	reqs.colorop = pstate->has_pipeline_csc || pstate->has_pipeline_igc;
 
 	for (i = 0; i < STAGES_PER_PLANE; i++) {
-		if (prev_adjacent_pstate[i] &&
+		if (prev_adjacent_pstate[i] && !reqs.colorop &&
+		    !prev_adjacent_pstate[i]->has_pipeline_csc &&
+		    !prev_adjacent_pstate[i]->has_pipeline_igc &&
 		    dpu_plane_try_multirect_shared(pstate, prev_adjacent_pstate[i], fmt,
 						   dpu_kms->catalog->caps->max_linewidth,
 						   i))
