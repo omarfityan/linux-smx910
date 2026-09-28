@@ -75,6 +75,9 @@
 #define SSPP_EXCL_REC_XY                   0x1B8
 #define SSPP_UBWC_STATIC_CTRL_REC1         0x1c0
 #define SSPP_UBWC_ERROR_STATUS_REC1        0x1c8
+/* the 16-bit-float chain's control register (this device's tree: qcom,sde-fp16-*) */
+#define DPU_SSPP_FP16_CTRL                 0x200
+#define DPU_SSPP_FP16_CTRL_REC1            0x280	/* a video pipe's second rect; DMA pipes name 0x200 for both */
 #define SSPP_CLK_CTRL                      0x330
 
 /* SSPP_SRC_OP_MODE & OP_MODE_REC1 */
@@ -254,6 +257,18 @@ static void dpu_hw_sspp_setup_format(struct dpu_sw_pipe *pipe,
 		DPU_REG_WRITE(&ctx->hw, SSPP_FETCH_CONFIG,
 			      DPU_FETCH_CONFIG_RESET_VALUE |
 			      hbb << 18);
+	}
+
+	/*
+	 * The pipe's 16-bit-float chain -- unmultiply, inverse gamma, matrix, gamma -- is one control
+	 * register. Every stage is written OFF on every 16-bit-float programming, so what the fetch
+	 * delivers never depends on what the register held before: power-on, a resume, an earlier client.
+	 */
+	if (MSM_FORMAT_IS_FP16(fmt)) {
+		bool rect1 = pipe->multirect_index == DPU_SSPP_RECT_1;
+
+		DPU_REG_WRITE(&ctx->hw, (rect1 && ctx->cap->type == SSPP_TYPE_VIG) ?
+			      DPU_SSPP_FP16_CTRL_REC1 : DPU_SSPP_FP16_CTRL, 0);
 	}
 
 	dpu_hw_setup_format_impl(pipe, fmt, flags, ctx, op_mode_off,
