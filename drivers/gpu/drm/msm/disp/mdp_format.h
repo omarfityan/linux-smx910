@@ -16,6 +16,7 @@ enum msm_format_flags {
 	MSM_FORMAT_FLAG_COMPRESSED_BIT,
 	MSM_FORMAT_FLAG_UNPACK_TIGHT_BIT,
 	MSM_FORMAT_FLAG_UNPACK_ALIGN_MSB_BIT,
+	MSM_FORMAT_FLAG_FP16_BIT,
 };
 
 #define MSM_FORMAT_FLAG_YUV		BIT(MSM_FORMAT_FLAG_YUV_BIT)
@@ -23,6 +24,8 @@ enum msm_format_flags {
 #define MSM_FORMAT_FLAG_COMPRESSED	BIT(MSM_FORMAT_FLAG_COMPRESSED_BIT)
 #define MSM_FORMAT_FLAG_UNPACK_TIGHT	BIT(MSM_FORMAT_FLAG_UNPACK_TIGHT_BIT)
 #define MSM_FORMAT_FLAG_UNPACK_ALIGN_MSB BIT(MSM_FORMAT_FLAG_UNPACK_ALIGN_MSB_BIT)
+/* 16-bit float per channel -- NOT a DX format: both scalers key a register bit on DX */
+#define MSM_FORMAT_FLAG_FP16		BIT(MSM_FORMAT_FLAG_FP16_BIT)
 
 /*
  * DPU HW,Component order color map
@@ -70,6 +73,7 @@ struct msm_format {
 
 #define MSM_FORMAT_IS_YUV(X)		((X)->flags & MSM_FORMAT_FLAG_YUV)
 #define MSM_FORMAT_IS_DX(X)		((X)->flags & MSM_FORMAT_FLAG_DX)
+#define MSM_FORMAT_IS_FP16(X)		((X)->flags & MSM_FORMAT_FLAG_FP16)
 #define MSM_FORMAT_IS_LINEAR(X)		((X)->fetch_mode == MDP_FETCH_LINEAR)
 #define MSM_FORMAT_IS_TILE(X) \
 	(((X)->fetch_mode == MDP_FETCH_UBWC) && \

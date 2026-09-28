@@ -66,6 +66,7 @@ static const uint32_t qcom_compressed_supported_formats[] = {
 	DRM_FORMAT_ARGB2101010,
 	DRM_FORMAT_XRGB2101010,
 	DRM_FORMAT_BGR565,
+	DRM_FORMAT_ABGR16161616F,	/* offered only where a pipe's list carries it: sm8550 */
 
 	DRM_FORMAT_NV12,
 	DRM_FORMAT_P010,
@@ -901,7 +902,8 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 			 plane->name,
 			 &new_plane_state->fb->format->format,
 			 fb_fmt && MSM_FORMAT_IS_YUV(fb_fmt) ? "YUV" : "RGB",
-			 fb_fmt && MSM_FORMAT_IS_DX(fb_fmt) ? " 10-bit" : "",
+			 fb_fmt && MSM_FORMAT_IS_DX(fb_fmt) ? " 10-bit" :
+			 fb_fmt && MSM_FORMAT_IS_FP16(fb_fmt) ? " 16-bit float" : "",
 			 fb_fmt && MSM_FORMAT_IS_UBWC(fb_fmt) ? " UBWC" : "",
 			 new_plane_state->fb->width,
 			 new_plane_state->fb->height);

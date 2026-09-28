@@ -355,6 +355,28 @@ static const struct msm_format mdp_formats[] = {
 		BPC8A, BPC8, BPC8, BPC8,
 		C2_R_Cr, C0_G_Y, C1_B_Cb, C3_ALPHA),
 
+	/*
+	 * 16-bit float per channel. This device's own driver fetches it exactly as ABGR8888 -- the
+	 * same component widths and unpack pattern -- plus one SRC_FORMAT bit (dpu_fp16_layout.h).
+	 */
+	{
+		.pixel_format = DRM_FORMAT_ABGR16161616F,
+		.fetch_type = MDP_PLANE_INTERLEAVED,
+		.alpha_enable = true,
+		.element = { C2_R_Cr, C0_G_Y, C1_B_Cb, C3_ALPHA },
+		.bpc_g_y = BPC8,
+		.bpc_b_cb = BPC8,
+		.bpc_r_cr = BPC8,
+		.bpc_a = BPC8A,
+		.chroma_sample = CHROMA_FULL,
+		.unpack_count = 4,
+		.bpp = 8,
+		.fetch_mode = MDP_FETCH_LINEAR,
+		.flags = MSM_FORMAT_FLAG_UNPACK_TIGHT | MSM_FORMAT_FLAG_FP16,
+		.num_planes = 1,
+		.tile_height = MDP_TILE_HEIGHT_DEFAULT,
+	},
+
 	INTERLEAVED_RGBX_FMT(XBGR8888, 4,
 		BPC8A, BPC8, BPC8, BPC8,
 		C2_R_Cr, C0_G_Y, C1_B_Cb, C3_ALPHA),
@@ -566,6 +588,25 @@ static const struct msm_format mdp_formats_ubwc[] = {
 	INTERLEAVED_RGBA_FMT_TILED(ABGR8888, 4,
 		BPC8A, BPC8, BPC8, BPC8,
 		C2_R_Cr, C0_G_Y, C1_B_Cb, C3_ALPHA),
+
+	/* 16-bit float, UBWC: as its linear entry, compressed */
+	{
+		.pixel_format = DRM_FORMAT_ABGR16161616F,
+		.fetch_type = MDP_PLANE_INTERLEAVED,
+		.alpha_enable = true,
+		.element = { C2_R_Cr, C0_G_Y, C1_B_Cb, C3_ALPHA },
+		.bpc_g_y = BPC8,
+		.bpc_b_cb = BPC8,
+		.bpc_r_cr = BPC8,
+		.bpc_a = BPC8A,
+		.chroma_sample = CHROMA_FULL,
+		.unpack_count = 4,
+		.bpp = 8,
+		.fetch_mode = MDP_FETCH_UBWC,
+		.flags = MSM_FORMAT_FLAG_UNPACK_TIGHT | MSM_FORMAT_FLAG_COMPRESSED | MSM_FORMAT_FLAG_FP16,
+		.num_planes = 2,
+		.tile_height = MDP_TILE_HEIGHT_UBWC,
+	},
 
 	/* ARGB8888 and ABGR8888 purposely have the same color
 	 * ordering.  The hardware only supports ABGR8888 UBWC
