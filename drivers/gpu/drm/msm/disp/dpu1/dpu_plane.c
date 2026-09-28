@@ -73,6 +73,19 @@ static const uint32_t qcom_compressed_supported_formats[] = {
 };
 
 /*
+ * A measurement switch: refuse every 16-bit-float framebuffer at check, so the compositor composes
+ * it -- the composited arm of a same-boot power bracket. TEST ONLY, off by default. It refuses above
+ * the format report, so a compositor retrying the plane every frame neither logs nor flips the
+ * reported format; fp16_refused counts the refusals instead.
+ */
+static bool dpu_fp16_refuse;
+module_param_named(fp16_refuse, dpu_fp16_refuse, bool, 0644);
+MODULE_PARM_DESC(fp16_refuse, "Refuse 16-bit-float framebuffers at check (a measurement switch; default off)");
+static unsigned int dpu_fp16_refused;
+module_param_named(fp16_refused, dpu_fp16_refused, uint, 0444);
+MODULE_PARM_DESC(fp16_refused, "How many 16-bit-float framebuffers fp16_refuse has refused");
+
+/*
  * struct dpu_plane - local dpu plane structure
  * @vm: address space pointer
  * @csc_ptr: Points to dpu_csc_cfg structure to use for current
@@ -865,6 +878,12 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	}
 	if (!new_plane_state->visible)
 		return 0;
+
+	if (READ_ONCE(dpu_fp16_refuse) && new_plane_state->fb &&
+	    MSM_FORMAT_IS_FP16(msm_framebuffer_format(new_plane_state->fb))) {
+		WRITE_ONCE(dpu_fp16_refused, dpu_fp16_refused + 1);
+		return -EINVAL;
+	}
 
 	/*
 	 * 🔴 SAY WHAT FRAMEBUFFER ARRIVED, AND SAY IT *HERE*.
