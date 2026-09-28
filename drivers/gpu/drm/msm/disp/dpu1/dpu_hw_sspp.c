@@ -4,6 +4,7 @@
 
 #include <linux/debugfs.h>
 
+#include "dpu_fp16_layout.h"
 #include "dpu_hwio.h"
 #include "dpu_hw_catalog.h"
 #include "dpu_hw_lm.h"
@@ -306,7 +307,7 @@ void dpu_hw_setup_format_impl(struct dpu_sw_pipe *pipe, const struct msm_format 
 	src_format |= ((fmt->unpack_count - 1) << 12) |
 		((fmt->flags & MSM_FORMAT_FLAG_UNPACK_TIGHT ? 1 : 0) << 17) |
 		((fmt->flags & MSM_FORMAT_FLAG_UNPACK_ALIGN_MSB ? 1 : 0) << 18) |
-		((fmt->bpp - 1) << 9);
+		dpu_src_format_bpp_bits(fmt->bpp, MSM_FORMAT_IS_FP16(fmt));
 
 	if (fmt->fetch_mode != MDP_FETCH_LINEAR) {
 		u32 hbb = ctx->ubwc->highest_bank_bit - 13;

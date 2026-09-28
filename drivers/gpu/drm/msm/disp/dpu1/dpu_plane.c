@@ -937,7 +937,14 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 
 	ret = dpu_format_populate_plane_sizes(new_plane_state->fb, &pstate->layout);
 	if (ret) {
-		DPU_ERROR_PLANE(pdpu, "failed to get format plane sizes, %d\n", ret);
+		/*
+		 * A 16-bit-float buffer is refused here only for its pitch, and the
+		 * layout code says so once where it refuses: a compositor retries a
+		 * refused plane every frame, so an error line here would repeat at the
+		 * refresh rate.
+		 */
+		if (!MSM_FORMAT_IS_FP16(msm_framebuffer_format(new_plane_state->fb)))
+			DPU_ERROR_PLANE(pdpu, "failed to get format plane sizes, %d\n", ret);
 		return ret;
 	}
 
