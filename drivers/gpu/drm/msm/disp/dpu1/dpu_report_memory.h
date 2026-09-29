@@ -1,14 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Check-time reports a compositor's refuse-and-fall-back retry cannot repeat -- pure logic, so a host test
- * can include this header unchanged. A host build defines u32 and time_before_eq() (as <linux/jiffies.h>
- * does) and includes <stdbool.h> before including it.
+ * can include this header unchanged. A host build defines u32, time_before_eq() and time_after() (as
+ * <linux/jiffies.h> does) and includes <stdbool.h> before including it.
  *
  * THE LOOP. A compositor proposes a client's buffer for a plane in a TEST commit every frame. When the
  * plane check refuses it, the compositor draws the frame itself and commits ITS OWN buffer to the same
  * plane -- through the same check -- and proposes the client's buffer again on the next frame. The plane's
- * checks then see two keys alternating at the refresh rate, and a report that fires whenever its key
- * changes fires on every one of them: ~120-360 lines a second from KWin at 120 Hz.
+ * checks then see two keys alternating, and a report that fires whenever its key changes fires on every one
+ * of them: measured, ~89 lines a second from KWin for a 30 fps client (one retry per client frame, three
+ * lines each, 2026-09-29); up to ~360 a second for a client at the full 120 Hz is an inference.
  */
 #ifndef _DPU_REPORT_MEMORY_H
 #define _DPU_REPORT_MEMORY_H
@@ -27,8 +28,9 @@
 
 /**
  * struct dpu_report_change - memory for a report that says when a plane's key CHANGES
- * @cur:       the key at the plane's last check -- the single entry these reports always kept; it never
- *             expires, so a key held across an idle gap is never re-reported
+ * @cur:       the key at the plane's last check -- the single entry these reports always kept.
+ *             dpu_report_change_note() never expires it, so a key held across an idle gap is never
+ *             re-reported; dpu_report_state_note() expires it after the window
  * @prev:      the key before that
  * @cur_seen:  when @cur was last seen, in jiffies
  * @prev_seen: when @prev was last seen, in jiffies
@@ -50,12 +52,18 @@ struct dpu_report_change {
  * @now:    when, in jiffies
  * @window: how long a key the plane has left is remembered, in jiffies
  *
- * The single-entry memory reported every change. This reports the same changes and differs only once a
- * plane has gone back to the key it left within @window for the SECOND time: from then on the returns are
- * silent until the plane stays away from that key for @window. So one refused offer still reports the
- * offer and the fall-back, a two-key refuse-and-fall-back loop reports those two lines and then nothing,
- * and a key that comes back after @window is reported as new. It never reports a key the single-entry
- * memory would not have. Only TWO keys are held: a cycle through three reports every change, as before.
+ * @key is reported when it differs from the key at the plane's last check -- the single-entry memory's
+ * rule -- UNLESS it is the plane's previous distinct key, last seen at a check on this plane no more than
+ * @window before, and the plane has already come back to that key once since its last new key. So one
+ * refused offer still reports the offer and the fall-back; a two-key refuse-and-fall-back loop reports
+ * those two lines and then nothing while its retries come no more than @window apart; a key that comes back
+ * after @window is reported as new. It never reports a key the single-entry memory would not have.
+ *
+ * Its limits, exactly: the key at the plane's last check is silent at ANY age, as it always was; beyond
+ * that, nothing is silenced on a plane checked less often than once per @window (a refused client slower
+ * than that is reported every frame, as before); an episode that begins more than @window after the
+ * plane's last check reports its first return as a new key, one line more; and only TWO keys are held -- a
+ * cycle through three reports every change.
  *
  * Return: true if the caller should report @key.
  */
@@ -93,6 +101,36 @@ static inline bool dpu_report_change_note(struct dpu_report_change *m, u32 key,
 }
 
 /**
+ * dpu_report_state_note - dpu_report_change_note() for a report that ALSO needs its key to differ from the
+ * plane's committed state before it prints
+ * @m:      the plane's memory for this report
+ * @key:    the key the check saw
+ * @now:    when, in jiffies
+ * @window: how long a key is remembered, in jiffies
+ *
+ * The change memory never expires its current key: that is what keeps an idle plane quiet when nothing else
+ * stands between the report and the log. A report that is also held back by the committed state has
+ * something else, so here the current key expires too, after @window. It matters on a plane whose fall-back
+ * never passes this check -- one the compositor switches off, or leaves out of the commit, when the kernel
+ * refuses it: the memory then keeps the refused offer's key, and with no expiry an offer ACCEPTED later with
+ * the same key would never be reported.
+ *
+ * So a silence here always means this plane checked @key no more than @window before, and with the
+ * caller's committed-state test "no line" means @key matched the committed state or was checked on this
+ * plane in the preceding @window. The converse does not hold: a first return within @window is reported.
+ *
+ * Return: true if the caller may report @key; the caller still requires it to differ from the committed
+ * state.
+ */
+static inline bool dpu_report_state_note(struct dpu_report_change *m, u32 key,
+					 unsigned long now, unsigned long window)
+{
+	bool stale = m->has_cur && key == m->cur && time_after(now, m->cur_seen + window);
+
+	return dpu_report_change_note(m, key, now, window) || stale;
+}
+
+/**
  * struct dpu_report_event - memory for a report of a refusal, which happens rather than holds
  * @key:  the refusal last noted
  * @seen: when, in jiffies
@@ -111,7 +149,7 @@ struct dpu_report_event {
  * @now:    when, in jiffies
  * @window: how long a run of the same refusal lasts without it recurring, in jiffies
  *
- * Once per RUN: a refusal is reported unless the same one was noted less than @window earlier, so a
+ * Once per RUN: a refusal is reported unless the same one was noted no more than @window earlier, so a
  * compositor retrying a refused plane every frame gets one line for the whole run and a later run gets its
  * own. One entry: two different refusals alternating are each reported every time.
  *

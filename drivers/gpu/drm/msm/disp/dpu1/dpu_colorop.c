@@ -646,16 +646,26 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 	 * alternate: a refused check never becomes the old state and the
 	 * fall-back commits shape 0, so against the old state alone a refused
 	 * pipeline was re-reported on every retry.  The plane's own memory
-	 * (dpu_report_change_note) silences the second and later returns within
-	 * a second.  It is noted on EVERY check -- also when the old-state test
-	 * fails, or the next run of the loop would find it stale -- and both must
-	 * agree, so this never prints a line the old-state test alone would not.
+	 * (dpu_report_state_note) silences the second and later returns within
+	 * a second, and a shape this plane checked again within a second.  It is
+	 * noted on EVERY check -- also when the old-state test fails, or a held
+	 * shape's last sighting would go stale -- and both must agree, so this
+	 * never prints a line the old-state test alone would not.
+	 *
+	 * So "no line" for a shape means it matched the committed one, or this
+	 * plane checked it in the preceding second.  Unlike the fb report's, the
+	 * memory's current shape EXPIRES after that second: on a plane whose
+	 * fall-back never reaches this check -- switched off, or left out of the
+	 * commit -- the memory keeps a refused offer's shape, and without the
+	 * expiry an offer accepted later with that shape would print no line at
+	 * any age.  An idle plane stays quiet because its shape is the committed
+	 * one.
 	 */
 	old_plane_state = drm_atomic_get_old_plane_state(state, plane_state->plane);
 	changed = !old_plane_state ||
 		  to_dpu_plane_state(old_plane_state)->pipeline_shape != shape;
-	report = dpu_report_change_note(&reports->shape, shape, jiffies,
-					msecs_to_jiffies(DPU_REPORT_WINDOW_MS));
+	report = dpu_report_state_note(&reports->shape, shape, jiffies,
+				       msecs_to_jiffies(DPU_REPORT_WINDOW_MS));
 	if (report && changed)
 		DRM_INFO("colorop: %s at check: %s | matrix %s%s | table %s%s\n",
 			 plane_state->plane->name,

@@ -904,7 +904,10 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	 * arms discovering, so the report goes where nothing can bypass it.
 	 *
 	 * Together with the colour-pipeline report at the tail this reads
-	 * four ways, not two:
+	 * four ways, not two -- each line within its own bound: the tail's line
+	 * is missing only when the pipeline shape matches the plane's committed
+	 * one or this plane checked it in the preceding second
+	 * (dpu_plane_colorop_check), and this one's bound is below:
 	 *
 	 *   YUV here + a pipeline at the tail  the compositor asked, and the
 	 *                                      hardware was given the job
@@ -920,8 +923,14 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	 * refused buffer and the compositor's fall-back ALTERNATE on this plane:
 	 * after the first return to the format the plane left within a second,
 	 * returns are silent until the alternation stops for a second
-	 * (dpu_report_change_note).  So "no line for F" still means F was not
-	 * offered -- unless F was on this plane in the preceding second.
+	 * (dpu_report_change_note).  So "no line for F" means F was not offered,
+	 * unless (i) F was this plane's format at its previous check, at ANY
+	 * age -- as before these reports had a memory; on a plane whose
+	 * fall-back skips this check it can be a refused offer's format from
+	 * long before, which is how a tail line can appear with no line here --
+	 * or (ii) F is the plane's previous format, checked here in the preceding
+	 * second, and the plane has already come back to it once since it last
+	 * saw a new format.  A refused TEST offer counts as checked.
 	 */
 	if (dpu_report_change_note(&pdpu->fb_report, new_plane_state->fb->format->format,
 				   jiffies, msecs_to_jiffies(DPU_REPORT_WINDOW_MS))) {
