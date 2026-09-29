@@ -533,6 +533,7 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
  * dpu_plane_colorop_check - can this plane's colour pipeline be programmed?
  * @state:       the atomic state
  * @plane_state: the plane state being checked
+ * @reports:     what this plane's colour-pipeline reports last said (logging only)
  *
  * Every operation the pipeline asks for is converted here, at check time, and
  * the commit is refused if any of them cannot be expressed.  Refusing makes the
@@ -547,13 +548,15 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
  * Return: 0 if the pipeline can be programmed, -EINVAL otherwise.
  */
 int dpu_plane_colorop_check(struct drm_atomic_state *state,
-			    struct drm_plane_state *plane_state)
+			    struct drm_plane_state *plane_state,
+			    struct dpu_colorop_reports *reports)
 {
 	struct dpu_plane_state *pstate = to_dpu_plane_state(plane_state);
 	struct drm_colorop *colorop = plane_state->color_pipeline;
 	struct drm_plane_state *old_plane_state;
 	struct drm_colorop_state *cs;
 	struct dpu_csc_cfg csc;
+	bool changed, report;
 	u32 shape = 0;
 
 	/*
@@ -572,7 +575,8 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 		/* first: the colour matrix */
 		cs = dpu_colorop_effective_state(state, colorop);
 		if (!cs) {
-			DPU_ERROR("a colour operation has no state at all\n");
+			if (dpu_colorop_report_refusal(reports, DPU_COLOROP_REFUSAL_NO_STATE))
+				DPU_ERROR("a colour operation has no state at all\n");
 			return -EINVAL;
 		}
 		if (cs->bypass)
@@ -581,7 +585,8 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			shape |= DPU_COLOROP_SHAPE_CSC_DATA;
 		if (!cs->bypass && cs->data &&
 		    dpu_colorop_ctm_to_csc(cs->data, &csc)) {
-			DPU_ERROR("colour matrix cannot be expressed by this pipe\n");
+			if (dpu_colorop_report_refusal(reports, DPU_COLOROP_REFUSAL_MATRIX))
+				DPU_ERROR("colour matrix cannot be expressed by this pipe\n");
 			return -EINVAL;
 		}
 
@@ -591,7 +596,8 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			return -EINVAL;
 		cs = dpu_colorop_effective_state(state, colorop);
 		if (!cs) {
-			DPU_ERROR("a colour operation has no state at all\n");
+			if (dpu_colorop_report_refusal(reports, DPU_COLOROP_REFUSAL_NO_STATE))
+				DPU_ERROR("a colour operation has no state at all\n");
 			return -EINVAL;
 		}
 		if (cs->bypass)
@@ -601,7 +607,9 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 		if (!cs->bypass && cs->data) {
 			if (dpu_colorop_lut_to_igc(cs->data, pstate->pipeline_igc,
 						   pstate->pipeline_igc_last)) {
-				DPU_ERROR("inverse-gamma table is not the size this pipe takes\n");
+				if (dpu_colorop_report_refusal(reports,
+							       DPU_COLOROP_REFUSAL_TABLE_SIZE))
+					DPU_ERROR("inverse-gamma table is not the size this pipe takes\n");
 				return -EINVAL;
 			}
 			pstate->has_pipeline_igc = true;
@@ -633,10 +641,22 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 	 *
 	 * It is emitted when the shape CHANGES, against the old plane state, so
 	 * a clip playing at 120 Hz produces one line and not seven thousand.
+	 *
+	 * And not while a refused pipeline and the compositor's fall-back
+	 * alternate: a refused check never becomes the old state and the
+	 * fall-back commits shape 0, so against the old state alone a refused
+	 * pipeline was re-reported on every retry.  The plane's own memory
+	 * (dpu_report_change_note) silences the second and later returns within
+	 * a second.  It is noted on EVERY check -- also when the old-state test
+	 * fails, or the next run of the loop would find it stale -- and both must
+	 * agree, so this never prints a line the old-state test alone would not.
 	 */
 	old_plane_state = drm_atomic_get_old_plane_state(state, plane_state->plane);
-	if (!old_plane_state ||
-	    to_dpu_plane_state(old_plane_state)->pipeline_shape != shape)
+	changed = !old_plane_state ||
+		  to_dpu_plane_state(old_plane_state)->pipeline_shape != shape;
+	report = dpu_report_change_note(&reports->shape, shape, jiffies,
+					msecs_to_jiffies(DPU_REPORT_WINDOW_MS));
+	if (report && changed)
 		DRM_INFO("colorop: %s at check: %s | matrix %s%s | table %s%s\n",
 			 plane_state->plane->name,
 			 (shape & DPU_COLOROP_SHAPE_PIPELINE)

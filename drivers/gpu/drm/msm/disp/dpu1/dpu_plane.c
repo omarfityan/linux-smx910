@@ -91,7 +91,8 @@ MODULE_PARM_DESC(fp16_refused, "How many 16-bit-float framebuffers fp16_refuse h
  * @csc_ptr: Points to dpu_csc_cfg structure to use for current
  * @catalog: Points to dpu catalog structure
  * @revalidate: force revalidation of all the plane properties
- * @reported_fb_fourcc: LOGGING ONLY -- the framebuffer format last reported
+ * @fb_report: LOGGING ONLY -- what the framebuffer report last said
+ * @colorop_reports: LOGGING ONLY -- what the colour-pipeline reports last said
  */
 struct dpu_plane {
 	struct drm_plane base;
@@ -104,15 +105,18 @@ struct dpu_plane {
 	const struct dpu_mdss_cfg *catalog;
 
 	/*
-	 * LOGGING ONLY -- the framebuffer format last reported for this plane.
+	 * LOGGING ONLY -- what this plane's check-time reports last said.
 	 *
 	 * It lives on the PLANE and not on the plane STATE deliberately.  A
 	 * failed atomic check throws its state away, so a compositor that
 	 * retries the SAME refused format every frame would re-report it at
-	 * the refresh rate.  Kept here, the report fires once per genuine
-	 * format change and never in a loop.
+	 * the refresh rate.  And it remembers TWO keys, not one: the compositor
+	 * commits its OWN buffer to this plane between two retries, through the
+	 * same check, so a single "last reported" entry flipped on every check
+	 * and re-reported both (dpu_report_memory.h has the contract).
 	 */
-	u32 reported_fb_fourcc;
+	struct dpu_report_change fb_report;
+	struct dpu_colorop_reports colorop_reports;
 };
 
 static const uint64_t supported_format_modifiers[] = {
@@ -912,10 +916,15 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	 *                                      kernel carrying one
 	 *
 	 * Emitted only when the format CHANGES, so a clip playing at 120 Hz
-	 * produces one line and not seven thousand.
+	 * produces one line and not seven thousand -- and not re-emitted while a
+	 * refused buffer and the compositor's fall-back ALTERNATE on this plane:
+	 * after the first return to the format the plane left within a second,
+	 * returns are silent until the alternation stops for a second
+	 * (dpu_report_change_note).  So "no line for F" still means F was not
+	 * offered -- unless F was on this plane in the preceding second.
 	 */
-	if (new_plane_state->fb->format->format != pdpu->reported_fb_fourcc) {
-		pdpu->reported_fb_fourcc = new_plane_state->fb->format->format;
+	if (dpu_report_change_note(&pdpu->fb_report, new_plane_state->fb->format->format,
+				   jiffies, msecs_to_jiffies(DPU_REPORT_WINDOW_MS))) {
 		fb_fmt = msm_framebuffer_format(new_plane_state->fb);
 		DRM_INFO("colorop: %s fb at check: %p4cc %s%s%s %ux%u\n",
 			 plane->name,
@@ -1015,7 +1024,8 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	 * Nothing here depends on which SSPP the plane ends up on: both
 	 * conversions read only the compositor's own blobs.
 	 */
-	ret = dpu_plane_colorop_check(new_plane_state->state, new_plane_state);
+	ret = dpu_plane_colorop_check(new_plane_state->state, new_plane_state,
+				      &pdpu->colorop_reports);
 	if (ret)
 		return ret;
 
@@ -1134,8 +1144,10 @@ static int dpu_plane_atomic_check_sspp(struct drm_plane *plane,
 			if (sspp->cap->sblk->csc_blk.len &&
 			    sspp->cap->sblk->igc_blk.len)
 				continue;
-			DPU_ERROR("%s: a colour pipeline was assigned to %s, which has no colour blocks\n",
-				  plane->name, sspp->cap->name);
+			if (dpu_colorop_report_refusal(&pdpu->colorop_reports,
+						       DPU_COLOROP_REFUSAL_PIPE_WITHOUT_BLOCKS))
+				DPU_ERROR("%s: a colour pipeline was assigned to %s, which has no colour blocks\n",
+					  plane->name, sspp->cap->name);
 			return -EINVAL;
 		}
 	}

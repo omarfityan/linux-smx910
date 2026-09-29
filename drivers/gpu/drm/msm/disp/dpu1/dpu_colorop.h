@@ -7,11 +7,41 @@
 #include <drm/drm_plane.h>
 
 #include "dpu_hw_mdss.h"
+#include "dpu_report_memory.h"
 
 struct dpu_sspp_sub_blks;
 struct drm_property_blob;
 struct drm_crtc;
 struct dpu_hw_ctl;
+
+/* the colour-pipeline refusals a plane's checks report: the keys of its refusal memory */
+enum dpu_colorop_refusal {
+	DPU_COLOROP_REFUSAL_NO_STATE = 1,
+	DPU_COLOROP_REFUSAL_MATRIX,
+	DPU_COLOROP_REFUSAL_TABLE_SIZE,
+	DPU_COLOROP_REFUSAL_PIPE_WITHOUT_BLOCKS,
+};
+
+/**
+ * struct dpu_colorop_reports - what a plane's colour-pipeline checks last reported (logging only)
+ * @shape:   the pipeline shape, for the "at check" report
+ * @refusal: the refusal last reported
+ *
+ * On the PLANE, never the plane state: a refused check's state is thrown away, and a memory kept there
+ * would forget every refused offer (dpu_report_memory.h has the contract).
+ */
+struct dpu_colorop_reports {
+	struct dpu_report_change shape;
+	struct dpu_report_event refusal;
+};
+
+/* a refusal's line is printed once per run of that refusal on the plane */
+static inline bool dpu_colorop_report_refusal(struct dpu_colorop_reports *reports,
+					      enum dpu_colorop_refusal why)
+{
+	return dpu_report_event_note(&reports->refusal, why, jiffies,
+				     msecs_to_jiffies(DPU_REPORT_WINDOW_MS));
+}
 
 int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
 			   struct dpu_csc_cfg *cfg);
@@ -24,6 +54,7 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
 			   struct drm_plane_state *plane_state,
 			   struct dpu_csc_cfg *out);
 int dpu_plane_colorop_check(struct drm_atomic_state *state,
-			    struct drm_plane_state *plane_state);
+			    struct drm_plane_state *plane_state,
+			    struct dpu_colorop_reports *reports);
 
 #endif /* _DPU_COLOROP_H */
