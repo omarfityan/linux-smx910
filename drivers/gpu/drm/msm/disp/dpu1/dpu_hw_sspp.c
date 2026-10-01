@@ -78,6 +78,8 @@
 /* the 16-bit-float chain's control register (this device's tree: qcom,sde-fp16-*) */
 #define DPU_SSPP_FP16_CTRL                 0x200
 #define DPU_SSPP_FP16_CTRL_REC1            0x280	/* a video pipe's second rect; DMA pipes name 0x200 for both */
+#define DPU_SSPP_FP16_CSC_EN               BIT(2)	/* the control's matrix stage */
+#define DPU_SSPP_FP16_CSC_WORD0            0x04	/* the first matrix word, from the control register */
 #define SSPP_CLK_CTRL                      0x330
 
 /* SSPP_SRC_OP_MODE & OP_MODE_REC1 */
@@ -261,19 +263,43 @@ static void dpu_hw_sspp_setup_format(struct dpu_sw_pipe *pipe,
 
 	/*
 	 * The pipe's 16-bit-float chain -- unmultiply, inverse gamma, matrix, gamma -- is one control
-	 * register. Every stage is written OFF on every 16-bit-float programming, so what the fetch
-	 * delivers never depends on what the register held before: power-on, a resume, an earlier client.
+	 * register, written on EVERY format programming of a pipe that has the chain: the matrix stage
+	 * alone on for a float format whose plane carries a matrix (its words already written by
+	 * setup_fp16_csc), every stage off otherwise. So what the fetch delivers never depends on what
+	 * the register held before -- power-on, a resume, an earlier client: a bit an earlier client
+	 * left SURVIVED a later non-float programming on hardware. A pipe without the chain is never
+	 * written.
 	 */
-	if (MSM_FORMAT_IS_FP16(fmt)) {
+	if (ctx->cap->sblk->fp16_blk.len) {
 		bool rect1 = pipe->multirect_index == DPU_SSPP_RECT_1;
+		bool matrix = MSM_FORMAT_IS_FP16(fmt) && (flags & DPU_SSPP_FP16_MATRIX);
 
 		DPU_REG_WRITE(&ctx->hw, (rect1 && ctx->cap->type == SSPP_TYPE_VIG) ?
-			      DPU_SSPP_FP16_CTRL_REC1 : DPU_SSPP_FP16_CTRL, 0);
+			      DPU_SSPP_FP16_CTRL_REC1 : DPU_SSPP_FP16_CTRL,
+			      matrix ? DPU_SSPP_FP16_CSC_EN : 0);
 	}
 
 	dpu_hw_setup_format_impl(pipe, fmt, flags, ctx, op_mode_off,
 				 unpack_pat_off, format_off,
 				 ubwc_ctrl_off, ubwc_error_off);
+}
+
+/*
+ * The 16-bit-float chain's colour matrix and clamps: ten words from the control register + 0x04,
+ * six of matrix then four of clamps (dpu_fp16_csc_pack). Written BEFORE setup_format switches the
+ * matrix stage on, so the stage is never on with another matrix's words; given only to a solo
+ * video pipe (dpu_plane_atomic_check_sspp), whose chain is its first rect's.
+ */
+static void dpu_hw_sspp_setup_fp16_csc(struct dpu_sw_pipe *pipe, const u32 words[DPU_FP16_CSC_WORDS])
+{
+	struct dpu_hw_sspp *ctx = pipe->sspp;
+	int i;
+
+	if (!ctx)
+		return;
+
+	for (i = 0; i < DPU_FP16_CSC_WORDS; i++)
+		DPU_REG_WRITE(&ctx->hw, DPU_SSPP_FP16_CTRL + DPU_SSPP_FP16_CSC_WORD0 + 4 * i, words[i]);
 }
 
 void dpu_hw_setup_format_impl(struct dpu_sw_pipe *pipe, const struct msm_format *fmt,
@@ -647,6 +673,8 @@ static void _setup_layer_ops(struct dpu_hw_sspp *c,
 		unsigned long features, const struct dpu_mdss_version *mdss_rev)
 {
 	c->ops.setup_format = dpu_hw_sspp_setup_format;
+	if (c->cap->type == SSPP_TYPE_VIG && c->cap->sblk->fp16_blk.len)
+		c->ops.setup_fp16_csc = dpu_hw_sspp_setup_fp16_csc;
 	c->ops.setup_rects = dpu_hw_sspp_setup_rects;
 	c->ops.setup_sourceaddress = dpu_hw_sspp_setup_sourceaddress;
 	c->ops.setup_solidfill = dpu_hw_sspp_setup_solidfill;

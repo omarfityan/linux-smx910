@@ -9,6 +9,7 @@
 #include "dpu_hw_mdss.h"
 #include "dpu_hw_util.h"
 #include "dpu_formats.h"
+#include "dpu_fp16_csc.h"
 
 struct dpu_hw_sspp;
 
@@ -22,6 +23,8 @@ struct dpu_hw_sspp;
 #define DPU_SSPP_SOURCE_ROTATED_90	BIT(2)
 #define DPU_SSPP_ROT_90			BIT(3)
 #define DPU_SSPP_SOLID_FILL		BIT(4)
+/* a 16-bit-float plane's colour matrix is in force: setup_format switches the float chain's matrix stage on */
+#define DPU_SSPP_FP16_MATRIX		BIT(5)
 
 /*
  * Component indices
@@ -189,6 +192,15 @@ struct dpu_hw_sspp_ops {
 	 */
 	void (*setup_format)(struct dpu_sw_pipe *pipe,
 			     const struct msm_format *fmt, u32 flags);
+
+	/**
+	 * @setup_fp16_csc: write the 16-bit-float chain's colour matrix and clamps (dpu_fp16_csc_pack); a
+	 *                  video pipe with the chain only. Called before @setup_format, which switches the
+	 *                  chain's matrix stage on (DPU_SSPP_FP16_MATRIX).
+	 * @pipe: Pointer to software pipe context
+	 * @words: the six matrix words and four clamp words
+	 */
+	void (*setup_fp16_csc)(struct dpu_sw_pipe *pipe, const u32 words[DPU_FP16_CSC_WORDS]);
 
 	/**
 	 * @setup_rects: setup pipe ROI rectangles

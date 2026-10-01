@@ -1034,21 +1034,31 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	 * conversions read only the compositor's own blobs.
 	 */
 	ret = dpu_plane_colorop_check(new_plane_state->state, new_plane_state,
-				      &pdpu->colorop_reports);
+				      &pdpu->colorop_reports,
+				      MSM_FORMAT_IS_FP16(msm_framebuffer_format(new_plane_state->fb)));
 	if (ret)
 		return ret;
 
-	pstate->has_pipeline_csc = dpu_plane_colorop_csc(new_plane_state->state,
-							new_plane_state,
-							&pstate->pipeline_csc);
+	/*
+	 * has_pipeline_csc means "a matrix is in force" -- what the resource requirements read to
+	 * keep the plane on solo video pipes. A 16-bit-float buffer's matrix was converted for the
+	 * float chain by the check above; the video matrix's own conversion may not hold it, and is
+	 * not needed.
+	 */
+	pstate->has_pipeline_csc = pstate->has_pipeline_fp16_csc ||
+				   dpu_plane_colorop_csc(new_plane_state->state,
+							 new_plane_state,
+							 &pstate->pipeline_csc);
 
 	/*
-	 * The pipe enables its colour matrix for YUV sources only (dpu_hw_setup_format_impl; this
-	 * device's own driver does the same), so a matrix in force on an RGB or 16-bit-float buffer would
-	 * be loaded and never applied. Refuse it: the compositor then composes the frame, slower and
-	 * correct. (A bypassed matrix leaves has_pipeline_csc false and is not refused.)
+	 * The video pipe enables its colour matrix for YUV sources only (dpu_hw_setup_format_impl;
+	 * this device's own driver does the same), so a matrix in force on an RGB buffer would be
+	 * loaded and never applied. Refuse it: the compositor then composes the frame, slower and
+	 * correct. A 16-bit-float buffer's matrix is applied by the pipe's float chain instead
+	 * (has_pipeline_fp16_csc) and is not refused. (A bypassed matrix leaves has_pipeline_csc
+	 * false and is not refused.)
 	 */
-	if (pstate->has_pipeline_csc &&
+	if (pstate->has_pipeline_csc && !pstate->has_pipeline_fp16_csc &&
 	    !MSM_FORMAT_IS_YUV(msm_framebuffer_format(new_plane_state->fb))) {
 		DRM_INFO_ONCE("colorop: %s refused: a colour matrix in force on an RGB buffer is never applied by this pipe\n",
 			      plane->name);
@@ -1157,6 +1167,31 @@ static int dpu_plane_atomic_check_sspp(struct drm_plane *plane,
 						       DPU_COLOROP_REFUSAL_PIPE_WITHOUT_BLOCKS))
 				DPU_ERROR("%s: a colour pipeline was assigned to %s, which has no colour blocks\n",
 					  plane->name, sspp->cap->name);
+			return -EINVAL;
+		}
+	}
+
+	/*
+	 * A 16-bit-float plane's matrix is programmed into the float chain of a SOLO video pipe only: a
+	 * DMA pipe's two rects share one control register, and a video pipe's second rect is never
+	 * given the matrix. The requirements above already keep a pipeline off multirect; this says so
+	 * again against the assignment, because a matrix on the wrong rect is silently not applied.
+	 */
+	if (pstate->has_pipeline_fp16_csc) {
+		int i;
+
+		for (i = 0; i < PIPES_PER_PLANE; i++) {
+			const struct dpu_sw_pipe *p = &pstate->pipe[i];
+
+			if (!p->sspp)
+				continue;
+			if (p->sspp->cap->type == SSPP_TYPE_VIG && p->sspp->cap->sblk->fp16_blk.len &&
+			    p->multirect_index == DPU_SSPP_RECT_SOLO)
+				continue;
+			if (dpu_colorop_report_refusal(&pdpu->colorop_reports,
+						       DPU_COLOROP_REFUSAL_FP16_MATRIX_PIPE))
+				DPU_ERROR("%s: a 16-bit-float colour matrix was assigned to %s, which is not a solo video pipe with the float chain\n",
+					  plane->name, p->sspp->cap->name);
 			return -EINVAL;
 		}
 	}
@@ -1511,6 +1546,10 @@ static void dpu_plane_flush_csc(struct dpu_plane *pdpu, struct dpu_sw_pipe *pipe
 	if (!pipe->sspp || !pipe->sspp->ops.setup_csc)
 		return;
 
+	/* a 16-bit-float plane's matrix is the float chain's (dpu_plane_sspp_update_pipe), never this one's */
+	if (pstate->has_pipeline_fp16_csc)
+		return;
+
 	/*
 	 * A colour pipeline, where the plane has one, is what the compositor
 	 * asked for explicitly and it outranks the COLOR_ENCODING default.  It
@@ -1637,6 +1676,15 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
 
 		if (rotation & DRM_MODE_ROTATE_90)
 			src_flags |= DPU_SSPP_ROT_90;
+
+		/*
+		 * A 16-bit-float plane's matrix: the float chain's words first, then setup_format
+		 * switches the chain's matrix stage on -- never on with another matrix's words.
+		 */
+		if (pstate->has_pipeline_fp16_csc && pipe->sspp->ops.setup_fp16_csc) {
+			pipe->sspp->ops.setup_fp16_csc(pipe, pstate->pipeline_fp16_csc);
+			src_flags |= DPU_SSPP_FP16_MATRIX;
+		}
 
 		/* update format */
 		pipe->sspp->ops.setup_format(pipe, fmt, src_flags);

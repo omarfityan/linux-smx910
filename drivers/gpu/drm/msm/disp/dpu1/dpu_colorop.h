@@ -8,6 +8,7 @@
 
 #include "dpu_hw_mdss.h"
 #include "dpu_report_memory.h"
+#include "dpu_fp16_csc.h"
 
 struct dpu_sspp_sub_blks;
 struct drm_property_blob;
@@ -20,6 +21,7 @@ enum dpu_colorop_refusal {
 	DPU_COLOROP_REFUSAL_MATRIX,
 	DPU_COLOROP_REFUSAL_TABLE_SIZE,
 	DPU_COLOROP_REFUSAL_PIPE_WITHOUT_BLOCKS,
+	DPU_COLOROP_REFUSAL_FP16_MATRIX_PIPE,
 };
 
 /**
@@ -45,6 +47,8 @@ static inline bool dpu_colorop_report_refusal(struct dpu_colorop_reports *report
 
 int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
 			   struct dpu_csc_cfg *cfg);
+int dpu_colorop_ctm_to_fp16_csc(const struct drm_property_blob *blob,
+				u32 words[DPU_FP16_CSC_WORDS]);
 int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out, u32 *last);
 
 bool dpu_plane_colorops_enabled(void);
@@ -55,6 +59,6 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
 			   struct dpu_csc_cfg *out);
 int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			    struct drm_plane_state *plane_state,
-			    struct dpu_colorop_reports *reports);
+			    struct dpu_colorop_reports *reports, bool fp16);
 
 #endif /* _DPU_COLOROP_H */

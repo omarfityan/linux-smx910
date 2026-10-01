@@ -261,6 +261,29 @@ int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
 }
 
 /**
+ * dpu_colorop_ctm_to_fp16_csc - convert a DRM 3x4 colour matrix into the 16-bit-float chain's words
+ * @blob:  the DATA blob of a DRM_COLOROP_CTM_3X4 colorop
+ * @words: the six matrix words and four clamp words (dpu_fp16_csc_pack)
+ *
+ * The float chain takes every value as a binary16, so the video matrix's narrower fields do not
+ * apply: a coefficient of 200 is a half like any other.
+ *
+ * Return: 0 on success, -EINVAL if the blob is the wrong size or a value has no finite binary16.
+ */
+int dpu_colorop_ctm_to_fp16_csc(const struct drm_property_blob *blob,
+				u32 words[DPU_FP16_CSC_WORDS])
+{
+	const struct drm_color_ctm_3x4 *ctm;
+
+	if (!blob || blob->length != sizeof(*ctm))
+		return -EINVAL;
+
+	ctm = blob->data;
+
+	return dpu_fp16_csc_pack(ctm->matrix, words) ? 0 : -EINVAL;
+}
+
+/**
  * dpu_colorop_lut_to_igc - convert a DRM 1D LUT into the pipe's packed table
  * @blob: the DATA blob of a DRM_COLOROP_1D_LUT colorop
  * @out:  DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) dwords to fill
@@ -567,6 +590,8 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
  * @state:       the atomic state
  * @plane_state: the plane state being checked
  * @reports:     what this plane's colour-pipeline reports last said (logging only)
+ * @fp16:        the plane's buffer is 16-bit float: its matrix is the pipe's float chain's, converted
+ *               for it (dpu_colorop_ctm_to_fp16_csc) instead of for the video matrix
  *
  * Every operation the pipeline asks for is converted here, at check time, and
  * the commit is refused if any of them cannot be expressed.  Refusing makes the
@@ -582,7 +607,7 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
  */
 int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			    struct drm_plane_state *plane_state,
-			    struct dpu_colorop_reports *reports)
+			    struct dpu_colorop_reports *reports, bool fp16)
 {
 	struct dpu_plane_state *pstate = to_dpu_plane_state(plane_state);
 	struct drm_colorop *colorop = plane_state->color_pipeline;
@@ -601,6 +626,7 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 
 	pstate->has_pipeline_igc = false;
 	pstate->pipeline_igc_id = 0;
+	pstate->has_pipeline_fp16_csc = false;
 
 	if (colorop) {
 		shape |= DPU_COLOROP_SHAPE_PIPELINE;
@@ -616,12 +642,19 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			shape |= DPU_COLOROP_SHAPE_CSC_BYPASS;
 		if (cs->data)
 			shape |= DPU_COLOROP_SHAPE_CSC_DATA;
+		/*
+		 * A 16-bit-float buffer's matrix is applied by the pipe's float chain, in
+		 * binary16, and converted for it here and carried: the video matrix's own
+		 * conversion, and its narrower fields, do not apply to it.
+		 */
 		if (!cs->bypass && cs->data &&
-		    dpu_colorop_ctm_to_csc(cs->data, &csc)) {
+		    (fp16 ? dpu_colorop_ctm_to_fp16_csc(cs->data, pstate->pipeline_fp16_csc)
+			  : dpu_colorop_ctm_to_csc(cs->data, &csc))) {
 			if (dpu_colorop_report_refusal(reports, DPU_COLOROP_REFUSAL_MATRIX))
 				DPU_ERROR("colour matrix cannot be expressed by this pipe\n");
 			return -EINVAL;
 		}
+		pstate->has_pipeline_fp16_csc = fp16 && !cs->bypass && cs->data;
 
 		/* second: the inverse-gamma table */
 		colorop = colorop->next;

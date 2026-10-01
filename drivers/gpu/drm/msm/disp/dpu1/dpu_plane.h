@@ -57,6 +57,15 @@ struct dpu_plane_state {
 	struct dpu_csc_cfg pipeline_csc;
 
 	/*
+	 * A 16-bit-float buffer's matrix is applied by the pipe's float chain instead,
+	 * and is carried here in the chain's own words (dpu_fp16_csc_pack). When it is,
+	 * has_pipeline_csc is set too: it means "a matrix is in force", which is what
+	 * keeps the plane on solo video pipes.
+	 */
+	bool has_pipeline_fp16_csc;
+	u32 pipeline_fp16_csc[DPU_FP16_CSC_WORDS];
+
+	/*
 	 * And the same for the pipeline's inverse-gamma table: converted at
 	 * check time and CARRIED, for the same reason.  It is held packed the
 	 * way the block takes it -- three channels of 128 dwords, two twelve-bit

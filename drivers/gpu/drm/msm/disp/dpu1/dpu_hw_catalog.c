@@ -440,6 +440,11 @@ static const struct dpu_sspp_sub_blks dpu_vig_sblk_qseed3_3_2 =
  * dpu_vig_sblk_qseed3_3_2 is shared with sar2130p, whose device tree has never
  * been read here.  Adding the offset to the shared macro would assert a register
  * location for a part nobody checked.
+ *
+ * It also declares the pipe's 16-bit-float chain, from the same tree:
+ *   qcom,sde-fp16-csc    = <0x200 0x10000>      (and igc, gc, unmult at the same base)
+ * Its control register and ten matrix words are pipe + 0x200 .. 0x228 (a video
+ * pipe's second rect has its own control at + 0x280).
  */
 #define _VIG_SBLK_IGC(scaler_ver) \
 	{ \
@@ -451,6 +456,8 @@ static const struct dpu_sspp_sub_blks dpu_vig_sblk_qseed3_3_2 =
 	.igc_blk = {.name = "igc", \
 		.version = 0x60000, \
 		.base = 0x1d00, .len = 0x100,}, \
+	.fp16_blk = {.name = "fp16", \
+		.base = 0x200, .len = 0x2c,}, \
 	.format_list = plane_formats_yuv_fp16, \
 	.num_formats = ARRAY_SIZE(plane_formats_yuv_fp16), \
 	.rotation_cfg = NULL, \
@@ -472,8 +479,13 @@ static const struct dpu_sspp_sub_blks dpu_rgb_sblk = _RGB_SBLK();
 
 static const struct dpu_sspp_sub_blks dpu_dma_sblk = _DMA_SBLK();
 
-/* sm8550: a DMA pipe that also fetches 16-bit float (see plane_formats_fp16) */
+/*
+ * sm8550: a DMA pipe that also fetches 16-bit float (see plane_formats_fp16), and has the 16-bit-float chain --
+ * this device's tree gives its two rects ONE control register, pipe + 0x200
+ */
 static const struct dpu_sspp_sub_blks dpu_dma_sblk_fp16 = {
+	.fp16_blk = {.name = "fp16",
+		.base = 0x200, .len = 0x2c,},
 	.format_list = plane_formats_fp16,
 	.num_formats = ARRAY_SIZE(plane_formats_fp16),
 };
