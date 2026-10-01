@@ -2,8 +2,9 @@
 /*
  * The 16-bit-float chain's colour matrix takes IEEE binary16 values (this device's own driver writes them as
  * sixteen-bit halves of each register: sde_setup_fp16_cscv1). A DRM 3x4 colour matrix arrives as S31.32 in
- * SIGN-MAGNITUDE form. This header holds the one conversion between the two, pure so a host test can include it
- * unchanged. A host build defines u16, u64 and fls64() and includes <stdbool.h> before including it.
+ * SIGN-MAGNITUDE form. This header holds the conversion between the two, and the packing of a whole matrix into the
+ * chain's registers, pure so a host test can include it unchanged. A host build defines u16, u32, u64 and fls64()
+ * and includes <stdbool.h> before including it.
  */
 #ifndef _DPU_FP16_CSC_H
 #define _DPU_FP16_CSC_H
@@ -72,6 +73,38 @@ static inline bool dpu_fp16_from_s31_32(u64 v, u16 *out)
 		return false;
 
 	*out = sign | (u16)((e + 15) << 10) | (u16)(q & 0x3ff);
+	return true;
+}
+
+/* the chain's registers from its base + 0x04: six of matrix, the three pre-clamps, the post-clamp */
+#define DPU_FP16_CSC_WORDS	10
+
+/**
+ * dpu_fp16_csc_pack - a DRM 3x4 colour matrix as the 16-bit-float chain's ten registers
+ * @v:     the twelve values, S31.32 sign-magnitude, row-major: each row's three coefficients, then its offset
+ * @words: six matrix words -- value 2i in the low half, 2i + 1 in the high half -- then the pre-clamps of R, G
+ *         and B and the post-clamp, each a (low, high) pair of halves
+ *
+ * The layout is the one the hardware was MEASURED to read: the twelve values in the order given, the offset
+ * applied after the matrix (the stage-2 spike, every pixel check exact). The pre-clamps pass every finite half;
+ * the post-clamp keeps the output in [0, 1].
+ *
+ * Return: false, with @words untouched, when a value has no finite binary16.
+ */
+static inline bool dpu_fp16_csc_pack(const u64 v[12], u32 words[DPU_FP16_CSC_WORDS])
+{
+	u16 h[12];
+	int i;
+
+	for (i = 0; i < 12; i++)
+		if (!dpu_fp16_from_s31_32(v[i], &h[i]))
+			return false;
+	for (i = 0; i < 6; i++)
+		words[i] = h[2 * i] | (u32)h[2 * i + 1] << 16;
+	words[6] = 0x7bfffbff;		/* R: [-65504, 65504] */
+	words[7] = 0x7bfffbff;		/* G */
+	words[8] = 0x7bfffbff;		/* B */
+	words[9] = 0x3c000000;		/* the output: [0, 1] */
 	return true;
 }
 
