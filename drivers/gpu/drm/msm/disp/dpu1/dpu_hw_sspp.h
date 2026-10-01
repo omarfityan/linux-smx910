@@ -22,6 +22,9 @@ struct dpu_hw_sspp;
 #define DPU_SSPP_SOURCE_ROTATED_90	BIT(2)
 #define DPU_SSPP_ROT_90			BIT(3)
 #define DPU_SSPP_SOLID_FILL		BIT(4)
+/* SPIKE, TEST ONLY: candidate M2, a colour matrix in force on an RGB source (colorop_rgb_matrix_variant) */
+#define DPU_SSPP_RGB_MATRIX		BIT(5)
+#define DPU_SSPP_RGB_MATRIX_SRC_FORMAT	BIT(6)
 
 /*
  * Component indices
@@ -189,6 +192,15 @@ struct dpu_hw_sspp_ops {
 	 */
 	void (*setup_format)(struct dpu_sw_pipe *pipe,
 			     const struct msm_format *fmt, u32 flags);
+
+	/**
+	 * @setup_fp16_csc: SPIKE, TEST ONLY -- candidate M1: program the 16-bit-float chain's
+	 *                  colour matrix and clamps (ten words from B + 0x04) and switch its
+	 *                  matrix stage on; called after @setup_format, which writes B to 0
+	 * @pipe: Pointer to software pipe context
+	 * @words: six matrix words, then four clamp words
+	 */
+	void (*setup_fp16_csc)(struct dpu_sw_pipe *pipe, const u32 *words);
 
 	/**
 	 * @setup_rects: setup pipe ROI rectangles

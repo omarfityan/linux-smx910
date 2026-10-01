@@ -53,6 +53,8 @@ void dpu_colorop_crtc_flush(struct drm_crtc *crtc, struct dpu_hw_ctl *ctl);
 bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
 			   struct drm_plane_state *plane_state,
 			   struct dpu_csc_cfg *out);
+int dpu_plane_colorop_fp16_csc(struct drm_atomic_state *state,
+			       struct drm_plane_state *plane_state, u32 *words);
 int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			    struct drm_plane_state *plane_state,
 			    struct dpu_colorop_reports *reports);

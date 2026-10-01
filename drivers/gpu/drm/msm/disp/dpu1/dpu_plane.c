@@ -86,6 +86,17 @@ module_param_named(fp16_refused, dpu_fp16_refused, uint, 0444);
 MODULE_PARM_DESC(fp16_refused, "How many 16-bit-float framebuffers fp16_refuse has refused");
 
 /*
+ * SPIKE, TEST ONLY: candidate M2 -- a colour matrix on an 8- or 10-bit RGB source through the video
+ * pipe's matrix, which this device's own driver never enables for RGB. 0 refuses as before; 1 sets the
+ * matrix stage's enable without its YUV-source flag; 2 also sets SRC_FORMAT bit 15. Change it only
+ * while nothing is on the plane path.
+ */
+static int dpu_colorop_rgb_matrix_variant;
+module_param_named(colorop_rgb_matrix_variant, dpu_colorop_rgb_matrix_variant, int, 0644);
+MODULE_PARM_DESC(colorop_rgb_matrix_variant,
+	"TEST ONLY, default 0: 0 refuse a matrix on RGB, 1 the CSC-10 enable without its YUV flag, 2 also SRC_FORMAT bit 15");
+
+/*
  * struct dpu_plane - local dpu plane structure
  * @vm: address space pointer
  * @csc_ptr: Points to dpu_csc_cfg structure to use for current
@@ -1042,14 +1053,29 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 							new_plane_state,
 							&pstate->pipeline_csc);
 
+	/* SPIKE, TEST ONLY: candidate M1 -- a 16-bit-float buffer's matrix goes to the float chain */
+	pstate->has_pipeline_fp16_csc = false;
+	if (MSM_FORMAT_IS_FP16(msm_framebuffer_format(new_plane_state->fb))) {
+		ret = dpu_plane_colorop_fp16_csc(new_plane_state->state, new_plane_state,
+						 pstate->pipeline_fp16_csc);
+		if (ret < 0)
+			return ret;
+		pstate->has_pipeline_fp16_csc = ret > 0;
+	}
+
 	/*
 	 * The pipe enables its colour matrix for YUV sources only (dpu_hw_setup_format_impl; this
 	 * device's own driver does the same), so a matrix in force on an RGB or 16-bit-float buffer would
 	 * be loaded and never applied. Refuse it: the compositor then composes the frame, slower and
 	 * correct. (A bypassed matrix leaves has_pipeline_csc false and is not refused.)
+	 * SPIKE: not for a float buffer whose matrix the float chain carries (M1), nor for another RGB
+	 * buffer while colorop_rgb_matrix_variant is set (M2).
 	 */
 	if (pstate->has_pipeline_csc &&
-	    !MSM_FORMAT_IS_YUV(msm_framebuffer_format(new_plane_state->fb))) {
+	    !MSM_FORMAT_IS_YUV(msm_framebuffer_format(new_plane_state->fb)) &&
+	    !pstate->has_pipeline_fp16_csc &&
+	    !(dpu_colorop_rgb_matrix_variant &&
+	      !MSM_FORMAT_IS_FP16(msm_framebuffer_format(new_plane_state->fb)))) {
 		DRM_INFO_ONCE("colorop: %s refused: a colour matrix in force on an RGB buffer is never applied by this pipe\n",
 			      plane->name);
 		return -EINVAL;
@@ -1638,8 +1664,21 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
 		if (rotation & DRM_MODE_ROTATE_90)
 			src_flags |= DPU_SSPP_ROT_90;
 
+		/* SPIKE, TEST ONLY: candidate M2, the matrix on an 8- or 10-bit RGB source */
+		if (pstate->has_pipeline_csc && !MSM_FORMAT_IS_YUV(fmt) &&
+		    !MSM_FORMAT_IS_FP16(fmt) && dpu_colorop_rgb_matrix_variant >= 1) {
+			src_flags |= DPU_SSPP_RGB_MATRIX;
+			if (dpu_colorop_rgb_matrix_variant == 2)
+				src_flags |= DPU_SSPP_RGB_MATRIX_SRC_FORMAT;
+		}
+
 		/* update format */
 		pipe->sspp->ops.setup_format(pipe, fmt, src_flags);
+
+		/* SPIKE, TEST ONLY: candidate M1, after setup_format wrote the float chain's control to 0 */
+		if (pstate->has_pipeline_fp16_csc && MSM_FORMAT_IS_FP16(fmt) &&
+		    pipe->sspp->ops.setup_fp16_csc)
+			pipe->sspp->ops.setup_fp16_csc(pipe, pstate->pipeline_fp16_csc);
 
 		if (pipe->sspp->ops.setup_cdp) {
 			const struct dpu_perf_cfg *perf = pdpu->catalog->perf;

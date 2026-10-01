@@ -13,6 +13,8 @@
 
 #include <drm/drm_file.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_print.h>
+#include <linux/jiffies.h>
 
 #include <linux/soc/qcom/ubwc.h>
 
@@ -220,6 +222,68 @@ void dpu_hw_sspp_setup_csc10_opmode(struct dpu_hw_sspp *ctx,
 /*
  * Setup source pixel format, flip,
  */
+/*
+ * SPIKE, TEST ONLY: should a candidate's register line print? On a change, and again after five
+ * seconds without a programming on this pipe -- so every arm run gets its line and a client
+ * presenting at 120 Hz does not print one a frame.
+ */
+static bool dpu_hw_sspp_spike_report(u32 *last, unsigned long *seen, const u32 *now, int n)
+{
+	bool quiet = !memcmp(last, now, n * sizeof(*now)) && time_before(jiffies, *seen + 5 * HZ);
+
+	*seen = jiffies;
+	if (quiet)
+		return false;
+	memcpy(last, now, n * sizeof(*now));
+	return true;
+}
+
+/*
+ * SPIKE, TEST ONLY: candidate M1. The 16-bit-float chain's matrix and clamps go to B + 0x04 ..
+ * B + 0x28, then B = BIT(2) switches its matrix stage on (and every other stage off). Called after
+ * setup_format, which writes B to 0 for a 16-bit-float format. Every register is read back for the line.
+ */
+static void dpu_hw_sspp_setup_fp16_csc(struct dpu_sw_pipe *pipe, const u32 *words)
+{
+	static u32 last[SSPP_MAX][11];
+	static unsigned long seen[SSPP_MAX];
+	struct dpu_hw_sspp *ctx = pipe->sspp;
+	u32 base, rb[11];
+	int i;
+
+	if (!ctx)
+		return;
+	base = (pipe->multirect_index == DPU_SSPP_RECT_1 && ctx->cap->type == SSPP_TYPE_VIG) ?
+	       DPU_SSPP_FP16_CTRL_REC1 : DPU_SSPP_FP16_CTRL;
+	for (i = 0; i < 10; i++)
+		DPU_REG_WRITE(&ctx->hw, base + 4 + 4 * i, words[i]);
+	DPU_REG_WRITE(&ctx->hw, base, BIT(2));
+
+	rb[0] = DPU_REG_READ(&ctx->hw, base);
+	for (i = 0; i < 10; i++)
+		rb[i + 1] = DPU_REG_READ(&ctx->hw, base + 4 + 4 * i);
+	if (dpu_hw_sspp_spike_report(last[ctx->idx], &seen[ctx->idx], rb, 11))
+		DRM_INFO("colorop: %s fp16 matrix: ctl 0x%08x words 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x clamps 0x%08x 0x%08x 0x%08x 0x%08x\n",
+			 ctx->cap->name, rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], rb[6],
+			 rb[7], rb[8], rb[9], rb[10]);
+}
+
+/* SPIKE, TEST ONLY: candidate M2's two registers, read back */
+static void dpu_hw_sspp_report_rgb_matrix(struct dpu_hw_sspp *ctx, u32 flags, u32 format_off)
+{
+	static u32 last[SSPP_MAX][2];
+	static unsigned long seen[SSPP_MAX];
+	u32 rb[2] = { 0, DPU_REG_READ(&ctx->hw, format_off) };
+
+	if (test_bit(DPU_SSPP_CSC_10BIT, &ctx->cap->features))
+		rb[0] = DPU_REG_READ(&ctx->hw,
+				     ctx->cap->sblk->csc_blk.base + SSPP_VIG_CSC_10_OP_MODE);
+	if (dpu_hw_sspp_spike_report(last[ctx->idx], &seen[ctx->idx], rb, 2))
+		DRM_INFO("colorop: %s rgb matrix variant %d: csc10 op 0x%08x src_format 0x%08x\n",
+			 ctx->cap->name, (flags & DPU_SSPP_RGB_MATRIX_SRC_FORMAT) ? 2 : 1,
+			 rb[0], rb[1]);
+}
+
 static void dpu_hw_sspp_setup_format(struct dpu_sw_pipe *pipe,
 		const struct msm_format *fmt, u32 flags)
 {
@@ -377,9 +441,21 @@ void dpu_hw_setup_format_impl(struct dpu_sw_pipe *pipe, const struct msm_format 
 			VIG_CSC_10_EN | VIG_CSC_10_SRC_DATAFMT,
 			MSM_FORMAT_IS_YUV(fmt));
 
+	/*
+	 * SPIKE, TEST ONLY: candidate M2 -- the video pipe's matrix on an RGB source. Variant 1 sets
+	 * the matrix stage's enable without its YUV-source flag; variant 2 also SRC_FORMAT bit 15.
+	 */
+	if ((flags & DPU_SSPP_RGB_MATRIX) && test_bit(DPU_SSPP_CSC_10BIT, &ctx->cap->features))
+		dpu_hw_sspp_setup_csc10_opmode(ctx, VIG_CSC_10_EN, true);
+	if (flags & DPU_SSPP_RGB_MATRIX_SRC_FORMAT)
+		src_format |= BIT(15);
+
 	DPU_REG_WRITE(c, format_off, src_format);
 	DPU_REG_WRITE(c, unpack_pat_off, unpack);
 	DPU_REG_WRITE(c, op_mode_off, opmode);
+
+	if (flags & DPU_SSPP_RGB_MATRIX)
+		dpu_hw_sspp_report_rgb_matrix(ctx, flags, format_off);
 
 	/* clear previous UBWC error */
 	DPU_REG_WRITE(c, ubwc_error_off, BIT(31));
@@ -647,6 +723,7 @@ static void _setup_layer_ops(struct dpu_hw_sspp *c,
 		unsigned long features, const struct dpu_mdss_version *mdss_rev)
 {
 	c->ops.setup_format = dpu_hw_sspp_setup_format;
+	c->ops.setup_fp16_csc = dpu_hw_sspp_setup_fp16_csc;
 	c->ops.setup_rects = dpu_hw_sspp_setup_rects;
 	c->ops.setup_sourceaddress = dpu_hw_sspp_setup_sourceaddress;
 	c->ops.setup_solidfill = dpu_hw_sspp_setup_solidfill;

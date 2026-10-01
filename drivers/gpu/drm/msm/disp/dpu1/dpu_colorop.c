@@ -48,6 +48,7 @@
 #include "dpu_hw_reg_dma.h"
 #include "dpu_hw_sspp.h"
 #include "dpu_colorop_igc.h"
+#include "dpu_fp16_csc.h"
 #include "dpu_kms.h"
 #include "dpu_plane.h"
 
@@ -379,6 +380,44 @@ MODULE_PARM_DESC(colorop_igc_test_invert,
 /* DRM object ids are positive ints, so the top bit is free to mark a transformed table */
 #define DPU_COLOROP_IGC_ID_INVERTED	BIT(31)
 
+/*
+ * SPIKE, TEST ONLY: load a KNOWN table -- a DRM-space identity, converted exactly as a compositor's
+ * table is -- in place of the compositor's, so the plane's output for input v can be checked against
+ * v itself. With the invert switch as well, the identity is loaded inverted. Toggle it only while
+ * nothing is on the plane path.
+ */
+static bool dpu_colorop_igc_test_identity;
+module_param_named(colorop_igc_test_identity, dpu_colorop_igc_test_identity, bool, 0644);
+MODULE_PARM_DESC(colorop_igc_test_identity,
+	"TEST ONLY, default off: load an identity inverse-gamma table in place of the compositor's");
+
+#define DPU_COLOROP_IGC_ID_IDENTITY	BIT(30)
+
+static void dpu_colorop_igc_identity(u32 *tbl, u32 *last)
+{
+	/*
+	 * A DRM-space identity -- entry j = j / 255 at full scale, exactly what a
+	 * compositor would send for "no change" -- pushed through the SAME
+	 * conversion the compositor's table takes, so an arm with this switch
+	 * tests the conversion, never the switch's own arithmetic.
+	 */
+	u32 ident[DPU_IGC_LUT_LEN];
+	u16 slots[DPU_IGC_SLOTS], endpoint;
+	u32 ch, i;
+
+	for (i = 0; i < DPU_IGC_LUT_LEN; i++)
+		ident[i] = (u32)div_u64((u64)i * 0xffffffffull + (DPU_IGC_LUT_LEN - 1) / 2,
+					DPU_IGC_LUT_LEN - 1);
+	dpu_igc_convert_channel(ident, 1, DPU_IGC_LUT_LEN, slots, &endpoint);
+	for (ch = 0; ch < DPU_IGC_CHANNELS; ch++) {
+		for (i = 0; i < DPU_IGC_LUT_LEN / 2; i++)
+			tbl[ch * (DPU_IGC_LUT_LEN / 2) + i] =
+				(slots[2 * i] & DPU_IGC_ENTRY_MASK) |
+				((slots[2 * i + 1] & DPU_IGC_ENTRY_MASK) << 16);
+		last[ch] = endpoint & DPU_IGC_ENTRY_MASK;
+	}
+}
+
 static_assert(DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) == DPU_PLANE_IGC_DWORDS,
 	      "the inversion walks exactly the plane state's packed table");
 static_assert(DPU_IGC_CHANNELS == DPU_PLANE_IGC_CHANNELS, "one endpoint per channel");
@@ -526,6 +565,46 @@ dpu_colorop_effective_state(struct drm_atomic_state *state,
 	return cs ? cs : colorop->state;
 }
 
+/*
+ * SPIKE, TEST ONLY: a known colour matrix, injected. Twelve S15.16 values, row-major 3x4, the last
+ * value of each row the offset in full scales. While it holds exactly twelve values, a pipeline whose
+ * matrix is BYPASSED is treated as carrying this one, fed through the SAME conversions as a
+ * compositor's, so each matrix block's layout can be measured with known numbers whatever the
+ * compositor offers. Write 0 to clear it. Change it only while nothing is on the plane path.
+ */
+static int dpu_colorop_test_matrix[12];
+static int dpu_colorop_test_matrix_n;
+module_param_array_named(colorop_test_matrix, dpu_colorop_test_matrix, int,
+			 &dpu_colorop_test_matrix_n, 0644);
+MODULE_PARM_DESC(colorop_test_matrix,
+	"TEST ONLY, default empty: twelve S15.16 values, row-major 3x4; a bypassed pipeline matrix is treated as this one");
+
+static struct drm_color_ctm_3x4 dpu_colorop_test_ctm;
+static struct drm_property_blob dpu_colorop_test_blob;
+
+/* the matrix in force: the compositor's, or the injected one standing in for a bypassed matrix */
+static const struct drm_property_blob *
+dpu_colorop_matrix_in_force(const struct drm_colorop_state *cs)
+{
+	int i;
+
+	if (!cs)
+		return NULL;
+	if (!cs->bypass)
+		return cs->data;
+	if (dpu_colorop_test_matrix_n != 12)
+		return NULL;
+	for (i = 0; i < 12; i++) {
+		s64 v = dpu_colorop_test_matrix[i];
+		u64 mag = (u64)(v < 0 ? -v : v) << 16;
+
+		dpu_colorop_test_ctm.matrix[i] = v < 0 ? (mag | (1ULL << 63)) : mag;
+	}
+	dpu_colorop_test_blob.data = &dpu_colorop_test_ctm;
+	dpu_colorop_test_blob.length = sizeof(dpu_colorop_test_ctm);
+	return &dpu_colorop_test_blob;
+}
+
 /**
  * dpu_plane_colorop_csc - the colour matrix this plane's pipeline asks for
  * @state: the plane state being checked or committed
@@ -540,16 +619,57 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
 			   struct dpu_csc_cfg *out)
 {
 	struct drm_colorop *colorop = plane_state->color_pipeline;
-	struct drm_colorop_state *cs;
+	const struct drm_property_blob *blob;
 
 	if (!colorop)
 		return false;
 
-	cs = dpu_colorop_effective_state(state, colorop);
-	if (!cs || cs->bypass || !cs->data)
+	blob = dpu_colorop_matrix_in_force(dpu_colorop_effective_state(state, colorop));
+	if (!blob)
 		return false;
 
-	return dpu_colorop_ctm_to_csc(cs->data, out) == 0;
+	return dpu_colorop_ctm_to_csc(blob, out) == 0;
+}
+
+/**
+ * dpu_plane_colorop_fp16_csc - SPIKE, TEST ONLY: candidate M1, the matrix in force as the
+ *                              16-bit-float chain's ten words
+ * @state:       the atomic state
+ * @plane_state: the plane state being checked
+ * @words:       six matrix words -- the twelve values as IEEE binary16, value 2i in the low half
+ *               and 2i+1 in the high half, ROW-MAJOR AS GIVEN (the reading the layout arm expects,
+ *               and the thing it tests) -- then the pre-clamps [-65504, 65504] for R, G and B and
+ *               the post-clamp [0, 1]
+ *
+ * Return: 1 with @words filled, 0 when no matrix is in force, -EINVAL when a value has no binary16.
+ */
+int dpu_plane_colorop_fp16_csc(struct drm_atomic_state *state,
+			       struct drm_plane_state *plane_state, u32 *words)
+{
+	struct drm_colorop *colorop = plane_state->color_pipeline;
+	const struct drm_property_blob *blob;
+	const struct drm_color_ctm_3x4 *ctm;
+	u16 h[12];
+	int i;
+
+	if (!colorop)
+		return 0;
+	blob = dpu_colorop_matrix_in_force(dpu_colorop_effective_state(state, colorop));
+	if (!blob)
+		return 0;
+	if (blob->length != sizeof(*ctm))
+		return -EINVAL;
+	ctm = blob->data;
+	for (i = 0; i < 12; i++)
+		if (!dpu_fp16_from_s31_32(ctm->matrix[i], &h[i]))
+			return -EINVAL;
+	for (i = 0; i < 6; i++)
+		words[i] = h[2 * i] | (u32)h[2 * i + 1] << 16;
+	words[6] = 0x7bfffbff;
+	words[7] = 0x7bfffbff;
+	words[8] = 0x7bfffbff;
+	words[9] = 0x3c000000;
+	return 1;
 }
 
 /* what the compositor placed, as booleans -- reported when it changes, never per frame */
@@ -644,6 +764,11 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			}
 			pstate->has_pipeline_igc = true;
 			pstate->pipeline_igc_id = cs->data->base.id;
+			if (dpu_colorop_igc_test_identity) {
+				dpu_colorop_igc_identity(pstate->pipeline_igc,
+							 pstate->pipeline_igc_last);
+				pstate->pipeline_igc_id |= DPU_COLOROP_IGC_ID_IDENTITY;
+			}
 			if (dpu_colorop_igc_test_invert) {
 				dpu_colorop_igc_invert(pstate->pipeline_igc,
 						       pstate->pipeline_igc_last);

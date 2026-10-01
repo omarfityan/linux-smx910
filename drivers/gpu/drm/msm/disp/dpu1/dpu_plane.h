@@ -56,6 +56,10 @@ struct dpu_plane_state {
 	bool has_pipeline_csc;
 	struct dpu_csc_cfg pipeline_csc;
 
+	/* SPIKE, TEST ONLY: candidate M1 -- the matrix carried by the 16-bit-float chain instead */
+	bool has_pipeline_fp16_csc;
+	u32 pipeline_fp16_csc[10];
+
 	/*
 	 * And the same for the pipeline's inverse-gamma table: converted at
 	 * check time and CARRIED, for the same reason.  It is held packed the
