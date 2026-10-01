@@ -1709,7 +1709,9 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
 
 		/*
 		 * A 16-bit-float plane's matrix: the float chain's words first, then setup_format
-		 * switches the chain's matrix stage on -- never on with another matrix's words.
+		 * switches the chain's matrix stage on -- switched on from off, the stage never shows
+		 * another matrix's words; between two matrices it is already on, and the change relies
+		 * on the registers latching at the flush (not measured).
 		 */
 		if (pstate->has_pipeline_fp16_csc && pipe->sspp->ops.setup_fp16_csc) {
 			pipe->sspp->ops.setup_fp16_csc(pipe, pstate->pipeline_fp16_csc);

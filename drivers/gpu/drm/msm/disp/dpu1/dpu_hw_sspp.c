@@ -287,8 +287,10 @@ static void dpu_hw_sspp_setup_format(struct dpu_sw_pipe *pipe,
 /*
  * The 16-bit-float chain's colour matrix and clamps: ten words from the control register + 0x04,
  * six of matrix then four of clamps (dpu_fp16_csc_pack). Written BEFORE setup_format switches the
- * matrix stage on, so the stage is never on with another matrix's words; given only to a solo
- * video pipe (dpu_plane_atomic_check_sspp), whose chain is its first rect's.
+ * matrix stage on, so a stage switched on from off never shows another matrix's words; a change
+ * from one matrix to another is written while the stage is already on, and relies on these
+ * registers latching at the flush, which has not been measured. Given only to a solo video pipe
+ * (dpu_plane_atomic_check_sspp), whose chain is its first rect's.
  */
 static void dpu_hw_sspp_setup_fp16_csc(struct dpu_sw_pipe *pipe, const u32 words[DPU_FP16_CSC_WORDS])
 {

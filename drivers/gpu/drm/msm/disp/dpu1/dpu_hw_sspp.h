@@ -198,7 +198,8 @@ struct dpu_hw_sspp_ops {
 	/**
 	 * @setup_fp16_csc: write the 16-bit-float chain's colour matrix and clamps (dpu_fp16_csc_pack); a
 	 *                  video pipe with the chain only. Called before @setup_format, which switches the
-	 *                  chain's matrix stage on (DPU_SSPP_FP16_MATRIX).
+	 *                  chain's matrix stage on (DPU_SSPP_FP16_MATRIX); between two matrices the stage
+	 *                  is already on, and the change relies on the flush latching (not measured).
 	 * @pipe: Pointer to software pipe context
 	 * @words: the six matrix words and four clamp words
 	 */
