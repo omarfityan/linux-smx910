@@ -1051,14 +1051,22 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 							 &pstate->pipeline_csc);
 
 	/*
-	 * The video pipe enables its colour matrix for YUV sources only (dpu_hw_setup_format_impl;
-	 * this device's own driver does the same), so a matrix in force on an RGB buffer would be
-	 * loaded and never applied. Refuse it: the compositor then composes the frame, slower and
-	 * correct. A 16-bit-float buffer's matrix is applied by the pipe's float chain instead
-	 * (has_pipeline_fp16_csc) and is not refused. (A bypassed matrix leaves has_pipeline_csc
-	 * false and is not refused.)
+	 * A 10-bit RGB buffer's matrix is applied by the video matrix itself, its enable set for an
+	 * RGB source (DPU_SSPP_RGB_MATRIX) -- on ARGB2101010, the one RGB format whose pixels
+	 * verified it: the matrix in DRM's own order, its pre-bias solved as for YUV. This device's
+	 * own driver enables that block for YUV only.
 	 */
-	if (pstate->has_pipeline_csc && !pstate->has_pipeline_fp16_csc &&
+	pstate->has_pipeline_rgb_csc = pstate->has_pipeline_csc && !pstate->has_pipeline_fp16_csc &&
+		msm_framebuffer_format(new_plane_state->fb)->pixel_format == DRM_FORMAT_ARGB2101010;
+
+	/*
+	 * Any other matrix in force on an RGB buffer would be loaded and never applied: the video
+	 * pipe enables its colour matrix for YUV sources, and for the RGB format above. Refuse it:
+	 * the compositor then composes the frame, slower and correct. A 16-bit-float buffer's matrix
+	 * is applied by the pipe's float chain instead (has_pipeline_fp16_csc) and is not refused.
+	 * (A bypassed matrix leaves has_pipeline_csc false and is not refused.)
+	 */
+	if (pstate->has_pipeline_csc && !pstate->has_pipeline_fp16_csc && !pstate->has_pipeline_rgb_csc &&
 	    !MSM_FORMAT_IS_YUV(msm_framebuffer_format(new_plane_state->fb))) {
 		DRM_INFO_ONCE("colorop: %s refused: a colour matrix in force on an RGB buffer is never applied by this pipe\n",
 			      plane->name);
@@ -1191,6 +1199,25 @@ static int dpu_plane_atomic_check_sspp(struct drm_plane *plane,
 			if (dpu_colorop_report_refusal(&pdpu->colorop_reports,
 						       DPU_COLOROP_REFUSAL_FP16_MATRIX_PIPE))
 				DPU_ERROR("%s: a 16-bit-float colour matrix was assigned to %s, which is not a solo video pipe with the float chain\n",
+					  plane->name, p->sspp->cap->name);
+			return -EINVAL;
+		}
+	}
+
+	/* and an RGB plane's matrix is the video matrix's, which is a solo video pipe's first rect's */
+	if (pstate->has_pipeline_rgb_csc) {
+		int i;
+
+		for (i = 0; i < PIPES_PER_PLANE; i++) {
+			const struct dpu_sw_pipe *p = &pstate->pipe[i];
+
+			if (!p->sspp)
+				continue;
+			if (p->sspp->cap->type == SSPP_TYPE_VIG && p->multirect_index == DPU_SSPP_RECT_SOLO)
+				continue;
+			if (dpu_colorop_report_refusal(&pdpu->colorop_reports,
+						       DPU_COLOROP_REFUSAL_RGB_MATRIX_PIPE))
+				DPU_ERROR("%s: an RGB colour matrix was assigned to %s, which is not a solo video pipe\n",
 					  plane->name, p->sspp->cap->name);
 			return -EINVAL;
 		}
@@ -1685,6 +1712,10 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
 			pipe->sspp->ops.setup_fp16_csc(pipe, pstate->pipeline_fp16_csc);
 			src_flags |= DPU_SSPP_FP16_MATRIX;
 		}
+
+		/* an RGB plane's matrix: the video matrix enabled for an RGB source */
+		if (pstate->has_pipeline_rgb_csc)
+			src_flags |= DPU_SSPP_RGB_MATRIX;
 
 		/* update format */
 		pipe->sspp->ops.setup_format(pipe, fmt, src_flags);

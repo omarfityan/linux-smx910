@@ -398,10 +398,19 @@ void dpu_hw_setup_format_impl(struct dpu_sw_pipe *pipe, const struct msm_format 
 	if (test_bit(DPU_SSPP_CSC, &ctx->cap->features))
 		dpu_hw_sspp_setup_opmode(ctx, VIG_OP_CSC_EN | VIG_OP_CSC_SRC_DATAFMT,
 			MSM_FORMAT_IS_YUV(fmt));
-	else if (test_bit(DPU_SSPP_CSC_10BIT, &ctx->cap->features))
-		dpu_hw_sspp_setup_csc10_opmode(ctx,
-			VIG_CSC_10_EN | VIG_CSC_10_SRC_DATAFMT,
+	else if (test_bit(DPU_SSPP_CSC_10BIT, &ctx->cap->features)) {
+		/*
+		 * The video matrix is enabled for a YUV source, and for an RGB source whose
+		 * plane carries a colour matrix (DPU_SSPP_RGB_MATRIX): measured to apply a
+		 * matrix to a 10-bit RGB fetch in DRM's own order with this enable alone. The
+		 * flag that says the source is YUV is set for YUV only, and SRC_FORMAT keeps
+		 * its YUV-only bit 15.
+		 */
+		dpu_hw_sspp_setup_csc10_opmode(ctx, VIG_CSC_10_EN,
+			MSM_FORMAT_IS_YUV(fmt) || (flags & DPU_SSPP_RGB_MATRIX));
+		dpu_hw_sspp_setup_csc10_opmode(ctx, VIG_CSC_10_SRC_DATAFMT,
 			MSM_FORMAT_IS_YUV(fmt));
+	}
 
 	DPU_REG_WRITE(c, format_off, src_format);
 	DPU_REG_WRITE(c, unpack_pat_off, unpack);

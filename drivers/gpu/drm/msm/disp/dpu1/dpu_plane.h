@@ -66,6 +66,13 @@ struct dpu_plane_state {
 	u32 pipeline_fp16_csc[DPU_FP16_CSC_WORDS];
 
 	/*
+	 * And a 10-bit RGB buffer's matrix, applied by the video matrix itself with its
+	 * enable set for an RGB source (DPU_SSPP_RGB_MATRIX) -- on the one RGB format
+	 * whose pixels verified it. has_pipeline_csc is set too, and pipeline_csc holds it.
+	 */
+	bool has_pipeline_rgb_csc;
+
+	/*
 	 * And the same for the pipeline's inverse-gamma table: converted at
 	 * check time and CARRIED, for the same reason.  It is held packed the
 	 * way the block takes it -- three channels of 128 dwords, two twelve-bit

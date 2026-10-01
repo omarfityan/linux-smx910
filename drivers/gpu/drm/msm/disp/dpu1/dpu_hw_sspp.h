@@ -25,6 +25,8 @@ struct dpu_hw_sspp;
 #define DPU_SSPP_SOLID_FILL		BIT(4)
 /* a 16-bit-float plane's colour matrix is in force: setup_format switches the float chain's matrix stage on */
 #define DPU_SSPP_FP16_MATRIX		BIT(5)
+/* an RGB plane's colour matrix is in force: setup_format enables the video matrix for an RGB source */
+#define DPU_SSPP_RGB_MATRIX		BIT(6)
 
 /*
  * Component indices
