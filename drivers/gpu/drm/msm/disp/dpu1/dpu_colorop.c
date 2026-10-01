@@ -72,17 +72,20 @@
 /*
  * The block's register fields are narrower than the arithmetic that fills them.  A
  * coefficient is S4.9 in thirteen bits -- dpu_hw_csc_setup() keeps bits 7 to 19 of the
- * S15.16 value -- so it holds [-8, 8 - 1/512]; a bias register takes sixteen bits of
- * ten-bit code values.  A value outside either would be written WRAPPED: a coefficient of
- * 8 lands as -8, of 200 as -8 as well.  Both are refused in the conversion, where the
- * commit can still be refused and the compositor composes the frame instead.
+ * S15.16 value -- so it holds [-8, 8 - 1/512]; a bias register is written sixteen bits
+ * wide but KEEPS ELEVEN, two's complement, of ten-bit code values: [-1024, 1023].  The
+ * vendor's 0xffc0 and 0xfe00 read back from the hardware as 0x7c0 and 0x600 -- the same
+ * values in eleven bits.  A value outside either field would be written WRAPPED: a
+ * coefficient of 8 lands as -8, of 200 as -8 as well, a bias of 1024 as -1024.  Both are
+ * refused in the conversion, where the commit can still be refused and the compositor
+ * composes the frame instead.
  */
 #define DPU_CSC_COEFF_MIN	(-8 * 65536LL)
 #define DPU_CSC_COEFF_MAX	(8 * 65536LL - 128)
-#define DPU_CSC_BIAS_CODE_MIN	(-32768LL)
-#define DPU_CSC_BIAS_CODE_MAX	32767LL
+#define DPU_CSC_BIAS_CODE_MIN	(-1024LL)
+#define DPU_CSC_BIAS_CODE_MAX	1023LL
 /*
- * An offset beyond this many full scales cannot end as a sixteen-bit bias behind any
+ * An offset beyond this many full scales cannot end as an in-range bias behind any
  * matrix the block holds (the bias is at least a twenty-fourth of it), and bounding it
  * before the solve keeps every product below inside sixty-four bits.
  */
