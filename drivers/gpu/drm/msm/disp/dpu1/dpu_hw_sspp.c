@@ -631,6 +631,30 @@ void dpu_hw_sspp_setup_csc(struct dpu_hw_sspp *ctx,
 	}
 
 	dpu_hw_csc_setup(&ctx->hw, offset, data, csc10);
+
+	/*
+	 * SPIKE, TEST ONLY: what the matrix now HOLDS, read back where it is written -- the five
+	 * coefficient words and the three pre-biases (inside the declared csc block) -- and the
+	 * 16-bit-float chain's control, which must read 0 on an RGB plane: a matrix stage left on
+	 * by an earlier float client would act on this fetch too. On a change, and again after five
+	 * seconds without a programming on this pipe.
+	 */
+	if (csc10) {
+		static u32 last[SSPP_MAX][9];
+		static unsigned long seen[SSPP_MAX];
+		u32 rb[9];
+		int i;
+
+		rb[0] = DPU_REG_READ(&ctx->hw, DPU_SSPP_FP16_CTRL);
+		for (i = 0; i < 5; i++)
+			rb[1 + i] = DPU_REG_READ(&ctx->hw, offset + 4 * i);
+		for (i = 0; i < 3; i++)
+			rb[6 + i] = DPU_REG_READ(&ctx->hw, offset + 0x2c + 4 * i);
+		if (dpu_hw_sspp_spike_report(last[ctx->idx], &seen[ctx->idx], rb, 9))
+			DRM_INFO("colorop: %s csc read back: fp16 ctl 0x%08x matrix 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x pre-bias 0x%08x 0x%08x 0x%08x\n",
+				 ctx->cap->name, rb[0], rb[1], rb[2], rb[3], rb[4], rb[5],
+				 rb[6], rb[7], rb[8]);
+	}
 }
 
 static void dpu_hw_sspp_setup_solidfill(struct dpu_sw_pipe *pipe, u32 color)
