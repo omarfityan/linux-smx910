@@ -1052,12 +1052,15 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 
 	/*
 	 * A 10-bit RGB buffer's matrix is applied by the video matrix itself, its enable set for an
-	 * RGB source (DPU_SSPP_RGB_MATRIX) -- on ARGB2101010, the one RGB format whose pixels
-	 * verified it: the matrix in DRM's own order, its pre-bias solved as for YUV. This device's
-	 * own driver enables that block for YUV only.
+	 * RGB source (DPU_SSPP_RGB_MATRIX) -- on LINEAR ARGB2101010, the one RGB layout whose pixels
+	 * verified it: the matrix in DRM's own order, its pre-bias solved as for YUV. A UBWC
+	 * ARGB2101010 buffer unpacks its components in another order (C2_R, C0_G, C1_B against
+	 * linear's C1_B, C0_G, C2_R) and was never measured with a matrix in force, so it is left to
+	 * the refusal below. This device's own driver enables that block for YUV only.
 	 */
 	pstate->has_pipeline_rgb_csc = pstate->has_pipeline_csc && !pstate->has_pipeline_fp16_csc &&
-		msm_framebuffer_format(new_plane_state->fb)->pixel_format == DRM_FORMAT_ARGB2101010;
+		msm_framebuffer_format(new_plane_state->fb)->pixel_format == DRM_FORMAT_ARGB2101010 &&
+		!MSM_FORMAT_IS_UBWC(msm_framebuffer_format(new_plane_state->fb));
 
 	/*
 	 * Any other matrix in force on an RGB buffer would be loaded and never applied: the video
