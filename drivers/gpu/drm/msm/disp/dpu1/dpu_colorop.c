@@ -70,6 +70,25 @@
 #define DPU_CSC_BIAS_SCALE_SHIFT	10
 
 /*
+ * The block's register fields are narrower than the arithmetic that fills them.  A
+ * coefficient is S4.9 in thirteen bits -- dpu_hw_csc_setup() keeps bits 7 to 19 of the
+ * S15.16 value -- so it holds [-8, 8 - 1/512]; a bias register takes sixteen bits of
+ * ten-bit code values.  A value outside either would be written WRAPPED: a coefficient of
+ * 8 lands as -8, of 200 as -8 as well.  Both are refused in the conversion, where the
+ * commit can still be refused and the compositor composes the frame instead.
+ */
+#define DPU_CSC_COEFF_MIN	(-8 * 65536LL)
+#define DPU_CSC_COEFF_MAX	(8 * 65536LL - 128)
+#define DPU_CSC_BIAS_CODE_MIN	(-32768LL)
+#define DPU_CSC_BIAS_CODE_MAX	32767LL
+/*
+ * An offset beyond this many full scales cannot end as a sixteen-bit bias behind any
+ * matrix the block holds (the bias is at least a twenty-fourth of it), and bounding it
+ * before the solve keeps every product below inside sixty-four bits.
+ */
+#define DPU_CSC_OFFSET_MAX	(1024 * 65536LL)
+
+/*
  * dpu_kms tracks which pipes have inverse gamma switched on as a bit per pipe
  * in a u32.  Seventeen today; say so out loud rather than discover it on a part
  * with more, where the overflow would silently stop pipes being turned off.
@@ -84,14 +103,16 @@ static_assert(SSPP_MAX <= 32, "the inverse-gamma on-mask is a u32, one bit a pip
  * remaining bits are a magnitude.  A plain cast would read every negative
  * coefficient as an enormous positive one.
  *
- * Return: the same value as S15.16, two's complement, which is the form
- *         struct dpu_csc_cfg uses.
+ * Return: the same value with sixteen fractional bits, two's complement -- the form
+ *         struct dpu_csc_cfg uses -- but NOT cut to thirty-two bits: a coefficient of
+ *         65536 has to reach the caller's range check as 65536, never as the 0 a cast
+ *         would make of it.
  */
-static s32 dpu_ctm_entry_to_s15_16(u64 v)
+static s64 dpu_ctm_entry_to_s15_16(u64 v)
 {
 	s64 mag = (s64)((v & ~(1ULL << 63)) >> 16);
 
-	return (v & (1ULL << 63)) ? (s32)-mag : (s32)mag;
+	return (v & (1ULL << 63)) ? -mag : mag;
 }
 
 /* a * b, both S15.16, result S15.16 */
@@ -172,13 +193,14 @@ static int dpu_csc_solve_pre_bias(const s64 m[3][3], const s64 t[3], s64 pre[3])
  * @cfg:  the config to fill in
  *
  * Return: 0 on success, -EINVAL if the blob is the wrong size or the matrix
- *         cannot be expressed by this block.
+ *         cannot be expressed by this block: near singular, or a coefficient or a
+ *         bias its register field cannot hold.
  */
 int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
 			   struct dpu_csc_cfg *cfg)
 {
 	const struct drm_color_ctm_3x4 *ctm;
-	s64 m[3][3], t[3], pre[3];
+	s64 m[3][3], t[3], pre[3], code[3];
 	int r, c, ret;
 
 	if (!blob || blob->length != sizeof(struct drm_color_ctm_3x4))
@@ -187,14 +209,29 @@ int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
 	ctm = blob->data;
 
 	for (r = 0; r < 3; r++) {
-		for (c = 0; c < 3; c++)
+		for (c = 0; c < 3; c++) {
 			m[r][c] = dpu_ctm_entry_to_s15_16(ctm->matrix[r * 4 + c]);
+			if (m[r][c] < DPU_CSC_COEFF_MIN || m[r][c] > DPU_CSC_COEFF_MAX)
+				return -EINVAL;
+		}
 		t[r] = dpu_ctm_entry_to_s15_16(ctm->matrix[r * 4 + 3]);
+		if (t[r] < -DPU_CSC_OFFSET_MAX || t[r] > DPU_CSC_OFFSET_MAX)
+			return -EINVAL;
 	}
 
 	ret = dpu_csc_solve_pre_bias(m, t, pre);
 	if (ret)
 		return ret;
+
+	/*
+	 * S15.16 normalised -> 10-bit code values, kept as a sixteen-bit signed
+	 * quantity because that is the width the vendor's own values use.
+	 */
+	for (r = 0; r < 3; r++) {
+		code[r] = dpu_fx_shift_round(pre[r] * (1 << DPU_CSC_BIAS_SCALE_SHIFT), 16);
+		if (code[r] < DPU_CSC_BIAS_CODE_MIN || code[r] > DPU_CSC_BIAS_CODE_MAX)
+			return -EINVAL;
+	}
 
 	memset(cfg, 0, sizeof(*cfg));
 
@@ -202,15 +239,8 @@ int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
 		for (c = 0; c < 3; c++)
 			cfg->csc_mv[r * 3 + c] = (u32)(s32)m[r][c];
 
-	/*
-	 * S15.16 normalised -> 10-bit code values, kept as a sixteen-bit signed
-	 * quantity because that is the width the vendor's own values use.
-	 */
-	for (r = 0; r < 3; r++) {
-		s64 code = dpu_fx_shift_round(pre[r] * (1 << DPU_CSC_BIAS_SCALE_SHIFT), 16);
-
-		cfg->csc_pre_bv[r] = (u32)(code & 0xffff);
-	}
+	for (r = 0; r < 3; r++)
+		cfg->csc_pre_bv[r] = (u32)(code[r] & 0xffff);
 
 	/*
 	 * Clamps: the input is whatever the compositor says it is, so the pre
