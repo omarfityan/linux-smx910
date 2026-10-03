@@ -47,7 +47,7 @@ static inline bool dpu_colorop_report_refusal(struct dpu_colorop_reports *report
 }
 
 int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
-			   struct dpu_csc_cfg *cfg);
+			   struct dpu_csc_cfg *cfg, bool src_yuv_8bit);
 int dpu_colorop_ctm_to_fp16_csc(const struct drm_property_blob *blob,
 				u32 words[DPU_FP16_CSC_WORDS]);
 int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out, u32 *last);
@@ -57,9 +57,10 @@ int dpu_plane_init_colorops(struct drm_plane *plane, bool has_blocks);
 void dpu_colorop_crtc_flush(struct drm_crtc *crtc, struct dpu_hw_ctl *ctl);
 bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
 			   struct drm_plane_state *plane_state,
-			   struct dpu_csc_cfg *out);
+			   struct dpu_csc_cfg *out, bool src_yuv_8bit);
 int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			    struct drm_plane_state *plane_state,
-			    struct dpu_colorop_reports *reports, bool fp16);
+			    struct dpu_colorop_reports *reports, bool fp16,
+			    bool src_yuv_8bit);
 
 #endif /* _DPU_COLOROP_H */

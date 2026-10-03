@@ -90,6 +90,16 @@
  * before the solve keeps every product below inside sixty-four bits.
  */
 #define DPU_CSC_OFFSET_MAX	(1024 * 65536LL)
+/*
+ * An 8-bit YUV component enters the pipe as 4 x v -- SRC_FORMAT bit 15, which this driver sets for every
+ * YUV format -- so its full scale there is 4 x 255 = 1020, while the matrix a compositor commits maps v/255
+ * to an output whose full scale is 1023.  Without the ratio between the two, 8-bit white (Y 235) lands at
+ * (940 - 64) x 596/512 -> 1020, three codes short, and some mid-tones one 8-bit code dark.  The offsets
+ * need nothing: in this block's x1024 domain the black level and the chroma centre already land on 4 x 16
+ * and 4 x 128.  A 10-bit source fills the 1023 itself.
+ */
+#define DPU_CSC_SHIFTED_FULL_SCALE	1020LL
+#define DPU_CSC_OUTPUT_FULL_SCALE	1023LL
 
 /*
  * dpu_kms tracks which pipes have inverse gamma switched on as a bit per pipe
@@ -192,18 +202,20 @@ static int dpu_csc_solve_pre_bias(const s64 m[3][3], const s64 t[3], s64 pre[3])
 
 /**
  * dpu_colorop_ctm_to_csc - convert a DRM 3x4 colour matrix into a pipe CSC config
- * @blob: the DATA blob of a DRM_COLOROP_CTM_3X4 colorop
- * @cfg:  the config to fill in
+ * @blob:         the DATA blob of a DRM_COLOROP_CTM_3X4 colorop
+ * @cfg:          the config to fill in
+ * @src_yuv_8bit: the plane's buffer is 8-bit YUV: every coefficient is scaled by 1023/1020
+ *                (DPU_CSC_SHIFTED_FULL_SCALE says why), the pre-bias left exactly as solved
  *
  * Return: 0 on success, -EINVAL if the blob is the wrong size or the matrix
  *         cannot be expressed by this block: near singular, or a coefficient or a
  *         bias its register field cannot hold.
  */
 int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
-			   struct dpu_csc_cfg *cfg)
+			   struct dpu_csc_cfg *cfg, bool src_yuv_8bit)
 {
 	const struct drm_color_ctm_3x4 *ctm;
-	s64 m[3][3], t[3], pre[3], code[3];
+	s64 m[3][3], t[3], pre[3], code[3], coeff[3][3];
 	int r, c, ret;
 
 	if (!blob || blob->length != sizeof(struct drm_color_ctm_3x4))
@@ -236,11 +248,36 @@ int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
 			return -EINVAL;
 	}
 
+	/*
+	 * The coefficients the block is written, S15.16.  For an 8-bit YUV source each is
+	 * re-derived from the blob's own S31.32 value, scaled by 1023/1020 and rounded ONCE,
+	 * half away from zero, onto the S4.9 grid the register keeps (S31.32 to S4.9 is a
+	 * shift of 23): rounding to S15.16 or to S4.9 first and scaling afterwards can land a
+	 * coefficient within a rounding of a tie on the wrong side of it -- KWin's BT.709 m11
+	 * sits 0.0044 from one.  The range check above holds the magnitude to at most
+	 * 8 x 2^32 + 2^16, so x1023 stays under 2^45.  A scaled coefficient can leave the field
+	 * its unscaled value fitted, so it is checked again.
+	 */
+	for (r = 0; r < 3; r++) {
+		for (c = 0; c < 3; c++) {
+			u64 v = ctm->matrix[r * 4 + c];
+			s64 den = DPU_CSC_SHIFTED_FULL_SCALE << 23, k;
+
+			coeff[r][c] = m[r][c];
+			if (!src_yuv_8bit)
+				continue;
+			k = div64_s64((s64)(v & ~(1ULL << 63)) * DPU_CSC_OUTPUT_FULL_SCALE + den / 2, den);
+			coeff[r][c] = ((v & (1ULL << 63)) ? -k : k) * 128;
+			if (coeff[r][c] < DPU_CSC_COEFF_MIN || coeff[r][c] > DPU_CSC_COEFF_MAX)
+				return -EINVAL;
+		}
+	}
+
 	memset(cfg, 0, sizeof(*cfg));
 
 	for (r = 0; r < 3; r++)
 		for (c = 0; c < 3; c++)
-			cfg->csc_mv[r * 3 + c] = (u32)(s32)m[r][c];
+			cfg->csc_mv[r * 3 + c] = (u32)(s32)coeff[r][c];
 
 	for (r = 0; r < 3; r++)
 		cfg->csc_pre_bv[r] = (u32)(code[r] & 0xffff);
@@ -554,8 +591,10 @@ dpu_colorop_effective_state(struct drm_atomic_state *state,
 
 /**
  * dpu_plane_colorop_csc - the colour matrix this plane's pipeline asks for
- * @state: the plane state being checked or committed
- * @out:   filled in when a matrix is in force
+ * @state:        the plane state being checked or committed
+ * @out:          filled in when a matrix is in force
+ * @src_yuv_8bit: the plane's buffer is 8-bit YUV -- the same decision dpu_plane_colorop_check()
+ *                converted with, so the words carried to the flush are the words it validated
  *
  * Return: true when @out was filled in, false when the plane has no pipeline,
  *         the matrix operation is bypassed, or it carries no data -- in which
@@ -563,7 +602,7 @@ dpu_colorop_effective_state(struct drm_atomic_state *state,
  */
 bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
 			   struct drm_plane_state *plane_state,
-			   struct dpu_csc_cfg *out)
+			   struct dpu_csc_cfg *out, bool src_yuv_8bit)
 {
 	struct drm_colorop *colorop = plane_state->color_pipeline;
 	struct drm_colorop_state *cs;
@@ -575,7 +614,7 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
 	if (!cs || cs->bypass || !cs->data)
 		return false;
 
-	return dpu_colorop_ctm_to_csc(cs->data, out) == 0;
+	return dpu_colorop_ctm_to_csc(cs->data, out, src_yuv_8bit) == 0;
 }
 
 /* what the compositor placed, as booleans -- reported when it changes, never per frame */
@@ -592,6 +631,9 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
  * @reports:     what this plane's colour-pipeline reports last said (logging only)
  * @fp16:        the plane's buffer is 16-bit float: its matrix is the pipe's float chain's, converted
  *               for it (dpu_colorop_ctm_to_fp16_csc) instead of for the video matrix
+ * @src_yuv_8bit: the plane's buffer is 8-bit YUV: the video matrix is converted for it
+ *               (dpu_colorop_ctm_to_csc) exactly as dpu_plane_colorop_csc() converts the words the
+ *               flush programs -- the caller decides it once and hands both the same value
  *
  * Every operation the pipeline asks for is converted here, at check time, and
  * the commit is refused if any of them cannot be expressed.  Refusing makes the
@@ -607,7 +649,8 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
  */
 int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			    struct drm_plane_state *plane_state,
-			    struct dpu_colorop_reports *reports, bool fp16)
+			    struct dpu_colorop_reports *reports, bool fp16,
+			    bool src_yuv_8bit)
 {
 	struct dpu_plane_state *pstate = to_dpu_plane_state(plane_state);
 	struct drm_colorop *colorop = plane_state->color_pipeline;
@@ -649,7 +692,7 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 		 */
 		if (!cs->bypass && cs->data &&
 		    (fp16 ? dpu_colorop_ctm_to_fp16_csc(cs->data, pstate->pipeline_fp16_csc)
-			  : dpu_colorop_ctm_to_csc(cs->data, &csc))) {
+			  : dpu_colorop_ctm_to_csc(cs->data, &csc, src_yuv_8bit))) {
 			if (dpu_colorop_report_refusal(reports, DPU_COLOROP_REFUSAL_MATRIX))
 				DPU_ERROR("colour matrix cannot be expressed by this pipe\n");
 			return -EINVAL;

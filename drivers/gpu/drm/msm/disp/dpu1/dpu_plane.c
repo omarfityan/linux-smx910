@@ -868,6 +868,7 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	struct drm_rect fb_rect = { 0 };
 	uint32_t max_linewidth;
 	const struct msm_format *fb_fmt;
+	bool src_yuv_8bit;
 
 	min_scale = FRAC_16_16(1, MAX_UPSCALE_RATIO);
 	max_scale = MAX_DOWNSCALE_RATIO << 16;
@@ -1023,6 +1024,16 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	pstate->needs_qos_remap = drm_atomic_crtc_needs_modeset(crtc_state);
 
 	/*
+	 * An 8-bit YUV buffer enters the pipe as 4 x v, a full scale of 1020, and the video matrix's
+	 * conversion scales its coefficients by 1023/1020 (dpu_colorop_ctm_to_csc).  8-bit here is YUV
+	 * without DX: both 10-bit YUV layouts carry DX in mdp_format.c and no 8-bit one does -- never
+	 * the bpc fields, which declare P010 as eight bits a component.  Decided ONCE and handed to both
+	 * conversions below, so the check validates the very words the flush programs.
+	 */
+	fb_fmt = msm_framebuffer_format(new_plane_state->fb);
+	src_yuv_8bit = MSM_FORMAT_IS_YUV(fb_fmt) && !MSM_FORMAT_IS_DX(fb_fmt);
+
+	/*
 	 * The colour pipeline is checked HERE, and not in dpu_plane_atomic_check,
 	 * because a VIRTUAL plane never reaches that function --
 	 * dpu_plane_virtual_atomic_check calls this one directly -- and virtual
@@ -1035,7 +1046,8 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	 */
 	ret = dpu_plane_colorop_check(new_plane_state->state, new_plane_state,
 				      &pdpu->colorop_reports,
-				      MSM_FORMAT_IS_FP16(msm_framebuffer_format(new_plane_state->fb)));
+				      MSM_FORMAT_IS_FP16(msm_framebuffer_format(new_plane_state->fb)),
+				      src_yuv_8bit);
 	if (ret)
 		return ret;
 
@@ -1048,7 +1060,8 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	pstate->has_pipeline_csc = pstate->has_pipeline_fp16_csc ||
 				   dpu_plane_colorop_csc(new_plane_state->state,
 							 new_plane_state,
-							 &pstate->pipeline_csc);
+							 &pstate->pipeline_csc,
+							 src_yuv_8bit);
 
 	/*
 	 * A 10-bit RGB buffer's matrix is applied by the video matrix itself, its enable set for an
