@@ -1306,7 +1306,9 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 	 * And set up the engine the plane colour operations use, here rather
 	 * than lazily, because the commit path is no place to be mapping
 	 * registers or asking for memory.  A page is far more than the whole
-	 * inverse-gamma program needs -- it is about 408 dwords of 1024.
+	 * inverse-gamma program needs -- it is about 408 dwords of 1024 -- but the
+	 * video pipes' gamut lattice (the colorop_gamut_test switch) is 7,374
+	 * dwords before its commands, about 29.8 KB in all: 32 KB holds both.
 	 *
 	 * Only when the operations are advertised at all: on an ordinary boot
 	 * this costs nothing.  A failure here is not fatal; the planes simply
@@ -1314,7 +1316,7 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 	 */
 	if (dpu_plane_colorops_enabled()) {
 		int engine = dpu_reg_dma_init(dpu_kms, &dpu_kms->colorop_rdma,
-					      PAGE_SIZE);
+					      SZ_32K);
 
 		if (engine)
 			DPU_ERROR("plane colour operations have no register-DMA engine: %d\n",

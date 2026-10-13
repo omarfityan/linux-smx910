@@ -637,6 +637,188 @@ MODULE_PARM_DESC(colorop_igc_test_program,
 static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
 	      "one endpoint register per channel");
 
+/*
+ * The video pipes' gamut block: a 17-point 3D lookup table behind a
+ * per-channel input map of 3 x 16 words.  The device's DT declares it at the
+ * same base as inverse gamma (<0x1d00 0x60001> beside <0x1d00 0x60000>), so
+ * the two share the op-mode word there: bits 0-4 are the gamut's -- enable,
+ * map enable and the mode (17 = 0, 17b = 4), which also names the table on
+ * display -- and 8-9 inverse gamma's.  The values are the device's own
+ * downstream driver's (reg_dmav2_setup_vig_gamutv61, sde_hw_reg_dma_v1_color_proc.c,
+ * and sde_hw_color_proc_common_v4.h).
+ */
+#define DPU_VIG_GAMUT_EN		BIT(0)
+#define DPU_VIG_GAMUT_MAP_EN		BIT(1)
+#define DPU_VIG_GAMUT_OP_BITS		0x1f
+#define DPU_VIG_GAMUT_TABLE_A		0
+#define DPU_VIG_GAMUT_SCALEA		0x10
+#define DPU_VIG_GAMUT_SCALE_STRIDE	0x40
+#define DPU_VIG_GAMUT_MAP_WORDS		16
+#define DPU_VIG_GAMUT_MAP_CHANNELS	3
+#define DPU_VIG_GAMUT_TEST_MAX		3
+
+/*
+ * TEST switch: at the next colour flush, program bank A of every colour-
+ * pipeline video pipe's gamut -- 1 a lattice of grey 512, 2 a grey lattice
+ * graded along the fastest lattice digit, 3 = 2 with the input map enabled
+ * and loaded raw from colorop_gamut_map -- and switch it off again on 0.  A
+ * measurement switch for the hardware arms only: nothing else drives the block.
+ */
+static int dpu_reg_dma_gamut_test;
+module_param_named(colorop_gamut_test, dpu_reg_dma_gamut_test, int, 0644);
+MODULE_PARM_DESC(colorop_gamut_test,
+		 "TEST: program the video planes' gamut, bank A: 0 off (default), 1 grey 512, 2 graded on the fastest digit, 3 = 2 + colorop_gamut_map");
+
+static u32 dpu_reg_dma_gamut_map[DPU_VIG_GAMUT_MAP_CHANNELS * DPU_VIG_GAMUT_MAP_WORDS];
+static int dpu_reg_dma_gamut_map_n;
+module_param_array_named(colorop_gamut_map, dpu_reg_dma_gamut_map, uint,
+			 &dpu_reg_dma_gamut_map_n, 0644);
+MODULE_PARM_DESC(colorop_gamut_map, "TEST: the 48 input-map words colorop_gamut_test=3 writes raw");
+
+int dpu_reg_dma_gamut_test_mode(void)
+{
+	return READ_ONCE(dpu_reg_dma_gamut_test);
+}
+
+const u32 *dpu_reg_dma_gamut_test_map(void)
+{
+	if (READ_ONCE(dpu_reg_dma_gamut_map_n) != ARRAY_SIZE(dpu_reg_dma_gamut_map))
+		return NULL;
+	return dpu_reg_dma_gamut_map;
+}
+
+/**
+ * dpu_vig_gamut_test_lattice - a grey test lattice, packed as the LUT bus takes it
+ * @mode: 1 every entry grey 512; 2 or 3 grey round(k x 1023 / 16), k = L mod 17
+ *        of the linear index L = 4j + i -- graded along the fastest lattice digit
+ * @out: DPU_VIG_GAMUT_DWORDS dwords
+ *
+ * The downstream setter's order: for each entry j, the four tables i, each as
+ * three 16-bit words c0, c2, c1 carrying a 10-bit value MSB-aligned (<< 6).
+ */
+void dpu_vig_gamut_test_lattice(int mode, u32 *out)
+{
+	u16 *data = (u16 *)out;
+	u32 i, j, k, v;
+
+	for (j = 0; j < DPU_VIG_GAMUT_TBL_SZ; j++) {
+		for (i = 0; i < DPU_VIG_GAMUT_TBL_NUM; i++) {
+			k = (4 * j + i) % 17;
+			v = mode == 1 ? 512 : DIV_ROUND_CLOSEST(k * 1023, 16);
+			*data++ = (u16)(v << 6);	/* c0 */
+			*data++ = (u16)(v << 6);	/* c2 */
+			*data++ = (u16)(v << 6);	/* c1 */
+		}
+	}
+}
+
+/**
+ * dpu_reg_dma_program_sspp_gamut - load bank A of a video pipe's gamut and enable it
+ * @lattice: DPU_VIG_GAMUT_DWORDS dwords, as dpu_vig_gamut_test_lattice() packs them
+ * @map: the 3 x 16 input-map words, written raw with the map enabled; NULL for none
+ *
+ * Bank A only (table 0, SCALEA, mode 17), and the block is switched off first in
+ * the same transfer, so the table written is never the one on display.  The
+ * vendor ping-pongs instead, writing whichever bank the live mode does not show.
+ * The op word is modified, never written whole as the vendor writes it: inverse
+ * gamma's enable lives in it.  Kicked off as the inverse gamma's is -- queue 0,
+ * write-immediate, the class the vendor gives both.
+ *
+ * Return: 0 when the engine acknowledged the transfer, negative otherwise.
+ */
+int dpu_reg_dma_program_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
+				   struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,
+				   const u32 *lattice, const u32 *map)
+{
+	u32 blk, op_off, op;
+	int ch, ret;
+
+	if (!sspp->cap->sblk->igc_blk.len)
+		return -ENODEV;
+	blk = dpu_reg_dma_blk_for_sspp(sspp->idx);
+	if (!blk)
+		return -ENODEV;
+	if (sspp->cap->sblk->igc_blk.base < DPU_VIG_TOP_OFF)
+		return -EINVAL;
+	op_off = sspp->cap->sblk->igc_blk.base - DPU_VIG_TOP_OFF + DPU_VIG_IGC_OPMODE;
+
+	dpu_reg_dma_buf_reset(rdma);
+	ret = dpu_reg_dma_decode_sel(rdma, blk);
+	if (!ret)
+		ret = dpu_reg_dma_single_modify(rdma, op_off, ~DPU_VIG_GAMUT_OP_BITS, 0); /* off first */
+	if (!ret)
+		ret = dpu_reg_dma_lutbus_write(rdma, DPU_REG_DMA_LUTBUS_GAMUT, DPU_VIG_GAMUT_TABLE_A,
+					       DPU_REG_DMA_LUTBUS_GAMUT_TRANS, lattice,
+					       DPU_VIG_GAMUT_DWORDS);
+	for (ch = 0; map && ch < DPU_VIG_GAMUT_MAP_CHANNELS && !ret; ch++)
+		ret = dpu_reg_dma_block_write(rdma, op_off + DPU_VIG_GAMUT_SCALEA +
+					      ch * DPU_VIG_GAMUT_SCALE_STRIDE,
+					      map + ch * DPU_VIG_GAMUT_MAP_WORDS,
+					      DPU_VIG_GAMUT_MAP_WORDS);
+	op = DPU_VIG_GAMUT_EN | (map ? DPU_VIG_GAMUT_MAP_EN : 0);	/* mode 17 = 0: table A */
+	if (!ret)
+		ret = dpu_reg_dma_single_modify(rdma, op_off, ~DPU_VIG_GAMUT_OP_BITS, op);
+	if (!ret)
+		ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, true);
+
+	return ret;
+}
+
+/**
+ * dpu_reg_dma_disable_sspp_gamut - switch a video pipe's gamut off, inverse gamma's bits kept
+ */
+int dpu_reg_dma_disable_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
+				   struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp)
+{
+	u32 blk, op_off;
+	int ret;
+
+	if (!sspp->cap->sblk->igc_blk.len)
+		return -ENODEV;
+	blk = dpu_reg_dma_blk_for_sspp(sspp->idx);
+	if (!blk)
+		return -ENODEV;
+	if (sspp->cap->sblk->igc_blk.base < DPU_VIG_TOP_OFF)
+		return -EINVAL;
+	op_off = sspp->cap->sblk->igc_blk.base - DPU_VIG_TOP_OFF + DPU_VIG_IGC_OPMODE;
+
+	dpu_reg_dma_buf_reset(rdma);
+	ret = dpu_reg_dma_decode_sel(rdma, blk);
+	if (!ret)
+		ret = dpu_reg_dma_single_modify(rdma, op_off, ~DPU_VIG_GAMUT_OP_BITS, 0); /* off */
+	if (!ret)
+		ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, true);
+
+	return ret;
+}
+
+/**
+ * dpu_reg_dma_gamut_test_action - what the colour flush does to one pipe's gamut
+ * @want: colorop_gamut_test now (out of range = off)
+ * @applied: the value this pipe was last given
+ * @on: the pipe's gamut enable as the register reads now
+ *
+ * Return: 1 program, -1 switch off, 0 nothing.  A table lost with the block's
+ * power (the enable read clear) is programmed again.
+ */
+int dpu_reg_dma_gamut_test_action(int want, int applied, bool on)
+{
+	if (want < 0 || want > DPU_VIG_GAMUT_TEST_MAX)
+		want = 0;
+	if (!want)
+		return (applied || on) ? -1 : 0;
+	return (want != applied || !on) ? 1 : 0;
+}
+
+/**
+ * dpu_reg_dma_sspp_gamut_is_on - the gamut enable as a video pipe's op word reads now
+ */
+bool dpu_reg_dma_sspp_gamut_is_on(struct dpu_hw_sspp *sspp)
+{
+	return DPU_REG_READ(&sspp->hw, sspp->cap->sblk->igc_blk.base + DPU_VIG_IGC_OPMODE) &
+	       DPU_VIG_GAMUT_EN;
+}
+
 /**
  * dpu_reg_dma_blk_for_sspp - the decode-select bit naming a source pipe
  *

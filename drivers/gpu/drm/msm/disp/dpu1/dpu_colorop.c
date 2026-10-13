@@ -435,6 +435,74 @@ MODULE_PARM_DESC(colorop_igc_keep_on,
  * is on the plane path, and turn it back off.
  */
 static bool dpu_colorop_igc_test_invert;
+/*
+ * The video pipes' gamut TEST switch (colorop_gamut_test in dpu_hw_reg_dma.c,
+ * 0 = off by default).  Per pipe, at each colour flush: bank A of the lattice
+ * is programmed when the switch differs from what the pipe was last given or
+ * its enable reads clear (a power loss), and switched off when the switch
+ * returns to 0.  A failure is latched per value, not retried every frame.  A
+ * pipe that leaves the colour pipeline while the switch is on keeps its table
+ * until the switch next changes -- the arms keep their plane up throughout.
+ */
+static int dpu_colorop_gamut_applied[SSPP_MAX];
+static int dpu_colorop_gamut_failed[SSPP_MAX];
+
+static void dpu_colorop_gamut_test(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
+				   struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp)
+{
+	int want = dpu_reg_dma_gamut_test_mode();
+	int *applied = &dpu_colorop_gamut_applied[sspp->idx];
+	int *failed = &dpu_colorop_gamut_failed[sspp->idx];
+	const u32 *map = NULL;
+	u32 *lattice;
+	int act, ret;
+
+	if (!want)
+		*failed = 0;
+	if (!want && !*applied)
+		return;
+	if (want && *failed == want)
+		return;
+
+	act = dpu_reg_dma_gamut_test_action(want, *applied, dpu_reg_dma_sspp_gamut_is_on(sspp));
+	if (!act)
+		return;
+
+	if (act < 0) {
+		ret = dpu_reg_dma_disable_sspp_gamut(dpu_kms, rdma, ctl, sspp);
+		pr_info("dpu: %s gamut test off: %d\n", sspp->cap->name, ret);
+		*applied = 0;
+		*failed = 0;
+		return;
+	}
+
+	if (want == 3) {
+		map = dpu_reg_dma_gamut_test_map();
+		if (!map) {
+			pr_info("dpu: %s gamut test 3 needs the 48 colorop_gamut_map words\n",
+				sspp->cap->name);
+			*failed = want;
+			return;
+		}
+	}
+
+	lattice = kvzalloc(DPU_VIG_GAMUT_DWORDS * sizeof(u32), GFP_KERNEL);
+	if (!lattice) {
+		*failed = want;
+		return;
+	}
+	dpu_vig_gamut_test_lattice(want, lattice);
+	ret = dpu_reg_dma_program_sspp_gamut(dpu_kms, rdma, ctl, sspp, lattice, map);
+	kvfree(lattice);
+	pr_info("dpu: %s gamut test %d programmed: %d\n", sspp->cap->name, want, ret);
+	if (ret) {
+		*failed = want;
+		return;
+	}
+	*applied = want;
+	*failed = 0;
+}
+
 module_param_named(colorop_igc_test_invert, dpu_colorop_igc_test_invert, bool, 0644);
 MODULE_PARM_DESC(colorop_igc_test_invert,
 	"TEST ONLY, default off: load every video pipe's inverse-gamma table inverted, each entry v as 4095 - v -- a third table with the compositor's own colour matrix; the video is a negative while it is on");
@@ -862,6 +930,9 @@ void dpu_colorop_crtc_flush(struct drm_crtc *crtc, struct dpu_hw_ctl *ctl)
 				wanted |= bit;
 				continue;
 			}
+
+			/* before the skips below: the gamut keeps its own state */
+			dpu_colorop_gamut_test(dpu_kms, rdma, ctl, sspp);
 
 			/*
 			 * Nothing to do when the hardware still HAS this exact
