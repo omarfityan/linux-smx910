@@ -100,6 +100,15 @@
 #define REG_DMA_QUEUE0_TRIGGER		BIT(0)
 
 /*
+ * How long a submission is waited for: the device's own driver reads the
+ * transfer-complete bit every 10 us for at most 20 ms (sde_hw_reg_dma_v1.c,
+ * the last command's REG_DMA_WAIT4_COMP).  A transfer that outlives the wait
+ * is not stopped -- nothing here resets the queue -- so it may still land.
+ */
+#define REG_DMA_DONE_POLL_US		10
+#define REG_DMA_DONE_POLLS		(20000 / REG_DMA_DONE_POLL_US)
+
+/*
  * Transfer-complete bit in REG_DMA_INTR_STATUS, per control block, for queue 0.
  * The assignment is not a formula -- the last two do not continue the run -- and
  * control blocks past the sixth have no bit at all, so a zero here means the
@@ -501,15 +510,15 @@ int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 
 	DPU_REG_WRITE(&ctl->hw, REG_DMA_CTL_TRIGGER_OFF, REG_DMA_QUEUE0_TRIGGER);
 
-	/* the engine acknowledges in microseconds; bound the wait at 1 ms */
+	/* the engine acknowledges in microseconds; wait as long as the vendor does */
 	ret = -ETIMEDOUT;
-	for (i = 0; i < 100; i++) {
+	for (i = 0; i < REG_DMA_DONE_POLLS; i++) {
 		status = DPU_REG_READ(&rdma->db, REG_DMA_INTR_STATUS);
 		if (status & done_mask) {
 			ret = 0;
 			break;
 		}
-		udelay(10);
+		udelay(REG_DMA_DONE_POLL_US);
 	}
 
 	err = DPU_REG_READ(&rdma->db, REG_DMA_INTR_ERR_STATUS);
@@ -517,7 +526,7 @@ int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 	DRM_INFO("ctl%u: %u dwords from iova %#llx -> %s (status %#x err %#x after %d us)\n",
 		 ctl_index, dwords, rdma->buf.iova,
 		 ret ? "NO COMPLETION" : "complete",
-		 DPU_REG_READ(&rdma->db, REG_DMA_INTR_STATUS), err, i * 10);
+		 DPU_REG_READ(&rdma->db, REG_DMA_INTR_STATUS), err, i * REG_DMA_DONE_POLL_US);
 
 	if (!ret && (err & REG_DMA_ERROR_MASK))
 		ret = -EIO;

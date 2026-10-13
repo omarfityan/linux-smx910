@@ -441,6 +441,9 @@ static bool dpu_colorop_igc_test_invert;
  * is programmed when the switch differs from what the pipe was last given or
  * its enable reads clear (a power loss), and switched off when the switch
  * returns to 0.  A failure is latched per value, not retried every frame.  A
+ * program that reports failure still counts as given -- a kick-off that timed
+ * out is not stopped and may land -- so the return to 0 switches it off; a
+ * switch-off that fails is not retried.  A
  * pipe that leaves the colour pipeline while the switch is on keeps its table
  * until the switch next changes -- the arms keep their plane up throughout.
  */
@@ -496,6 +499,8 @@ static void dpu_colorop_gamut_test(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 	kvfree(lattice);
 	pr_info("dpu: %s gamut test %d programmed: %d\n", sspp->cap->name, want, ret);
 	if (ret) {
+		/* a timed-out kick-off may still land: count it as given, so 0 switches it off */
+		*applied = want;
 		*failed = want;
 		return;
 	}
