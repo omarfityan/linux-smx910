@@ -100,13 +100,16 @@
 #define REG_DMA_QUEUE0_TRIGGER		BIT(0)
 
 /*
- * How long a submission is waited for: the device's own driver reads the
- * transfer-complete bit every 10 us for at most 20 ms (sde_hw_reg_dma_v1.c,
- * the last command's REG_DMA_WAIT4_COMP).  A transfer that outlives the wait
- * is not stopped -- nothing here resets the queue -- so it may still land.
+ * How long a submission is waited for, its completion read every 10 us.  The
+ * inverse-gamma tables complete in microseconds and are given 1 ms.  The video
+ * pipes' gamut lattice, some 18 times larger, is given as long as the device's
+ * own driver waits for a completion -- 20 ms (sde_hw_reg_dma_v1.c, the last
+ * command's REG_DMA_WAIT4_COMP).  A transfer that outlives its wait is not
+ * stopped -- nothing here resets the queue -- so it may still land.
  */
 #define REG_DMA_DONE_POLL_US		10
-#define REG_DMA_DONE_POLLS		(20000 / REG_DMA_DONE_POLL_US)
+#define REG_DMA_WAIT_US			1000
+#define REG_DMA_LUT_WAIT_US		20000
 
 /*
  * Transfer-complete bit in REG_DMA_INTR_STATUS, per control block, for queue 0.
@@ -438,8 +441,8 @@ int dpu_reg_dma_lutbus_write(struct dpu_reg_dma *rdma, u32 block, u32 table,
  * Returns 0 once the hardware reports the transfer complete, -ETIMEDOUT if it
  * never does, and -EIO if the engine raised an error.
  */
-int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
-			 struct dpu_hw_ctl *ctl, bool trigger)
+static int dpu_reg_dma_kick_off_wait(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
+				     struct dpu_hw_ctl *ctl, bool trigger, u32 wait_us)
 {
 	u32 ctl_index, done_mask, cmd1, dwords, err, status;
 	int i, ret = 0;
@@ -510,9 +513,9 @@ int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 
 	DPU_REG_WRITE(&ctl->hw, REG_DMA_CTL_TRIGGER_OFF, REG_DMA_QUEUE0_TRIGGER);
 
-	/* the engine acknowledges in microseconds; wait as long as the vendor does */
+	/* the engine acknowledges in microseconds; wait as long as the caller says */
 	ret = -ETIMEDOUT;
-	for (i = 0; i < REG_DMA_DONE_POLLS; i++) {
+	for (i = 0; i < wait_us / REG_DMA_DONE_POLL_US; i++) {
 		status = DPU_REG_READ(&rdma->db, REG_DMA_INTR_STATUS);
 		if (status & done_mask) {
 			ret = 0;
@@ -542,6 +545,12 @@ out:
 					DPU_CLK_CTRL_REG_DMA, false);
 
 	return ret;
+}
+
+int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
+			 struct dpu_hw_ctl *ctl, bool trigger)
+{
+	return dpu_reg_dma_kick_off_wait(dpu_kms, rdma, ctl, trigger, REG_DMA_WAIT_US);
 }
 
 /* ------------------------------------------------------------------------ *
@@ -768,7 +777,7 @@ int dpu_reg_dma_program_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 	if (!ret)
 		ret = dpu_reg_dma_single_modify(rdma, op_off, ~DPU_VIG_GAMUT_OP_BITS, op);
 	if (!ret)
-		ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, true);
+		ret = dpu_reg_dma_kick_off_wait(dpu_kms, rdma, ctl, true, REG_DMA_LUT_WAIT_US);
 
 	return ret;
 }
@@ -796,7 +805,7 @@ int dpu_reg_dma_disable_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 	if (!ret)
 		ret = dpu_reg_dma_single_modify(rdma, op_off, ~DPU_VIG_GAMUT_OP_BITS, 0); /* off */
 	if (!ret)
-		ret = dpu_reg_dma_kick_off(dpu_kms, rdma, ctl, true);
+		ret = dpu_reg_dma_kick_off_wait(dpu_kms, rdma, ctl, true, REG_DMA_LUT_WAIT_US);
 
 	return ret;
 }
