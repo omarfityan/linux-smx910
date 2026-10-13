@@ -71,6 +71,19 @@
 #define REG_DMA_OP_BLOCK_WRITE		BIT(30)
 /* writes a run of values through one address, the block advancing its own index */
 #define REG_DMA_OP_INDEXED_WRITE	(BIT(28) | BIT(29))
+/*
+ * streams a table into a colour block's own table memory -- the LUT bus --
+ * rather than into its registers; the encoding is the device's own downstream
+ * driver's (sde_hw_reg_dma_v1.c, write_block_lut_reg)
+ */
+#define REG_DMA_OP_LUTBUS_WRITE		(BIT(30) | BIT(29))
+#define REG_DMA_LUTBUS_TABLE_SEL_MASK	0x10000
+#define REG_DMA_LUTBUS_BLOCK_SEL_MASK	0xffff
+#define REG_DMA_LUTBUS_TRANS_SZ_MASK	0xff0000
+#define REG_DMA_LUTBUS_LUT_SIZE_MASK	0x3fff
+#define REG_DMA_OP_NOP			0
+/* a LUT-bus payload's residual data plus the next opcode must exceed four dwords */
+#define REG_DMA_LUTBUS_NOPS		3
 #define REG_DMA_MAX_REL_OFF		(BIT(21) - 1)
 #define REG_DMA_MAX_DWORDS		(BIT(14) - 1)
 
@@ -344,6 +357,65 @@ int dpu_reg_dma_single_modify(struct dpu_reg_dma *rdma, u32 blk_off, u32 mask,
 	loc[1] = mask;
 	loc[2] = val;
 	rdma->buf.index += 3 * sizeof(u32);
+
+	return 0;
+}
+
+/**
+ * dpu_reg_dma_lutbus_write - stream a table into a colour block's LUT bus
+ * @block:      the LUT-bus block, DPU_REG_DMA_LUTBUS_IGC / _GAMUT / _SIXZONE
+ * @table:      which of the block's two tables receives the data
+ * @trans_size: the block's transfer granule in dwords, DPU_REG_DMA_LUTBUS_*_TRANS
+ * @data:       the table, @count dwords -- a whole number of transfers
+ *
+ * Unlike the other writes this one names no register: the payload goes to the
+ * table memory of the block named in the header, in the pipe chosen by the
+ * preceding decode-select.  Three no-op words follow it.
+ */
+int dpu_reg_dma_lutbus_write(struct dpu_reg_dma *rdma, u32 block, u32 table,
+			     u32 trans_size, const u32 *data, u32 count)
+{
+	u32 payload = count * sizeof(u32);
+	u32 nops = REG_DMA_LUTBUS_NOPS * sizeof(u32);
+	u32 *loc;
+	u32 i;
+	int ret;
+
+	if (table >= DPU_REG_DMA_LUTBUS_TABLES ||
+	    block >= DPU_REG_DMA_LUTBUS_BLOCKS ||
+	    (trans_size != DPU_REG_DMA_LUTBUS_IGC_TRANS &&
+	     trans_size != DPU_REG_DMA_LUTBUS_GAMUT_TRANS &&
+	     trans_size != DPU_REG_DMA_LUTBUS_SIXZONE_TRANS)) {
+		DPU_ERROR("invalid LUT-bus write: table %u block %u transfer %u\n",
+			  table, block, trans_size);
+		return -EINVAL;
+	}
+
+	if (!data || !count || count > REG_DMA_MAX_DWORDS ||
+	    count % trans_size) {
+		DPU_ERROR("invalid LUT-bus payload of %u dwords\n", count);
+		return -EINVAL;
+	}
+
+	ret = dpu_reg_dma_room(rdma, 2 * sizeof(u32) + payload + nops);
+	if (ret)
+		return ret;
+
+	loc = (u32 *)((u8 *)rdma->buf.vaddr + rdma->buf.index);
+	loc[0] = REG_DMA_OP_LUTBUS_WRITE |
+		 ((table << 16) & REG_DMA_LUTBUS_TABLE_SEL_MASK) |
+		 (block & REG_DMA_LUTBUS_BLOCK_SEL_MASK);
+	loc[1] = ((trans_size << 16) & REG_DMA_LUTBUS_TRANS_SZ_MASK) |
+		 ((count / trans_size) & REG_DMA_LUTBUS_LUT_SIZE_MASK);
+	rdma->buf.index += 2 * sizeof(u32);
+
+	memcpy((u8 *)rdma->buf.vaddr + rdma->buf.index, data, payload);
+	rdma->buf.index += payload;
+
+	loc = (u32 *)((u8 *)rdma->buf.vaddr + rdma->buf.index);
+	for (i = 0; i < REG_DMA_LUTBUS_NOPS; i++)
+		loc[i] = REG_DMA_OP_NOP;
+	rdma->buf.index += nops;
 
 	return 0;
 }

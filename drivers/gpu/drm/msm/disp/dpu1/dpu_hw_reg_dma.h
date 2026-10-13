@@ -96,6 +96,25 @@ int dpu_reg_dma_indexed_write(struct dpu_reg_dma *rdma, u32 blk_off,
 int dpu_reg_dma_single_modify(struct dpu_reg_dma *rdma, u32 blk_off, u32 mask,
 			      u32 val);
 
+/*
+ * LUT-bus targets.  A LUT-bus write fills a colour block's table memory rather
+ * than its registers: the block is named here, the pipe by the preceding
+ * decode-select.  The values are the device's own downstream driver's
+ * (sde_reg_dma.h: enum sde_reg_dma_lutbus_block, LUTBUS_TABLE_SELECT_MAX and the
+ * LUTBUS_*_TRANS_SIZE transfer granules, in dwords).
+ */
+#define DPU_REG_DMA_LUTBUS_IGC			0
+#define DPU_REG_DMA_LUTBUS_GAMUT		1
+#define DPU_REG_DMA_LUTBUS_SIXZONE		3
+#define DPU_REG_DMA_LUTBUS_BLOCKS		4
+#define DPU_REG_DMA_LUTBUS_TABLES		2
+#define DPU_REG_DMA_LUTBUS_IGC_TRANS		3
+#define DPU_REG_DMA_LUTBUS_GAMUT_TRANS		6
+#define DPU_REG_DMA_LUTBUS_SIXZONE_TRANS	5
+
+int dpu_reg_dma_lutbus_write(struct dpu_reg_dma *rdma, u32 block, u32 table,
+			     u32 trans_size, const u32 *data, u32 count);
+
 int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 			 struct dpu_hw_ctl *ctl, bool trigger);
 
