@@ -673,19 +673,20 @@ static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
 #define DPU_VIG_GAMUT_SCALE_STRIDE	0x40
 #define DPU_VIG_GAMUT_MAP_WORDS		16
 #define DPU_VIG_GAMUT_MAP_CHANNELS	3
-#define DPU_VIG_GAMUT_TEST_MAX		3
+#define DPU_VIG_GAMUT_TEST_MAX		6
 
 /*
  * TEST switch: at the next colour flush, program bank A of every colour-
  * pipeline video pipe's gamut -- 1 a lattice of grey 512, 2 a grey lattice
  * graded along the fastest lattice digit, 3 = 2 with the input map enabled
- * and loaded raw from colorop_gamut_map -- and switch it off again on 0.  A
- * measurement switch for the hardware arms only: nothing else drives the block.
+ * and loaded raw from colorop_gamut_map, 4 / 5 / 6 = 2's grading in output
+ * word c0 / c1 / c2 alone -- and switch it off again on 0.  A measurement
+ * switch for the hardware arms only: nothing else drives the block.
  */
 static int dpu_reg_dma_gamut_test;
 module_param_named(colorop_gamut_test, dpu_reg_dma_gamut_test, int, 0644);
 MODULE_PARM_DESC(colorop_gamut_test,
-		 "TEST: program the video planes' gamut, bank A: 0 off (default), 1 grey 512, 2 graded on the fastest digit, 3 = 2 + colorop_gamut_map");
+		 "TEST: program the video planes' gamut, bank A: 0 off (default), 1 grey 512, 2 graded on the fastest digit, 3 = 2 + colorop_gamut_map, 4/5/6 = 2 in word c0/c1/c2 only");
 
 static u32 dpu_reg_dma_gamut_map[DPU_VIG_GAMUT_MAP_CHANNELS * DPU_VIG_GAMUT_MAP_WORDS];
 static int dpu_reg_dma_gamut_map_n;
@@ -706,9 +707,10 @@ const u32 *dpu_reg_dma_gamut_test_map(void)
 }
 
 /**
- * dpu_vig_gamut_test_lattice - a grey test lattice, packed as the LUT bus takes it
+ * dpu_vig_gamut_test_lattice - a test lattice, packed as the LUT bus takes it
  * @mode: 1 every entry grey 512; 2 or 3 grey round(k x 1023 / 16), k = L mod 17
- *        of the linear index L = 4j + i -- graded along the fastest lattice digit
+ *        of the linear index L = 4j + i -- graded along the fastest lattice digit;
+ *        4, 5, 6 the same grading in ONE output word -- c0, c1, c2 -- the others 0
  * @out: DPU_VIG_GAMUT_DWORDS dwords
  *
  * The downstream setter's order: for each entry j, the four tables i, each as
@@ -722,10 +724,10 @@ void dpu_vig_gamut_test_lattice(int mode, u32 *out)
 	for (j = 0; j < DPU_VIG_GAMUT_TBL_SZ; j++) {
 		for (i = 0; i < DPU_VIG_GAMUT_TBL_NUM; i++) {
 			k = (4 * j + i) % 17;
-			v = mode == 1 ? 512 : DIV_ROUND_CLOSEST(k * 1023, 16);
-			*data++ = (u16)(v << 6);	/* c0 */
-			*data++ = (u16)(v << 6);	/* c2 */
-			*data++ = (u16)(v << 6);	/* c1 */
+			v = (mode == 1 ? 512 : DIV_ROUND_CLOSEST(k * 1023, 16)) << 6;
+			*data++ = (u16)(mode < 4 || mode == 4 ? v : 0);	/* c0 */
+			*data++ = (u16)(mode < 4 || mode == 6 ? v : 0);	/* c2 */
+			*data++ = (u16)(mode < 4 || mode == 5 ? v : 0);	/* c1 */
 		}
 	}
 }
