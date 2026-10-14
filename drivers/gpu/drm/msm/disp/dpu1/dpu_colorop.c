@@ -479,11 +479,11 @@ static void dpu_colorop_gamut_test(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 		return;
 	}
 
-	if (want == 3) {
+	if (want == 3 || want == 8 || want == 10) {
 		map = dpu_reg_dma_gamut_test_map();
 		if (!map) {
-			pr_info("dpu: %s gamut test 3 needs the 48 colorop_gamut_map words\n",
-				sspp->cap->name);
+			pr_info("dpu: %s gamut test %d needs the 48 colorop_gamut_map words\n",
+				sspp->cap->name, want);
 			*failed = want;
 			return;
 		}
