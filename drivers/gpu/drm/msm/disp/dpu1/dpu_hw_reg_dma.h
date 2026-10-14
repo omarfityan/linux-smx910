@@ -151,6 +151,23 @@ int dpu_reg_dma_gamut_test_mode(void);
 const u32 *dpu_reg_dma_gamut_test_map(void);
 bool dpu_reg_dma_sspp_gamut_is_on(struct dpu_hw_sspp *sspp);
 
+/*
+ * colorop_gamut_test=11: a stock table -- the device's own downstream struct
+ * drm_msm_3d_gamut, 39,536 bytes -- written to debugfs vig_gamut_test_blob and
+ * programmed with its own input map.
+ */
+#define DPU_VIG_GAMUT_TEST_BLOB		11
+#define DPU_VIG_GAMUT_BLOB_SIZE		39536
+#define DPU_VIG_GAMUT_BLOB_MAP_WORDS	48
+#define DPU_VIG_GAMUT_BLOB_ENTRIES	(DPU_VIG_GAMUT_TBL_NUM * DPU_VIG_GAMUT_TBL_SZ)
+
+struct dentry;
+int dpu_vig_gamut_blob_check(const u8 *blob, size_t len);
+void dpu_vig_gamut_blob_lattice(const u8 *blob, u32 *out);
+bool dpu_vig_gamut_blob_map(const u8 *blob, u32 *map);
+int dpu_reg_dma_gamut_test_blob(u32 *lattice, u32 *map);
+void dpu_reg_dma_debugfs_init(struct dentry *parent);
+
 struct dpu_hw_dspp;
 void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
 			      struct dpu_hw_dspp *dspp, struct dpu_hw_ctl *ctl);

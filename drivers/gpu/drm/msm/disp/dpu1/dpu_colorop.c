@@ -456,6 +456,7 @@ static void dpu_colorop_gamut_test(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 	int want = dpu_reg_dma_gamut_test_mode();
 	int *applied = &dpu_colorop_gamut_applied[sspp->idx];
 	int *failed = &dpu_colorop_gamut_failed[sspp->idx];
+	u32 blob_map[DPU_VIG_GAMUT_BLOB_MAP_WORDS];
 	const u32 *map = NULL;
 	u32 *lattice;
 	int act, ret;
@@ -494,7 +495,19 @@ static void dpu_colorop_gamut_test(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 		*failed = want;
 		return;
 	}
-	dpu_vig_gamut_test_lattice(want, lattice);
+	if (want == DPU_VIG_GAMUT_TEST_BLOB) {
+		ret = dpu_reg_dma_gamut_test_blob(lattice, blob_map);
+		if (ret < 0) {
+			pr_info("dpu: %s gamut test %d needs a table in debugfs vig_gamut_test_blob\n",
+				sspp->cap->name, want);
+			kvfree(lattice);
+			*failed = want;
+			return;
+		}
+		map = ret ? blob_map : NULL;
+	} else {
+		dpu_vig_gamut_test_lattice(want, lattice);
+	}
 	ret = dpu_reg_dma_program_sspp_gamut(dpu_kms, rdma, ctl, sspp, lattice, map);
 	kvfree(lattice);
 	pr_info("dpu: %s gamut test %d programmed: %d\n", sspp->cap->name, want, ret);

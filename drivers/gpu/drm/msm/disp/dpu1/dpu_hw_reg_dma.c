@@ -7,9 +7,16 @@
 
 #define pr_fmt(fmt)	"[dpu-lutdma] " fmt
 
+#include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/fs.h>
 #include <linux/io.h>
+#include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/mutex.h>
+#include <linux/string.h>
+#include <linux/unaligned.h>
 
 #include "dpu_hw_reg_dma.h"
 #include "dpu_hw_catalog.h"
@@ -673,7 +680,7 @@ static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
 #define DPU_VIG_GAMUT_SCALE_STRIDE	0x40
 #define DPU_VIG_GAMUT_MAP_WORDS		16
 #define DPU_VIG_GAMUT_MAP_CHANNELS	3
-#define DPU_VIG_GAMUT_TEST_MAX		10
+#define DPU_VIG_GAMUT_TEST_MAX		11
 
 /*
  * TEST switch: at the next colour flush, program bank A of every colour-
@@ -681,14 +688,15 @@ static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
  * graded along the fastest lattice digit, 3 = 2 with the input map enabled
  * and loaded raw from colorop_gamut_map, 4 / 5 / 6 = 2's grading in output
  * word c0 / c1 / c2 alone, 7 a grey lattice graded along the middle digit,
- * 8 = 7 with the map, 9 graded along the slowest digit, 10 = 9 with the map
+ * 8 = 7 with the map, 9 graded along the slowest digit, 10 = 9 with the map,
+ * 11 the stock table held in debugfs (vig_gamut_test_blob) with its own map
  * -- and switch it off again on 0.  A measurement switch for the hardware
  * arms only: nothing else drives the block.
  */
 static int dpu_reg_dma_gamut_test;
 module_param_named(colorop_gamut_test, dpu_reg_dma_gamut_test, int, 0644);
 MODULE_PARM_DESC(colorop_gamut_test,
-		 "TEST: program the video planes' gamut, bank A: 0 off (default), 1 grey 512, 2 graded on the fastest digit, 3 = 2 + colorop_gamut_map, 4/5/6 = 2 in word c0/c1/c2 only, 7 graded on the middle digit, 8 = 7 + colorop_gamut_map, 9 graded on the slowest digit, 10 = 9 + colorop_gamut_map");
+		 "TEST: program the video planes' gamut, bank A: 0 off (default), 1 grey 512, 2 graded on the fastest digit, 3 = 2 + colorop_gamut_map, 4/5/6 = 2 in word c0/c1/c2 only, 7 graded on the middle digit, 8 = 7 + colorop_gamut_map, 9 graded on the slowest digit, 10 = 9 + colorop_gamut_map, 11 the stock table written to debugfs vig_gamut_test_blob");
 
 static u32 dpu_reg_dma_gamut_map[DPU_VIG_GAMUT_MAP_CHANNELS * DPU_VIG_GAMUT_MAP_WORDS];
 static int dpu_reg_dma_gamut_map_n;
@@ -737,6 +745,196 @@ void dpu_vig_gamut_test_lattice(int mode, u32 *out)
 			*data++ = (u16)(all || mode == 5 ? v : 0);	/* c1 */
 		}
 	}
+}
+
+/*
+ * A stock gamut table for colorop_gamut_test=11: the device's own downstream
+ * struct drm_msm_3d_gamut (msm_drm_pp.h :190-:229, DZA1_v3.1.0), taken
+ * verbatim through debugfs -- flags u64 (bit 0 the input map), mode u32 (1, the
+ * 17-point lattice), 3 x 16 input-map words, then col[4][1229] of {c2_c1, c0},
+ * all little-endian, 39,536 bytes with the tail pad.
+ */
+#define DPU_VIG_GAMUT_BLOB_FLAGS	0
+#define DPU_VIG_GAMUT_BLOB_MODE		8
+#define DPU_VIG_GAMUT_BLOB_MAP		12
+#define DPU_VIG_GAMUT_BLOB_COL		204
+#define DPU_VIG_GAMUT_BLOB_MODE_17	1
+#define DPU_VIG_GAMUT_BLOB_MAP_EN	BIT(0)
+
+static_assert(DPU_VIG_GAMUT_BLOB_MAP_WORDS == DPU_VIG_GAMUT_MAP_CHANNELS * DPU_VIG_GAMUT_MAP_WORDS);
+static_assert(DPU_VIG_GAMUT_BLOB_COL == DPU_VIG_GAMUT_BLOB_MAP + 4 * DPU_VIG_GAMUT_BLOB_MAP_WORDS);
+static_assert(DPU_VIG_GAMUT_BLOB_SIZE == ALIGN(DPU_VIG_GAMUT_BLOB_COL + 8 * DPU_VIG_GAMUT_BLOB_ENTRIES, 8));
+
+/* entry n = i x 1229 + j of the table's col[4][1229] */
+static void dpu_vig_gamut_blob_entry(const u8 *blob, u32 n, u32 *c0, u32 *c1, u32 *c2)
+{
+	const u8 *e = blob + DPU_VIG_GAMUT_BLOB_COL + 8 * n;
+	u32 c2_c1 = get_unaligned_le32(e);
+
+	*c0 = get_unaligned_le32(e + 4);
+	*c1 = c2_c1 & 0xffff;
+	*c2 = c2_c1 >> 16;
+}
+
+/**
+ * dpu_vig_gamut_blob_check - is this a stock gamut table the LUT bus can take
+ * @blob: the bytes written
+ * @len: how many
+ *
+ * Return: 0, or -EINVAL for the wrong size, a mode other than the 17-point
+ * lattice, a flag other than the input map's, or a component past 10 bits.
+ */
+int dpu_vig_gamut_blob_check(const u8 *blob, size_t len)
+{
+	u32 n, c0, c1, c2;
+
+	if (len != DPU_VIG_GAMUT_BLOB_SIZE)
+		return -EINVAL;
+	if (get_unaligned_le32(blob + DPU_VIG_GAMUT_BLOB_MODE) != DPU_VIG_GAMUT_BLOB_MODE_17)
+		return -EINVAL;
+	if (get_unaligned_le64(blob + DPU_VIG_GAMUT_BLOB_FLAGS) & ~(u64)DPU_VIG_GAMUT_BLOB_MAP_EN)
+		return -EINVAL;
+	for (n = 0; n < DPU_VIG_GAMUT_BLOB_ENTRIES; n++) {
+		dpu_vig_gamut_blob_entry(blob, n, &c0, &c1, &c2);
+		if (c0 > 1023 || c1 > 1023 || c2 > 1023)
+			return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * One lattice entry as the LUT bus takes it -- the downstream setter's order,
+ * c0, c2, c1, each a 10-bit value MSB-aligned in its 16-bit word (DZA1
+ * :4799-:4802).  A 3D-LUT colour operation would build its stream through it too.
+ */
+static u16 *dpu_vig_gamut_pack(u16 *data, u32 c0, u32 c1, u32 c2)
+{
+	*data++ = (u16)(c0 << 6);
+	*data++ = (u16)(c2 << 6);
+	*data++ = (u16)(c1 << 6);
+	return data;
+}
+
+/**
+ * dpu_vig_gamut_blob_lattice - a stock table's lattice, packed for the LUT bus
+ * @blob: a table dpu_vig_gamut_blob_check() passed
+ * @out: DPU_VIG_GAMUT_DWORDS dwords
+ *
+ * For each entry j, the four tables i -- stream position 4j + i -- as
+ * dpu_vig_gamut_test_lattice() packs its own.
+ */
+void dpu_vig_gamut_blob_lattice(const u8 *blob, u32 *out)
+{
+	u16 *data = (u16 *)out;
+	u32 i, j, c0, c1, c2;
+
+	for (j = 0; j < DPU_VIG_GAMUT_TBL_SZ; j++) {
+		for (i = 0; i < DPU_VIG_GAMUT_TBL_NUM; i++) {
+			dpu_vig_gamut_blob_entry(blob, i * DPU_VIG_GAMUT_TBL_SZ + j, &c0, &c1, &c2);
+			data = dpu_vig_gamut_pack(data, c0, c1, c2);
+		}
+	}
+}
+
+/**
+ * dpu_vig_gamut_blob_map - a stock table's input map
+ * @blob: a table dpu_vig_gamut_blob_check() passed
+ * @map: DPU_VIG_GAMUT_BLOB_MAP_WORDS words, the three channels' 16 in turn, as stored
+ *
+ * Return: true when the table enables the map (flags bit 0).
+ */
+bool dpu_vig_gamut_blob_map(const u8 *blob, u32 *map)
+{
+	u32 k;
+
+	for (k = 0; k < DPU_VIG_GAMUT_BLOB_MAP_WORDS; k++)
+		map[k] = get_unaligned_le32(blob + DPU_VIG_GAMUT_BLOB_MAP + 4 * k);
+	return get_unaligned_le64(blob + DPU_VIG_GAMUT_BLOB_FLAGS) & DPU_VIG_GAMUT_BLOB_MAP_EN;
+}
+
+static u8 *dpu_vig_gamut_blob;		/* the held table, NULL until one is written */
+static DEFINE_MUTEX(dpu_vig_gamut_blob_lock);
+
+/**
+ * dpu_reg_dma_gamut_test_blob - the held stock table, packed for colorop_gamut_test=11
+ * @lattice: DPU_VIG_GAMUT_DWORDS dwords
+ * @map: DPU_VIG_GAMUT_BLOB_MAP_WORDS words
+ *
+ * Return: 1 the table enables its input map, 0 it does not, -ENOENT none is held.
+ */
+int dpu_reg_dma_gamut_test_blob(u32 *lattice, u32 *map)
+{
+	int ret = -ENOENT;
+
+	mutex_lock(&dpu_vig_gamut_blob_lock);
+	if (dpu_vig_gamut_blob) {
+		dpu_vig_gamut_blob_lattice(dpu_vig_gamut_blob, lattice);
+		ret = dpu_vig_gamut_blob_map(dpu_vig_gamut_blob, map);
+	}
+	mutex_unlock(&dpu_vig_gamut_blob_lock);
+	return ret;
+}
+
+/*
+ * The debugfs node colorop_gamut_test=11 takes its table from: one write of
+ * the whole struct at offset 0, refused while the switch is on -- the hook does
+ * nothing for an unchanged mode with the block on, so a table written under a
+ * held 11 would never load -- and read back whole.
+ */
+static ssize_t dpu_vig_gamut_blob_write(struct file *file, const char __user *ubuf,
+					size_t len, loff_t *ppos)
+{
+	u8 *blob;
+	int ret;
+
+	if (*ppos || len != DPU_VIG_GAMUT_BLOB_SIZE)
+		return -EINVAL;
+	if (READ_ONCE(dpu_reg_dma_gamut_test))
+		return -EBUSY;
+	blob = vmemdup_user(ubuf, len);
+	if (IS_ERR(blob))
+		return PTR_ERR(blob);
+	ret = dpu_vig_gamut_blob_check(blob, len);
+	if (ret) {
+		kvfree(blob);
+		return ret;
+	}
+	mutex_lock(&dpu_vig_gamut_blob_lock);
+	swap(blob, dpu_vig_gamut_blob);
+	mutex_unlock(&dpu_vig_gamut_blob_lock);
+	kvfree(blob);
+	*ppos = len;
+	return len;
+}
+
+static ssize_t dpu_vig_gamut_blob_read(struct file *file, char __user *ubuf,
+				       size_t len, loff_t *ppos)
+{
+	ssize_t ret = 0;
+
+	mutex_lock(&dpu_vig_gamut_blob_lock);
+	if (dpu_vig_gamut_blob)
+		ret = simple_read_from_buffer(ubuf, len, ppos, dpu_vig_gamut_blob,
+					      DPU_VIG_GAMUT_BLOB_SIZE);
+	mutex_unlock(&dpu_vig_gamut_blob_lock);
+	return ret;
+}
+
+static const struct file_operations dpu_vig_gamut_blob_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = dpu_vig_gamut_blob_read,
+	.write = dpu_vig_gamut_blob_write,
+	.llseek = default_llseek,
+};
+
+/**
+ * dpu_reg_dma_debugfs_init - add the node a stock gamut table is written to
+ * @parent: the DPU's debugfs directory
+ */
+void dpu_reg_dma_debugfs_init(struct dentry *parent)
+{
+	debugfs_create_file("vig_gamut_test_blob", 0600, parent, NULL, &dpu_vig_gamut_blob_fops);
 }
 
 /**
