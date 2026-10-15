@@ -1893,8 +1893,13 @@ dpu_plane_duplicate_state(struct drm_plane *plane)
 	DPU_DEBUG_PLANE(pdpu, "\n");
 
 	pstate->pending = false;
-	/* the copy shares the blob: it needs its own reference */
-	drm_property_blob_get(pstate->pipeline_gamut);
+	/*
+	 * the copy shares the blob: it needs its own reference.  Unlike its put,
+	 * drm_property_blob_get() does not accept NULL -- and a state fresh from
+	 * reset has no blob.
+	 */
+	if (pstate->pipeline_gamut)
+		drm_property_blob_get(pstate->pipeline_gamut);
 
 	__drm_atomic_helper_plane_duplicate_state(plane, &pstate->base);
 
