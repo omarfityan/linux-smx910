@@ -18,6 +18,8 @@
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
+#include <drm/drm_color_mgmt.h>
+
 #include "dpu_hw_reg_dma.h"
 #include "dpu_hw_catalog.h"
 #include "dpu_hw_ctl.h"
@@ -837,6 +839,35 @@ void dpu_vig_gamut_blob_lattice(const u8 *blob, u32 *out)
 }
 
 /**
+ * dpu_vig_gamut_from_lut32 - a DRM 3D-LUT colour operation's data, packed for the LUT bus
+ * @lut: DPU_VIG_GAMUT_POINTS entries, DRM's index R + 17 (G + 17 B) (drm_mode.h)
+ * @out: DPU_VIG_GAMUT_DWORDS dwords
+ *
+ * The lattice's linear index is DRM's own -- the stream position 4j + i is the
+ * index, R its fastest digit, G the middle, B the slowest (measured on the
+ * hardware) -- so entry L lands at stream position L.  The words are c0 = R,
+ * c1 = B, c2 = G (measured likewise), each rounded to the lattice's 10 bits.
+ * The three positions past 17^3 that complete the last group of four are 0.
+ */
+void dpu_vig_gamut_from_lut32(const struct drm_color_lut32 *lut, u32 *out)
+{
+	u16 *data = (u16 *)out;
+	u32 L;
+
+	for (L = 0; L < DPU_VIG_GAMUT_TBL_NUM * DPU_VIG_GAMUT_TBL_SZ; L++) {
+		if (L < DPU_VIG_GAMUT_POINTS) {
+			const struct drm_color_lut32 *e = &lut[L];
+
+			data = dpu_vig_gamut_pack(data, drm_color_lut32_extract(e->red, 10),
+						  drm_color_lut32_extract(e->blue, 10),
+						  drm_color_lut32_extract(e->green, 10));
+		} else {
+			data = dpu_vig_gamut_pack(data, 0, 0, 0);
+		}
+	}
+}
+
+/**
  * dpu_vig_gamut_blob_map - a stock table's input map
  * @blob: a table dpu_vig_gamut_blob_check() passed
  * @map: DPU_VIG_GAMUT_BLOB_MAP_WORDS words, the three channels' 16 in turn, as stored
@@ -1033,6 +1064,32 @@ int dpu_reg_dma_gamut_test_action(int want, int applied, bool on)
 	if (!want)
 		return (applied || on) ? -1 : 0;
 	return (want != applied || !on) ? 1 : 0;
+}
+
+/**
+ * dpu_reg_dma_gamut_colorop_action - what the colour flush does to one pipe's
+ *                                    gamut for the 3D-LUT colour operation
+ * @want: the data blob id the pipe's plane asks for, 0 for none
+ * @applied: the blob id this pipe was last given, 0 for none
+ * @failed: the blob id that last failed on this pipe, 0 for none
+ * @on: the pipe's gamut enable as the register reads now
+ * @test: the gamut TEST switch owns the block (set, or still applied)
+ *
+ * Return: 1 program, -1 switch off, 0 nothing.  A table lost with the block's
+ * power (the enable read clear) is programmed again; a table that failed is
+ * not retried until the plane asks for a different one.
+ */
+int dpu_reg_dma_gamut_colorop_action(u32 want, u32 applied, u32 failed, bool on, bool test)
+{
+	if (test)
+		return 0;
+	if (!want)
+		return applied ? -1 : 0;
+	if (want == applied && on)
+		return 0;
+	if (want == failed)
+		return 0;
+	return 1;
 }
 
 /**

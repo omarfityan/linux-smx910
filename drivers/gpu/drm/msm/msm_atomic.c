@@ -5,6 +5,7 @@
  */
 
 #include <drm/drm_atomic_uapi.h>
+#include <drm/drm_colorop.h>
 #include <drm/drm_vblank.h>
 
 #include "msm_atomic_trace.h"
@@ -186,8 +187,34 @@ int msm_atomic_check(struct drm_device *dev, struct drm_atomic_state *state)
 	struct msm_drm_private *priv = dev->dev_private;
 	struct msm_kms *kms = priv->kms;
 	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
+	struct drm_colorop_state *colorop_state;
+	struct drm_colorop *colorop;
+	struct drm_plane *plane;
 	struct drm_crtc *crtc;
+	u32 planes = 0;
 	int i, ret = 0;
+
+	/*
+	 * A commit that changes only a colour operation -- its data or its
+	 * bypass -- carries the colorop and not its plane, so no plane check
+	 * would see the change and the flush would keep the old table.  Pull
+	 * each such plane in, and its CRTC with it.  The planes are collected
+	 * first: adding states while walking the colorop array is not safe.
+	 */
+	for_each_new_colorop_in_state(state, colorop, colorop_state, i)
+		if (colorop_state && colorop->plane)
+			planes |= drm_plane_mask(colorop->plane);
+	drm_for_each_plane_mask(plane, dev, planes) {
+		struct drm_plane_state *plane_state = drm_atomic_get_plane_state(state, plane);
+
+		if (IS_ERR(plane_state))
+			return PTR_ERR(plane_state);
+		if (plane_state->crtc) {
+			new_crtc_state = drm_atomic_get_crtc_state(state, plane_state->crtc);
+			if (IS_ERR(new_crtc_state))
+				return PTR_ERR(new_crtc_state);
+		}
+	}
 
 	/*
 	 * FIXME: stop setting allow_modeset and move this check to the DPU

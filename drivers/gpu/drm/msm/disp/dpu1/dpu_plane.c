@@ -1176,7 +1176,7 @@ static int dpu_plane_atomic_check_sspp(struct drm_plane *plane,
 	 * paths simply do nothing and the picture comes out wrong.  Refusing
 	 * here costs a composited frame, which is slower and CORRECT.
 	 */
-	if (pstate->has_pipeline_csc || pstate->has_pipeline_igc) {
+	if (pstate->has_pipeline_csc || pstate->has_pipeline_igc || pstate->pipeline_gamut) {
 		int i;
 
 		for (i = 0; i < PIPES_PER_PLANE; i++) {
@@ -1526,12 +1526,14 @@ static int dpu_plane_virtual_assign_resources(struct drm_crtc *crtc,
 		(plane_state->src_h >> 16 != plane_state->crtc_h);
 
 	reqs.rot90 = drm_rotation_90_or_270(plane_state->rotation);
-	reqs.colorop = pstate->has_pipeline_csc || pstate->has_pipeline_igc;
+	reqs.colorop = pstate->has_pipeline_csc || pstate->has_pipeline_igc ||
+		       pstate->pipeline_gamut;
 
 	for (i = 0; i < STAGES_PER_PLANE; i++) {
 		if (prev_adjacent_pstate[i] && !reqs.colorop &&
 		    !prev_adjacent_pstate[i]->has_pipeline_csc &&
 		    !prev_adjacent_pstate[i]->has_pipeline_igc &&
+		    !prev_adjacent_pstate[i]->pipeline_gamut &&
 		    dpu_plane_try_multirect_shared(pstate, prev_adjacent_pstate[i], fmt,
 						   dpu_kms->catalog->caps->max_linewidth,
 						   i))
@@ -1860,6 +1862,7 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
 static void dpu_plane_destroy_state(struct drm_plane *plane,
 		struct drm_plane_state *state)
 {
+	drm_property_blob_put(to_dpu_plane_state(state)->pipeline_gamut);
 	__drm_atomic_helper_plane_destroy_state(state);
 	kfree(to_dpu_plane_state(state));
 }
@@ -1890,6 +1893,8 @@ dpu_plane_duplicate_state(struct drm_plane *plane)
 	DPU_DEBUG_PLANE(pdpu, "\n");
 
 	pstate->pending = false;
+	/* the copy shares the blob: it needs its own reference */
+	drm_property_blob_get(pstate->pipeline_gamut);
 
 	__drm_atomic_helper_plane_duplicate_state(plane, &pstate->base);
 

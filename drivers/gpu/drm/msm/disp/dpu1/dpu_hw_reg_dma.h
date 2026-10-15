@@ -133,13 +133,19 @@ int dpu_reg_dma_disable_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 
 /*
  * The video pipes' gamut block: a 17-point 3D lookup table streamed over the
- * LUT bus as four tables of 1229 entries, three 16-bit words each.  Driven only
- * by a TEST switch (colorop_gamut_test) until a colour operation exposes it.
+ * LUT bus as four tables of 1229 entries, three 16-bit words each.  Driven by
+ * the plane's 3D-LUT colour operation, or by a TEST switch (colorop_gamut_test)
+ * that owns the block while it is set.
  */
 #define DPU_VIG_GAMUT_TBL_NUM		4
 #define DPU_VIG_GAMUT_TBL_SZ		1229
 #define DPU_VIG_GAMUT_DWORDS		(DPU_VIG_GAMUT_TBL_NUM * DPU_VIG_GAMUT_TBL_SZ * 3 / 2)
+#define DPU_VIG_GAMUT_LUT_SIZE		17
+#define DPU_VIG_GAMUT_POINTS		(DPU_VIG_GAMUT_LUT_SIZE * DPU_VIG_GAMUT_LUT_SIZE * DPU_VIG_GAMUT_LUT_SIZE)
 
+struct drm_color_lut32;
+void dpu_vig_gamut_from_lut32(const struct drm_color_lut32 *lut, u32 *out);
+int dpu_reg_dma_gamut_colorop_action(u32 want, u32 applied, u32 failed, bool on, bool test);
 void dpu_vig_gamut_test_lattice(int mode, u32 *out);
 int dpu_reg_dma_program_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 				   struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,

@@ -95,6 +95,18 @@ struct dpu_plane_state {
 	u32 pipeline_igc_last[DPU_PLANE_IGC_CHANNELS];
 
 	/*
+	 * The 3D-LUT colour operation's data, for the pipe's gamut block.  Unlike
+	 * the inverse-gamma table it is NOT converted into the plane state -- the
+	 * packed lattice is 7,374 dwords, copied on every duplicate -- so the state
+	 * holds a REFERENCE to the blob (taken in duplicate, dropped in destroy)
+	 * and the flush converts it only when @pipeline_gamut_id differs from what
+	 * the pipe was last given.  NULL and 0 when the operation is bypassed or
+	 * carries no data.
+	 */
+	struct drm_property_blob *pipeline_gamut;
+	u32 pipeline_gamut_id;
+
+	/*
 	 * What the compositor put in the pipeline, as booleans, purely so a
 	 * change can be reported once instead of every frame.
 	 */
