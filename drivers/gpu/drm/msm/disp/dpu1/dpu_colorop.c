@@ -541,6 +541,14 @@ static void dpu_colorop_gamut_lut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *r
 	u32 *lattice;
 	int act, ret;
 
+	/*
+	 * The test loads its own lattice over bank A, so whatever this pipe was
+	 * given before is gone -- also when the test's own switch-off fails and
+	 * leaves the block on, which would otherwise read as "still loaded".
+	 */
+	if (test)
+		*applied = 0;
+
 	act = dpu_reg_dma_gamut_colorop_action(want, *applied, *failed,
 					       dpu_reg_dma_sspp_gamut_is_on(sspp), test);
 	if (!act)
