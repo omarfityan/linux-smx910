@@ -682,6 +682,7 @@ static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
 #define DPU_VIG_GAMUT_MODE_SHIFT	2	/* the op word's mode, bits 4:2 */
 #define DPU_VIG_GAMUT_MODE_17B		4	/* gamut_mode_17b: table B shown; gamut_mode_17 = 0, A */
 #define DPU_VIG_GAMUT_SCALEA		0x10
+#define DPU_VIG_GAMUT_SCALEB		0xe0	/* table B's map: common_v4.h GAMUT_SCALEB_OFFSET_OFF */
 #define DPU_VIG_GAMUT_SCALE_STRIDE	0x40
 #define DPU_VIG_GAMUT_MAP_WORDS		16
 #define DPU_VIG_GAMUT_MAP_CHANNELS	3
@@ -1006,15 +1007,16 @@ u32 dpu_reg_dma_sspp_gamut_op(struct dpu_hw_sspp *sspp)
  * @lattice: DPU_VIG_GAMUT_DWORDS dwords, as dpu_vig_gamut_test_lattice() packs them
  * @map: the 3 x 16 input-map words, written raw with the map enabled; NULL for none
  *
- * Without a map -- the 3D-LUT colour operation, which can change every frame -- the
- * device's own ping-pong: the bank the live mode does not show is written and the
- * mode flipped to it in the same transfer, so the table on display is never
- * rewritten under the scan (dpu_reg_dma_gamut_bank).  With a map -- the test switch
- * only -- bank A (table 0, SCALEA, mode 17), the block switched off first: bank B's
- * map words would sit past the block's declared 0x1dff.  The op word is modified,
- * never written whole as the vendor writes it: inverse gamma's enable lives in it.
- * Kicked off as the inverse gamma's is -- queue 0, write-immediate, the class the
- * vendor gives both.
+ * The device's own ping-pong for every load (v6.1 setter :4752-:4834): the bank the
+ * live mode does not show is written and the mode flipped to it in the same
+ * transfer, so the table on display is never rewritten under the scan
+ * (dpu_reg_dma_gamut_bank).  A map goes into that same bank's scale / offset words
+ * -- SCALEA for table A, SCALEB for table B -- with MAP_EN beside the mode: stock
+ * shows bank B with its map on (VIG2's op word 0x13, read on stock CYG1).  Bank
+ * B's map words are written by the engine only; the gamut path reads nothing past
+ * its op word.  The op word is modified, never written whole as the vendor writes
+ * it: inverse gamma's enable lives in it.  Kicked off as the inverse gamma's is --
+ * queue 0, write-immediate, the class the vendor gives both.
  *
  * Return: 0 when the engine acknowledged the transfer, negative otherwise.
  */
@@ -1022,7 +1024,7 @@ int dpu_reg_dma_program_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 				   struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,
 				   const u32 *lattice, const u32 *map)
 {
-	u32 blk, op_off, op, table = DPU_VIG_GAMUT_TABLE_A;
+	u32 blk, op_off, op, scale, table = DPU_VIG_GAMUT_TABLE_A;
 	int ch, ret;
 
 	if (!sspp->cap->sblk->igc_blk.len)
@@ -1034,21 +1036,19 @@ int dpu_reg_dma_program_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 		return -EINVAL;
 	op_off = sspp->cap->sblk->igc_blk.base - DPU_VIG_TOP_OFF + DPU_VIG_IGC_OPMODE;
 
-	if (!map)
-		op = dpu_reg_dma_gamut_bank(dpu_reg_dma_sspp_gamut_op(sspp), &table);
-	else
-		op = DPU_VIG_GAMUT_EN | DPU_VIG_GAMUT_MAP_EN;	/* mode 17 = 0: table A */
+	op = dpu_reg_dma_gamut_bank(dpu_reg_dma_sspp_gamut_op(sspp), &table);
+	if (map)
+		op |= DPU_VIG_GAMUT_MAP_EN;
+	scale = table == DPU_VIG_GAMUT_TABLE_A ? DPU_VIG_GAMUT_SCALEA : DPU_VIG_GAMUT_SCALEB;
 
 	dpu_reg_dma_buf_reset(rdma);
 	ret = dpu_reg_dma_decode_sel(rdma, blk);
-	if (!ret && map)
-		ret = dpu_reg_dma_single_modify(rdma, op_off, ~DPU_VIG_GAMUT_OP_BITS, 0); /* off first */
 	if (!ret)
 		ret = dpu_reg_dma_lutbus_write(rdma, DPU_REG_DMA_LUTBUS_GAMUT, table,
 					       DPU_REG_DMA_LUTBUS_GAMUT_TRANS, lattice,
 					       DPU_VIG_GAMUT_DWORDS);
 	for (ch = 0; map && ch < DPU_VIG_GAMUT_MAP_CHANNELS && !ret; ch++)
-		ret = dpu_reg_dma_block_write(rdma, op_off + DPU_VIG_GAMUT_SCALEA +
+		ret = dpu_reg_dma_block_write(rdma, op_off + scale +
 					      ch * DPU_VIG_GAMUT_SCALE_STRIDE,
 					      map + ch * DPU_VIG_GAMUT_MAP_WORDS,
 					      DPU_VIG_GAMUT_MAP_WORDS);
