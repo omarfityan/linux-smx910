@@ -50,7 +50,7 @@ int dpu_colorop_ctm_to_csc(const struct drm_property_blob *blob,
 			   struct dpu_csc_cfg *cfg, bool src_yuv_8bit);
 int dpu_colorop_ctm_to_fp16_csc(const struct drm_property_blob *blob,
 				u32 words[DPU_FP16_CSC_WORDS]);
-int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out, u32 *last);
+int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u16 one, u32 *out, u32 *last);
 
 bool dpu_plane_colorops_enabled(void);
 int dpu_plane_init_colorops(struct drm_plane *plane, bool has_blocks);

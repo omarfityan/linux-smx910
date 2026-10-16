@@ -678,6 +678,9 @@ static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
 #define DPU_VIG_GAMUT_MAP_EN		BIT(1)
 #define DPU_VIG_GAMUT_OP_BITS		0x1f
 #define DPU_VIG_GAMUT_TABLE_A		0
+#define DPU_VIG_GAMUT_TABLE_B		1
+#define DPU_VIG_GAMUT_MODE_SHIFT	2	/* the op word's mode, bits 4:2 */
+#define DPU_VIG_GAMUT_MODE_17B		4	/* gamut_mode_17b: table B shown; gamut_mode_17 = 0, A */
 #define DPU_VIG_GAMUT_SCALEA		0x10
 #define DPU_VIG_GAMUT_SCALE_STRIDE	0x40
 #define DPU_VIG_GAMUT_MAP_WORDS		16
@@ -969,16 +972,49 @@ void dpu_reg_dma_debugfs_init(struct dentry *parent)
 }
 
 /**
- * dpu_reg_dma_program_sspp_gamut - load bank A of a video pipe's gamut and enable it
+ * dpu_reg_dma_gamut_bank - which bank a map-less gamut load writes: the device's own rule
+ * @op:    a video pipe's op word as it reads now
+ * @table: filled with the LUT-bus table to write -- the one @op does NOT show
+ *
+ * The v6.1 setter (sde_hw_reg_dma_v1_color_proc.c, DZA1_v3.1.0) reads the mode in bits 4:2 and
+ * writes table A when it is gamut_mode_17b (table B shown), table B otherwise -- a cleared word
+ * included, so after a switch-off or a power loss the first load goes to B -- and flips the mode
+ * with the block on.  Unlike inverse gamma, whose engine picks the bank, the LUT bus names it.
+ *
+ * Return: the op word's bits 0-4 that show the bank written, the block on.
+ */
+u32 dpu_reg_dma_gamut_bank(u32 op, u32 *table)
+{
+	if (((op & DPU_VIG_GAMUT_OP_BITS) >> DPU_VIG_GAMUT_MODE_SHIFT) == DPU_VIG_GAMUT_MODE_17B) {
+		*table = DPU_VIG_GAMUT_TABLE_A;
+		return DPU_VIG_GAMUT_EN;
+	}
+	*table = DPU_VIG_GAMUT_TABLE_B;
+	return DPU_VIG_GAMUT_EN | DPU_VIG_GAMUT_MODE_17B << DPU_VIG_GAMUT_MODE_SHIFT;
+}
+
+/**
+ * dpu_reg_dma_sspp_gamut_op - a video pipe's gamut / inverse-gamma op word as it reads now
+ */
+u32 dpu_reg_dma_sspp_gamut_op(struct dpu_hw_sspp *sspp)
+{
+	return DPU_REG_READ(&sspp->hw, sspp->cap->sblk->igc_blk.base + DPU_VIG_IGC_OPMODE);
+}
+
+/**
+ * dpu_reg_dma_program_sspp_gamut - load a video pipe's gamut and enable it
  * @lattice: DPU_VIG_GAMUT_DWORDS dwords, as dpu_vig_gamut_test_lattice() packs them
  * @map: the 3 x 16 input-map words, written raw with the map enabled; NULL for none
  *
- * Bank A only (table 0, SCALEA, mode 17), and the block is switched off first in
- * the same transfer, so the table written is never the one on display.  The
- * vendor ping-pongs instead, writing whichever bank the live mode does not show.
- * The op word is modified, never written whole as the vendor writes it: inverse
- * gamma's enable lives in it.  Kicked off as the inverse gamma's is -- queue 0,
- * write-immediate, the class the vendor gives both.
+ * Without a map -- the 3D-LUT colour operation, which can change every frame -- the
+ * device's own ping-pong: the bank the live mode does not show is written and the
+ * mode flipped to it in the same transfer, so the table on display is never
+ * rewritten under the scan (dpu_reg_dma_gamut_bank).  With a map -- the test switch
+ * only -- bank A (table 0, SCALEA, mode 17), the block switched off first: bank B's
+ * map words would sit past the block's declared 0x1dff.  The op word is modified,
+ * never written whole as the vendor writes it: inverse gamma's enable lives in it.
+ * Kicked off as the inverse gamma's is -- queue 0, write-immediate, the class the
+ * vendor gives both.
  *
  * Return: 0 when the engine acknowledged the transfer, negative otherwise.
  */
@@ -986,7 +1022,7 @@ int dpu_reg_dma_program_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 				   struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,
 				   const u32 *lattice, const u32 *map)
 {
-	u32 blk, op_off, op;
+	u32 blk, op_off, op, table = DPU_VIG_GAMUT_TABLE_A;
 	int ch, ret;
 
 	if (!sspp->cap->sblk->igc_blk.len)
@@ -998,12 +1034,17 @@ int dpu_reg_dma_program_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 		return -EINVAL;
 	op_off = sspp->cap->sblk->igc_blk.base - DPU_VIG_TOP_OFF + DPU_VIG_IGC_OPMODE;
 
+	if (!map)
+		op = dpu_reg_dma_gamut_bank(dpu_reg_dma_sspp_gamut_op(sspp), &table);
+	else
+		op = DPU_VIG_GAMUT_EN | DPU_VIG_GAMUT_MAP_EN;	/* mode 17 = 0: table A */
+
 	dpu_reg_dma_buf_reset(rdma);
 	ret = dpu_reg_dma_decode_sel(rdma, blk);
-	if (!ret)
+	if (!ret && map)
 		ret = dpu_reg_dma_single_modify(rdma, op_off, ~DPU_VIG_GAMUT_OP_BITS, 0); /* off first */
 	if (!ret)
-		ret = dpu_reg_dma_lutbus_write(rdma, DPU_REG_DMA_LUTBUS_GAMUT, DPU_VIG_GAMUT_TABLE_A,
+		ret = dpu_reg_dma_lutbus_write(rdma, DPU_REG_DMA_LUTBUS_GAMUT, table,
 					       DPU_REG_DMA_LUTBUS_GAMUT_TRANS, lattice,
 					       DPU_VIG_GAMUT_DWORDS);
 	for (ch = 0; map && ch < DPU_VIG_GAMUT_MAP_CHANNELS && !ret; ch++)
@@ -1011,7 +1052,6 @@ int dpu_reg_dma_program_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 					      ch * DPU_VIG_GAMUT_SCALE_STRIDE,
 					      map + ch * DPU_VIG_GAMUT_MAP_WORDS,
 					      DPU_VIG_GAMUT_MAP_WORDS);
-	op = DPU_VIG_GAMUT_EN | (map ? DPU_VIG_GAMUT_MAP_EN : 0);	/* mode 17 = 0: table A */
 	if (!ret)
 		ret = dpu_reg_dma_single_modify(rdma, op_off, ~DPU_VIG_GAMUT_OP_BITS, op);
 	if (!ret)

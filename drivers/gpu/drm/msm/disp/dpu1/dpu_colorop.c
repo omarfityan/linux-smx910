@@ -323,6 +323,7 @@ int dpu_colorop_ctm_to_fp16_csc(const struct drm_property_blob *blob,
 /**
  * dpu_colorop_lut_to_igc - convert a DRM 1D LUT into the pipe's packed table
  * @blob: the DATA blob of a DRM_COLOROP_1D_LUT colorop
+ * @one:  the twelve-bit value the curve's 1.0 maps to (dpu_colorop_igc_scale)
  * @out:  DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) dwords to fill
  * @last: DPU_IGC_CHANNELS endpoint values to fill
  *
@@ -336,7 +337,7 @@ int dpu_colorop_ctm_to_fp16_csc(const struct drm_property_blob *blob,
  *
  * Return: 0 on success, -EINVAL if the blob is the wrong size.
  */
-int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out, u32 *last)
+int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u16 one, u32 *out, u32 *last)
 {
 	const struct drm_color_lut32 *lut;
 	u16 slots[DPU_IGC_SLOTS], endpoint;
@@ -351,9 +352,9 @@ int dpu_colorop_lut_to_igc(const struct drm_property_blob *blob, u32 *out, u32 *
 		u32 *tbl = out + ch * (DPU_IGC_LUT_LEN / 2);
 
 		/* red, green and blue are consecutive u32s of each drm_color_lut32 */
-		dpu_igc_convert_channel(&lut[0].red + ch,
-					sizeof(struct drm_color_lut32) / sizeof(u32),
-					DPU_IGC_LUT_LEN, slots, &endpoint);
+		dpu_igc_convert_channel_scaled(&lut[0].red + ch,
+					       sizeof(struct drm_color_lut32) / sizeof(u32),
+					       DPU_IGC_LUT_LEN, one, slots, &endpoint);
 		for (i = 0; i < DPU_IGC_LUT_LEN / 2; i++)
 			tbl[i] = (slots[2 * i] & DPU_IGC_ENTRY_MASK) |
 				 ((slots[2 * i + 1] & DPU_IGC_ENTRY_MASK) << 16);
@@ -587,6 +588,33 @@ MODULE_PARM_DESC(colorop_igc_test_invert,
 
 /* DRM object ids are positive ints, so the top bit is free to mark a transformed table */
 #define DPU_COLOROP_IGC_ID_INVERTED	BIT(31)
+
+/*
+ * And the next one marks a table scaled for a 3D LUT behind it (dpu_colorop_igc.h): the flush
+ * reloads on an id change, so tagging the id is what reloads the curve when the plane's 3D LUT
+ * enters or leaves bypass.  Blob ids are allocated small and in order; one this high would need a
+ * billion live objects.
+ */
+#define DPU_COLOROP_IGC_ID_FULL_SCALE	BIT(30)
+
+/**
+ * dpu_colorop_igc_scale - the inverse gamma's full scale and table id for one plane state
+ * @lut3d:  the plane's 3D LUT is in force (not bypassed, with data)
+ * @invert: colorop_igc_test_invert is on
+ * @id:     the 1D LUT's blob id
+ * @one:    filled with the twelve-bit value the curve's 1.0 maps to
+ *
+ * Return: the id the pipe's loaded table is known by.
+ */
+static u32 dpu_colorop_igc_scale(bool lut3d, bool invert, u32 id, u16 *one)
+{
+	*one = lut3d ? DPU_IGC_OUT_MAX : DPU_IGC_OUT_ONE;
+	if (lut3d)
+		id |= DPU_COLOROP_IGC_ID_FULL_SCALE;
+	if (invert)
+		id |= DPU_COLOROP_IGC_ID_INVERTED;
+	return id;
+}
 
 static_assert(DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) == DPU_PLANE_IGC_DWORDS,
 	      "the inversion walks exactly the plane state's packed table");
@@ -824,7 +852,7 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 	struct dpu_plane_state *pstate = to_dpu_plane_state(plane_state);
 	struct drm_colorop *colorop = plane_state->color_pipeline;
 	struct drm_plane_state *old_plane_state;
-	struct drm_colorop_state *cs;
+	struct drm_colorop_state *cs, *igc_cs;
 	struct dpu_csc_cfg csc;
 	bool changed, report;
 	u32 shape = 0;
@@ -885,22 +913,8 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			shape |= DPU_COLOROP_SHAPE_IGC_BYPASS;
 		if (cs->data)
 			shape |= DPU_COLOROP_SHAPE_IGC_DATA;
-		if (!cs->bypass && cs->data) {
-			if (dpu_colorop_lut_to_igc(cs->data, pstate->pipeline_igc,
-						   pstate->pipeline_igc_last)) {
-				if (dpu_colorop_report_refusal(reports,
-							       DPU_COLOROP_REFUSAL_TABLE_SIZE))
-					DPU_ERROR("inverse-gamma table is not the size this pipe takes\n");
-				return -EINVAL;
-			}
-			pstate->has_pipeline_igc = true;
-			pstate->pipeline_igc_id = cs->data->base.id;
-			if (dpu_colorop_igc_test_invert) {
-				dpu_colorop_igc_invert(pstate->pipeline_igc,
-						       pstate->pipeline_igc_last);
-				pstate->pipeline_igc_id |= DPU_COLOROP_IGC_ID_INVERTED;
-			}
-		}
+		/* converted below, once the 3D LUT behind it is known: that sets its scale */
+		igc_cs = cs;
 
 		/*
 		 * third: the 3D LUT.  Its blob is only REFERENCED here (the core
@@ -929,6 +943,31 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			}
 			pstate->pipeline_gamut = drm_property_blob_get(cs->data);
 			pstate->pipeline_gamut_id = cs->data->base.id;
+		}
+
+		/*
+		 * The inverse-gamma table, at the scale of what reads it: the mixer, or
+		 * the 3D LUT when one is in force (dpu_colorop_igc.h).  The id carries
+		 * the scale, so the flush reloads the curve when the 3D LUT comes or goes.
+		 */
+		if (!igc_cs->bypass && igc_cs->data) {
+			u16 one;
+			u32 id = dpu_colorop_igc_scale(!cs->bypass && cs->data,
+						       dpu_colorop_igc_test_invert,
+						       igc_cs->data->base.id, &one);
+
+			if (dpu_colorop_lut_to_igc(igc_cs->data, one, pstate->pipeline_igc,
+						   pstate->pipeline_igc_last)) {
+				if (dpu_colorop_report_refusal(reports,
+							       DPU_COLOROP_REFUSAL_TABLE_SIZE))
+					DPU_ERROR("inverse-gamma table is not the size this pipe takes\n");
+				return -EINVAL;
+			}
+			pstate->has_pipeline_igc = true;
+			pstate->pipeline_igc_id = id;
+			if (dpu_colorop_igc_test_invert)
+				dpu_colorop_igc_invert(pstate->pipeline_igc,
+						       pstate->pipeline_igc_last);
 		}
 	}
 

@@ -173,6 +173,8 @@ void dpu_vig_gamut_blob_lattice(const u8 *blob, u32 *out);
 bool dpu_vig_gamut_blob_map(const u8 *blob, u32 *map);
 int dpu_reg_dma_gamut_test_blob(u32 *lattice, u32 *map);
 void dpu_reg_dma_debugfs_init(struct dentry *parent);
+u32 dpu_reg_dma_gamut_bank(u32 op, u32 *table);
+u32 dpu_reg_dma_sspp_gamut_op(struct dpu_hw_sspp *sspp);
 
 struct dpu_hw_dspp;
 void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,

@@ -32,16 +32,26 @@
 #define DPU_IGC_OUT_ONE		4092	/* twelve-bit value that reaches the mixer as code 1023 */
 #define DPU_IGC_OUT_MAX		4095
 
+/*
+ * WHERE THE CURVE'S 1.0 GOES depends on what reads the block's output.  The layer mixer takes
+ * round(x / 4), so 4092 is the value that arrives as 1023 (DPU_IGC_OUT_ONE).  The video pipe's
+ * gamut (the 3D LUT) samples the twelve-bit output over 0..4095 instead, and at 4092 its top cell
+ * is read 3 codes short: KWin's white 1023 came out as 1020 / 1021 (measured).  So while a 3D LUT
+ * is in force the curve is scaled to DPU_IGC_OUT_MAX.
+ */
+
 /**
- * dpu_igc_convert_channel - one channel of a DRM 1D LUT into the block's slots and endpoint
+ * dpu_igc_convert_channel_scaled - one channel of a DRM 1D LUT into the block's slots and endpoint
  * @lut:      the channel's first value (a u32 per entry, full scale 0xffffffff)
  * @stride:   u32s between consecutive entries (4 for struct drm_color_lut32)
  * @n:        entries in the LUT (at least 2)
+ * @one:      the twelve-bit value the LUT's 1.0 maps to: DPU_IGC_OUT_ONE, or DPU_IGC_OUT_MAX in
+ *            front of a 3D LUT
  * @slots:    DPU_IGC_SLOTS twelve-bit values to fill
  * @endpoint: the value for the register past the last slot
  */
-static inline void dpu_igc_convert_channel(const u32 *lut, unsigned int stride, unsigned int n,
-					   u16 *slots, u16 *endpoint)
+static inline void dpu_igc_convert_channel_scaled(const u32 *lut, unsigned int stride, unsigned int n,
+						  u16 one, u16 *slots, u16 *endpoint)
 {
 	const u64 full = 0xffffffffull, den = DPU_IGC_IN_MAX;
 	unsigned int i;
@@ -57,15 +67,24 @@ static inline void dpu_igc_convert_channel(const u32 *lut, unsigned int stride, 
 		/* the curve times den; between two entries, so never below the smaller one */
 		y_den = j + 1 < n ? a * (s64)den + ((s64)lut[(j + 1) * stride] - a) * (s64)r
 				  : a * (s64)den;
-		q = div64_u64((u64)y_den * DPU_IGC_OUT_ONE + den * full / 2, den * full);
+		q = div64_u64((u64)y_den * one + den * full / 2, den * full);
 		slots[i] = q > DPU_IGC_OUT_MAX ? DPU_IGC_OUT_MAX : q;
 	}
 
 	/* 3 * endpoint = 4 * (the last value) - slot 255; clamped to the register's range */
-	top = div64_u64((u64)lut[(n - 1) * stride] * DPU_IGC_OUT_ONE + full / 2, full);
+	top = div64_u64((u64)lut[(n - 1) * stride] * one + full / 2, full);
 	e3 = 4 * (s64)top - (s64)slots[DPU_IGC_SLOTS - 1];
 	q = e3 < 0 ? 0 : div64_u64((u64)e3 + 1, 3);
 	*endpoint = q > DPU_IGC_OUT_MAX ? DPU_IGC_OUT_MAX : q;
+}
+
+/**
+ * dpu_igc_convert_channel - dpu_igc_convert_channel_scaled() for the path without a 3D LUT
+ */
+static inline void dpu_igc_convert_channel(const u32 *lut, unsigned int stride, unsigned int n,
+					   u16 *slots, u16 *endpoint)
+{
+	dpu_igc_convert_channel_scaled(lut, stride, n, DPU_IGC_OUT_ONE, slots, endpoint);
 }
 
 #endif /* _DPU_COLOROP_IGC_H */
