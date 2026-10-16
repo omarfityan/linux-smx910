@@ -871,6 +871,110 @@ void dpu_vig_gamut_from_lut32(const struct drm_color_lut32 *lut, u32 *out)
 	}
 }
 
+/* the input map in 16.16 fixed point: x is the 14-bit map input, u the lattice coordinate (1024 per node) */
+#define DPU_VIG_GAMUT_MAP_FP		16
+#define DPU_VIG_GAMUT_MAP_NODE		(1024U << DPU_VIG_GAMUT_MAP_FP)
+#define DPU_VIG_GAMUT_MAP_TOL		(DPU_VIG_GAMUT_MAP_NODE / 4096)	/* a quarter of a lattice unit */
+/* an entry this close to a node is a clamped one, quantised: it never draws a slope */
+#define DPU_VIG_GAMUT_MAP_EDGE		(DPU_VIG_GAMUT_MAP_NODE / 65536)	/* 1/64 of a lattice unit */
+
+/**
+ * dpu_vig_gamut_map_eval - one channel's input map at an input
+ * @w16: its 16 words -- offset bits 0-13 (an input breakpoint), slope bits
+ *       14-29 (13 fraction bits)
+ * @x: the input, 16.16
+ *
+ * The map as measured on the hardware: the segment is the last one whose
+ * offset does not exceed the input, its base is FIXED at node k, and its rise
+ * is clamped at node k + 1.
+ *
+ * Return: the lattice coordinate, 16.16.
+ */
+static u32 dpu_vig_gamut_map_eval(const u32 *w16, u32 x)
+{
+	u32 k, seg = 0;
+	u64 base, rise = 0, off;
+
+	for (k = 1; k < DPU_VIG_GAMUT_MAP_WORDS; k++)
+		if (((u64)(w16[k] & 0x3fff) << DPU_VIG_GAMUT_MAP_FP) <= x)
+			seg = k;
+	base = (u64)seg * DPU_VIG_GAMUT_MAP_NODE;
+	off = (u64)(w16[seg] & 0x3fff) << DPU_VIG_GAMUT_MAP_FP;
+	if (x > off)
+		rise = ((x - off) * (u64)((w16[seg] >> 14) & 0xffff)) >> 13;
+	return base + min_t(u64, rise, DPU_VIG_GAMUT_MAP_NODE);
+}
+
+/**
+ * dpu_vig_gamut_map_from_lut32 - a DRM 1D-LUT colour operation's data as the gamut's input map
+ * @lut: DPU_VIG_GAMUT_MAP_SIZE entries; entry i is the map at input i / (size - 1)
+ * @words: 48 words -- slot 0 the GREEN input's map, slot 1 BLUE's, slot 2 RED's
+ *
+ * Entry i sits at x = i x 16383 / (size - 1) and holds u x (2^32 - 1) / 16384.
+ * Per channel and segment k, the entries strictly between nodes k and k + 1
+ * lie on segment k's slope: the first and last of them give the slope and the
+ * breakpoint.  Every entry is then re-evaluated through the words found; a
+ * LUT the map cannot reproduce within a quarter of a lattice unit -- a curve
+ * that is not a 16-segment map, or a segment holding fewer than two entries --
+ * is refused.
+ *
+ * Return: 0, or -EINVAL.
+ */
+int dpu_vig_gamut_map_from_lut32(const struct drm_color_lut32 *lut, u32 *words)
+{
+	static const u8 chan[DPU_VIG_GAMUT_MAP_CHANNELS] = { 1, 2, 0 };	/* G, B, R */
+	const u32 last = DPU_VIG_GAMUT_MAP_SIZE - 1;
+	u32 u[DPU_VIG_GAMUT_MAP_SIZE];
+	u32 s, i, k;
+
+	for (s = 0; s < DPU_VIG_GAMUT_MAP_CHANNELS; s++) {
+		u32 *w16 = words + s * DPU_VIG_GAMUT_MAP_WORDS;
+
+		for (i = 0; i <= last; i++) {
+			const struct drm_color_lut32 *e = &lut[i];
+			u32 y = chan[s] == 0 ? e->red : chan[s] == 1 ? e->green : e->blue;
+
+			u[i] = mul_u64_u64_div_u64(y, 1ULL << 30, 0xffffffff);
+		}
+		for (k = 0; k < DPU_VIG_GAMUT_MAP_WORDS; k++) {
+			u64 lo = (u64)k * DPU_VIG_GAMUT_MAP_NODE, hi = lo + DPU_VIG_GAMUT_MAP_NODE;
+			u64 xa, xb, d, slope, off;
+			int a = -1, b = -1;
+
+			for (i = 0; i <= last; i++) {
+				if (u[i] > lo + DPU_VIG_GAMUT_MAP_EDGE &&
+				    u[i] + DPU_VIG_GAMUT_MAP_EDGE < hi) {
+					if (a < 0)
+						a = i;
+					b = i;
+				}
+			}
+			if (a < 0 || a == b)
+				return -EINVAL;
+			xa = DIV_ROUND_CLOSEST_ULL((u64)a * 16383 << DPU_VIG_GAMUT_MAP_FP, last);
+			xb = DIV_ROUND_CLOSEST_ULL((u64)b * 16383 << DPU_VIG_GAMUT_MAP_FP, last);
+			slope = DIV_ROUND_CLOSEST_ULL((u64)(u[b] - u[a]) << 13, xb - xa);
+			if (!slope || slope > 0xffff)
+				return -EINVAL;
+			d = DIV_ROUND_CLOSEST_ULL((u[a] - lo) << 13, slope);
+			if (d > xa)
+				return -EINVAL;
+			off = DIV_ROUND_CLOSEST_ULL(xa - d, 1U << DPU_VIG_GAMUT_MAP_FP);
+			if (off > 0x3fff)
+				return -EINVAL;
+			w16[k] = (u32)(slope << 14) | (u32)off;
+		}
+		for (i = 0; i <= last; i++) {
+			u32 x = DIV_ROUND_CLOSEST_ULL((u64)i * 16383 << DPU_VIG_GAMUT_MAP_FP, last);
+			u32 got = dpu_vig_gamut_map_eval(w16, x);
+
+			if ((got > u[i] ? got - u[i] : u[i] - got) > DPU_VIG_GAMUT_MAP_TOL)
+				return -EINVAL;
+		}
+	}
+	return 0;
+}
+
 /**
  * dpu_vig_gamut_blob_map - a stock table's input map
  * @blob: a table dpu_vig_gamut_blob_check() passed

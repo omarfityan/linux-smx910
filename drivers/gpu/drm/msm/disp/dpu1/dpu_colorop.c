@@ -821,6 +821,39 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
 #define DPU_COLOROP_SHAPE_LUT3D_BYPASS	BIT(5)
 #define DPU_COLOROP_SHAPE_LUT3D_DATA	BIT(6)
 
+/* the gamut input map's check-time verdict */
+#define DPU_COLOROP_MAP_OK		0
+#define DPU_COLOROP_MAP_NOT_255		1	/* not DPU_VIG_GAMUT_MAP_SIZE entries */
+#define DPU_COLOROP_MAP_NOT_A_MAP	2	/* no 16-segment map reproduces it */
+#define DPU_COLOROP_MAP_NO_LUT3D	3	/* in force while the 3D LUT is not */
+
+/**
+ * dpu_colorop_map_verdict - can the gamut input map colour operation be programmed?
+ * @map_on:   the operation is in force (not bypassed, with data)
+ * @len:      its data's length in bytes
+ * @fit:      dpu_vig_gamut_map_from_lut32()'s result on that data
+ * @lut3d_on: the 3D LUT after it is in force
+ *
+ * The map's output is a lattice coordinate: the hardware has no map without
+ * the lattice, so a map in force over a bypassed 3D LUT is refused rather than
+ * approximated with an identity lattice.  A map bypassed or without data
+ * leaves MAP_EN off and is always accepted.
+ *
+ * Return: DPU_COLOROP_MAP_OK, or the first reason it cannot be programmed.
+ */
+static int __maybe_unused dpu_colorop_map_verdict(bool map_on, size_t len, int fit, bool lut3d_on)
+{
+	if (!map_on)
+		return DPU_COLOROP_MAP_OK;
+	if (len != DPU_VIG_GAMUT_MAP_SIZE * sizeof(struct drm_color_lut32))
+		return DPU_COLOROP_MAP_NOT_255;
+	if (fit)
+		return DPU_COLOROP_MAP_NOT_A_MAP;
+	if (!lut3d_on)
+		return DPU_COLOROP_MAP_NO_LUT3D;
+	return DPU_COLOROP_MAP_OK;
+}
+
 /**
  * dpu_plane_colorop_check - can this plane's colour pipeline be programmed?
  * @state:       the atomic state
