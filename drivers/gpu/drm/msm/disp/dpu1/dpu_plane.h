@@ -32,6 +32,8 @@
 /* three channels of 256 twelve-bit entries, packed two to a dword */
 #define DPU_PLANE_IGC_CHANNELS	3
 #define DPU_PLANE_IGC_DWORDS	(DPU_PLANE_IGC_CHANNELS * 128)
+/* the gamut input map's words, three channels of sixteen (DPU_VIG_GAMUT_MAP_DWORDS) */
+#define DPU_PLANE_GAMUT_MAP_DWORDS	48
 
 struct dpu_plane_state {
 	struct drm_plane_state base;
@@ -105,6 +107,18 @@ struct dpu_plane_state {
 	 */
 	struct drm_property_blob *pipeline_gamut;
 	u32 pipeline_gamut_id;
+
+	/*
+	 * The gamut's input map, the 1D LUT colour operation in front of the 3D
+	 * LUT: fitted at check time into the block's 48 words and CARRIED, as the
+	 * inverse-gamma table is -- 192 bytes copy on a duplicate, and the state
+	 * then holds no blob reference for it.  @pipeline_gamut_map_id is its
+	 * blob's id, 0 when the operation is bypassed or carries no data (the
+	 * map then stays off); it travels with @pipeline_gamut_id as the pair the
+	 * flush compares.
+	 */
+	u32 pipeline_gamut_map[DPU_PLANE_GAMUT_MAP_DWORDS];
+	u32 pipeline_gamut_map_id;
 
 	/*
 	 * What the compositor put in the pipeline, as booleans, purely so a

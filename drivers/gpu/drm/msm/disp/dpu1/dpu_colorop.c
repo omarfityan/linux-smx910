@@ -524,20 +524,21 @@ static void dpu_colorop_gamut_test(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 
 /*
  * The 3D-LUT colour operation on one pipe's gamut block, at each colour flush:
- * programmed (bank A, the input map off) when the plane's blob is not the one
- * the pipe holds or the block's enable reads clear (a power loss), switched off
- * when the plane no longer asks for one.  While the TEST switch is set -- or
- * still applied, until its own return to 0 switches the block off -- the test
- * owns the block and this does nothing.  A failure switches the block off and
- * latches the blob id; a different blob lifts it.
+ * programmed -- with the plane's input map when one is in force -- when the
+ * pair (3D blob, map blob) is not the one the pipe holds or the block's enable
+ * reads clear (a power loss), switched off when the plane no longer asks for
+ * one.  While the TEST switch is set -- or still applied, until its own return
+ * to 0 switches the block off -- the test owns the block and this does nothing.
+ * A failure switches the block off and latches the pair; a different pair lifts it.
  */
 static void dpu_colorop_gamut_lut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 				  struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,
 				  const struct dpu_plane_state *pstate)
 {
-	u32 want = pstate->pipeline_gamut ? pstate->pipeline_gamut_id : 0;
-	u32 *applied = &dpu_kms->colorop_gamut_lut_id[sspp->idx];
-	u32 *failed = &dpu_kms->colorop_gamut_failed_id[sspp->idx];
+	u64 want = pstate->pipeline_gamut ?
+		   (u64)pstate->pipeline_gamut_map_id << 32 | pstate->pipeline_gamut_id : 0;
+	u64 *applied = &dpu_kms->colorop_gamut_lut_id[sspp->idx];
+	u64 *failed = &dpu_kms->colorop_gamut_failed_id[sspp->idx];
 	bool test = dpu_reg_dma_gamut_test_mode() || dpu_colorop_gamut_applied[sspp->idx];
 	u32 *lattice;
 	int act, ret;
@@ -568,9 +569,13 @@ static void dpu_colorop_gamut_lut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *r
 		return;
 	}
 	dpu_vig_gamut_from_lut32(pstate->pipeline_gamut->data, lattice);
-	ret = dpu_reg_dma_program_sspp_gamut(dpu_kms, rdma, ctl, sspp, lattice, NULL);
+	if (pstate->pipeline_gamut_map_id)
+		pr_info("dpu: %s 3D LUT %u carries input map %u\n", sspp->cap->name,
+			pstate->pipeline_gamut_id, pstate->pipeline_gamut_map_id);
+	ret = dpu_reg_dma_program_sspp_gamut(dpu_kms, rdma, ctl, sspp, lattice,
+					     pstate->pipeline_gamut_map_id ? pstate->pipeline_gamut_map : NULL);
 	kvfree(lattice);
-	pr_info("dpu: %s 3D LUT %u programmed: %d\n", sspp->cap->name, want, ret);
+	pr_info("dpu: %s 3D LUT %u programmed: %d\n", sspp->cap->name, pstate->pipeline_gamut_id, ret);
 	if (ret) {
 		/* a part-written lattice must not be shown: off is the safe state */
 		*failed = want;
@@ -620,6 +625,8 @@ static_assert(DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) == DPU_PLANE_IGC_DWORDS,
 	      "the inversion walks exactly the plane state's packed table");
 static_assert(DPU_IGC_CHANNELS == DPU_PLANE_IGC_CHANNELS, "one endpoint per channel");
 static_assert(DPU_IGC_LUT_LEN == DPU_IGC_SLOTS, "the conversion fills exactly the block's slots");
+static_assert(DPU_PLANE_GAMUT_MAP_DWORDS == DPU_VIG_GAMUT_MAP_DWORDS,
+	      "the plane state carries exactly the words the map fit fills");
 
 static void dpu_colorop_igc_invert(u32 *tbl, u32 *last)
 {
@@ -654,16 +661,17 @@ bool dpu_plane_colorops_enabled(void)
  * @has_blocks: whether the pipe (or, for a virtual plane, the largest pipe)
  *              carries both a colour matrix and an inverse-gamma table
  *
- * Builds the two-element chain the compositor needs -- the colour matrix, then
- * the inverse-gamma table -- and attaches it as the plane's one colour
- * pipeline.  Does nothing unless the pipe actually has both blocks.
+ * Builds the chain the compositor needs -- the colour matrix, the inverse-gamma
+ * table, the gamut's input map, the gamut's 3D LUT -- and attaches it as the
+ * plane's one colour pipeline.  Does nothing unless the pipe actually has the
+ * matrix and the table.
  *
  * Return: 0 on success or when there is nothing to advertise, negative on error.
  */
 int dpu_plane_init_colorops(struct drm_plane *plane, bool has_blocks)
 {
 	struct drm_prop_enum_list pipeline = {};
-	struct drm_colorop *csc_op = NULL, *igc_op = NULL, *lut3d_op = NULL;
+	struct drm_colorop *csc_op = NULL, *igc_op = NULL, *map_op = NULL, *lut3d_op = NULL;
 	struct drm_device *dev = plane->dev;
 	int ret;
 
@@ -683,8 +691,9 @@ int dpu_plane_init_colorops(struct drm_plane *plane, bool has_blocks)
 
 	csc_op = kzalloc(sizeof(*csc_op), GFP_KERNEL);
 	igc_op = kzalloc(sizeof(*igc_op), GFP_KERNEL);
+	map_op = kzalloc(sizeof(*map_op), GFP_KERNEL);
 	lut3d_op = kzalloc(sizeof(*lut3d_op), GFP_KERNEL);
-	if (!csc_op || !igc_op || !lut3d_op) {
+	if (!csc_op || !igc_op || !map_op || !lut3d_op) {
 		ret = -ENOMEM;
 		goto err;
 	}
@@ -708,11 +717,27 @@ int dpu_plane_init_colorops(struct drm_plane *plane, bool has_blocks)
 	drm_colorop_set_next_property(csc_op, igc_op);
 
 	/*
-	 * Third: the pipe's GAMUT block as a 17-point 3D LUT, after inverse
+	 * Third: the GAMUT block's per-channel input map, as a 1D LUT of
+	 * DPU_VIG_GAMUT_MAP_SIZE entries whose output is the lattice coordinate
+	 * the 3D LUT behind it is read at.  The hardware's map is sixteen linear
+	 * segments; the check refuses any LUT none of them reproduces
+	 * (dpu_vig_gamut_map_from_lut32), and a map with no 3D LUT in force.
+	 * Bypassed, the map is off and the lattice uniform -- as before it existed.
+	 */
+	ret = drm_plane_colorop_curve_1d_lut_init(dev, map_op, plane,
+						  DPU_VIG_GAMUT_MAP_SIZE,
+						  DRM_COLOROP_LUT1D_INTERPOLATION_LINEAR,
+						  DRM_COLOROP_FLAG_ALLOW_BYPASS);
+	if (ret)
+		goto err;
+
+	drm_colorop_set_next_property(igc_op, map_op);
+
+	/*
+	 * Fourth: the pipe's GAMUT block as a 17-point 3D LUT, after inverse
 	 * gamma (a compositor shapes the lattice's input with the table before
-	 * it).  The block's linear index is DRM's own and its interpolation was
-	 * read tetrahedral on the grey diagonal; its per-channel input map stays
-	 * OFF -- a uniform lattice -- until a colour operation is designed for it.
+	 * it) and the input map.  The block's linear index is DRM's own and its
+	 * interpolation was read tetrahedral on the grey diagonal.
 	 */
 	ret = drm_plane_colorop_3dlut_init(dev, lut3d_op, plane, DPU_VIG_GAMUT_LUT_SIZE,
 					   DRM_COLOROP_LUT3D_INTERPOLATION_TETRAHEDRAL,
@@ -720,7 +745,7 @@ int dpu_plane_init_colorops(struct drm_plane *plane, bool has_blocks)
 	if (ret)
 		goto err;
 
-	drm_colorop_set_next_property(igc_op, lut3d_op);
+	drm_colorop_set_next_property(map_op, lut3d_op);
 
 	pipeline.name = kasprintf(GFP_KERNEL, "Color Pipeline %d", csc_op->base.id);
 	if (!pipeline.name) {
@@ -741,9 +766,9 @@ int dpu_plane_init_colorops(struct drm_plane *plane, bool has_blocks)
 	 * colorop output means the COMPOSITOR did not ask -- not that the driver
 	 * never offered.
 	 */
-	DRM_INFO("colorop: %s advertises a colour pipeline: 3x4 matrix (id %u) -> %u-entry 1D LUT (id %u) -> %u-point 3D LUT (id %u)\n",
+	DRM_INFO("colorop: %s advertises a colour pipeline: 3x4 matrix (id %u) -> %u-entry 1D LUT (id %u) -> %u-entry 1D LUT (id %u) -> %u-point 3D LUT (id %u)\n",
 		 plane->name, csc_op->base.id, DPU_IGC_LUT_LEN, igc_op->base.id,
-		 DPU_VIG_GAMUT_LUT_SIZE, lut3d_op->base.id);
+		 DPU_VIG_GAMUT_MAP_SIZE, map_op->base.id, DPU_VIG_GAMUT_LUT_SIZE, lut3d_op->base.id);
 
 	return 0;
 
@@ -751,6 +776,10 @@ err:
 	if (lut3d_op) {
 		drm_colorop_cleanup(lut3d_op);
 		kfree(lut3d_op);
+	}
+	if (map_op) {
+		drm_colorop_cleanup(map_op);
+		kfree(map_op);
 	}
 	if (igc_op) {
 		drm_colorop_cleanup(igc_op);
@@ -820,6 +849,8 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
 #define DPU_COLOROP_SHAPE_IGC_DATA	BIT(4)
 #define DPU_COLOROP_SHAPE_LUT3D_BYPASS	BIT(5)
 #define DPU_COLOROP_SHAPE_LUT3D_DATA	BIT(6)
+#define DPU_COLOROP_SHAPE_MAP_BYPASS	BIT(7)
+#define DPU_COLOROP_SHAPE_MAP_DATA	BIT(8)
 
 /* the gamut input map's check-time verdict */
 #define DPU_COLOROP_MAP_OK		0
@@ -841,7 +872,7 @@ bool dpu_plane_colorop_csc(struct drm_atomic_state *state,
  *
  * Return: DPU_COLOROP_MAP_OK, or the first reason it cannot be programmed.
  */
-static int __maybe_unused dpu_colorop_map_verdict(bool map_on, size_t len, int fit, bool lut3d_on)
+static int dpu_colorop_map_verdict(bool map_on, size_t len, int fit, bool lut3d_on)
 {
 	if (!map_on)
 		return DPU_COLOROP_MAP_OK;
@@ -852,6 +883,35 @@ static int __maybe_unused dpu_colorop_map_verdict(bool map_on, size_t len, int f
 	if (!lut3d_on)
 		return DPU_COLOROP_MAP_NO_LUT3D;
 	return DPU_COLOROP_MAP_OK;
+}
+
+/**
+ * dpu_colorop_map_fit - the gamut input map's leg of the check
+ * @bypass:   the map operation is bypassed
+ * @data:     its data blob, NULL for none
+ * @lut3d_on: the 3D LUT after it is in force
+ * @words:    filled with the block's 48 map words when the map is in force
+ * @id:       set to @data's id when the map is in force, 0 otherwise (MAP_EN off)
+ *
+ * The fit reads DPU_VIG_GAMUT_MAP_SIZE entries, so it runs only on a blob of
+ * exactly that many; any other length is the verdict's to refuse.
+ *
+ * Return: dpu_colorop_map_verdict()'s DPU_COLOROP_MAP_OK, or why the map cannot be programmed.
+ */
+static int dpu_colorop_map_fit(bool bypass, const struct drm_property_blob *data, bool lut3d_on,
+			       u32 *words, u32 *id)
+{
+	bool map_on = !bypass && data;
+	size_t len = map_on ? data->length : 0;
+	int fit = 0, verdict;
+
+	*id = 0;
+	if (map_on && len == DPU_VIG_GAMUT_MAP_SIZE * sizeof(struct drm_color_lut32))
+		fit = dpu_vig_gamut_map_from_lut32(data->data, words);
+	verdict = dpu_colorop_map_verdict(map_on, len, fit, lut3d_on);
+	if (verdict == DPU_COLOROP_MAP_OK && map_on)
+		*id = data->base.id;
+	return verdict;
 }
 
 /**
@@ -885,10 +945,11 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 	struct dpu_plane_state *pstate = to_dpu_plane_state(plane_state);
 	struct drm_colorop *colorop = plane_state->color_pipeline;
 	struct drm_plane_state *old_plane_state;
-	struct drm_colorop_state *cs, *igc_cs;
+	struct drm_colorop_state *cs, *igc_cs, *map_cs;
 	struct dpu_csc_cfg csc;
 	bool changed, report;
 	u32 shape = 0;
+	int verdict;
 
 	/*
 	 * Reached at all?  This check was once hooked into a function VIRTUAL
@@ -903,6 +964,7 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 	drm_property_blob_put(pstate->pipeline_gamut);
 	pstate->pipeline_gamut = NULL;
 	pstate->pipeline_gamut_id = 0;
+	pstate->pipeline_gamut_map_id = 0;
 
 	if (colorop) {
 		shape |= DPU_COLOROP_SHAPE_PIPELINE;
@@ -949,8 +1011,24 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 		/* converted below, once the 3D LUT behind it is known: that sets its scale */
 		igc_cs = cs;
 
+		/* third: the gamut's input map -- fitted below, once the 3D LUT is known */
+		colorop = colorop->next;
+		if (!colorop)
+			return -EINVAL;
+		cs = dpu_colorop_effective_state(state, colorop);
+		if (!cs) {
+			if (dpu_colorop_report_refusal(reports, DPU_COLOROP_REFUSAL_NO_STATE))
+				DPU_ERROR("a colour operation has no state at all\n");
+			return -EINVAL;
+		}
+		if (cs->bypass)
+			shape |= DPU_COLOROP_SHAPE_MAP_BYPASS;
+		if (cs->data)
+			shape |= DPU_COLOROP_SHAPE_MAP_DATA;
+		map_cs = cs;
+
 		/*
-		 * third: the 3D LUT.  Its blob is only REFERENCED here (the core
+		 * fourth: the 3D LUT.  Its blob is only REFERENCED here (the core
 		 * already sized it at 17^3 entries); the flush converts it when the
 		 * pipe does not hold it yet.
 		 */
@@ -976,6 +1054,21 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			}
 			pstate->pipeline_gamut = drm_property_blob_get(cs->data);
 			pstate->pipeline_gamut_id = cs->data->base.id;
+		}
+
+		/*
+		 * The input map, against the 3D LUT behind it: fitted into the plane
+		 * state's words, or the commit refused -- a map is never approximated.
+		 */
+		verdict = dpu_colorop_map_fit(map_cs->bypass, map_cs->data, !cs->bypass && cs->data,
+					      pstate->pipeline_gamut_map, &pstate->pipeline_gamut_map_id);
+		if (verdict) {
+			if (dpu_colorop_report_refusal(reports, DPU_COLOROP_REFUSAL_GAMUT_MAP))
+				DPU_ERROR("gamut input map cannot be programmed: %s\n",
+					  verdict == DPU_COLOROP_MAP_NOT_255 ? "not the size this pipe takes" :
+					  verdict == DPU_COLOROP_MAP_NOT_A_MAP ? "no 16-segment map reproduces it" :
+					  "in force without the 3D LUT behind it");
+			return -EINVAL;
 		}
 
 		/*
@@ -1049,7 +1142,7 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 	report = dpu_report_state_note(&reports->shape, shape, jiffies,
 				       msecs_to_jiffies(DPU_REPORT_WINDOW_MS));
 	if (report && changed)
-		DRM_INFO("colorop: %s at check: %s | matrix %s%s | table %s%s | 3D LUT %s%s\n",
+		DRM_INFO("colorop: %s at check: %s | matrix %s%s | table %s%s | 3D LUT %s%s | map %s%s\n",
 			 plane_state->plane->name,
 			 (shape & DPU_COLOROP_SHAPE_PIPELINE)
 				? "A COLOUR PIPELINE WAS SELECTED"
@@ -1059,7 +1152,10 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 			 (shape & DPU_COLOROP_SHAPE_IGC_BYPASS) ? "bypassed" : "in force",
 			 (shape & DPU_COLOROP_SHAPE_IGC_DATA) ? ", has data" : ", NO DATA",
 			 (shape & DPU_COLOROP_SHAPE_LUT3D_BYPASS) ? "bypassed" : "in force",
-			 (shape & DPU_COLOROP_SHAPE_LUT3D_DATA) ? ", has data" : ", NO DATA");
+			 (shape & DPU_COLOROP_SHAPE_LUT3D_DATA) ? ", has data" : ", NO DATA",
+			 /* after the 3D LUT, unlike the chain: every reader of this line matches its old prefix */
+			 (shape & DPU_COLOROP_SHAPE_MAP_BYPASS) ? "bypassed" : "in force",
+			 (shape & DPU_COLOROP_SHAPE_MAP_DATA) ? ", has data" : ", NO DATA");
 
 	return 0;
 }

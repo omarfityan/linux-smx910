@@ -134,10 +134,13 @@ struct dpu_kms {
 	 * block's own index/data port is the witness of a real power loss instead.
 	 *
 	 * @colorop_gamut_lut_id and @colorop_gamut_failed_id are the 3D-LUT colour
-	 * operation's, per pipe: the data blob id last given to the pipe's gamut
-	 * block (0 none -- what the sweep switches off), and the id that last
-	 * failed, not retried until the plane asks for another.  Whether the block
-	 * still holds its table is asked of its enable bit, as for inverse gamma.
+	 * operation's, per pipe: what was last given to the pipe's gamut block (0
+	 * none -- what the sweep switches off), and what last failed, not retried
+	 * until the plane asks for another.  Each is the PAIR the block loads as
+	 * one -- the 3D LUT's data blob id, with its input map's blob id in the
+	 * upper 32 bits (0 there: the map off) -- so a new map over the same
+	 * lattice is a new table.  Whether the block still holds its table is
+	 * asked of its enable bit, as for inverse gamma.
 	 */
 	struct dpu_reg_dma colorop_rdma;
 	u32 colorop_igc_on;
@@ -145,8 +148,8 @@ struct dpu_kms {
 	u32 colorop_igc_bank_known;
 	u32 colorop_igc_bank1;
 	u32 colorop_igc_lut_id[SSPP_MAX];
-	u32 colorop_gamut_lut_id[SSPP_MAX];
-	u32 colorop_gamut_failed_id[SSPP_MAX];
+	u64 colorop_gamut_lut_id[SSPP_MAX];
+	u64 colorop_gamut_failed_id[SSPP_MAX];
 };
 
 struct vsync_info {

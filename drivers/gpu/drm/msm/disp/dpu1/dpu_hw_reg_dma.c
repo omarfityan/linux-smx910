@@ -768,6 +768,7 @@ void dpu_vig_gamut_test_lattice(int mode, u32 *out)
 #define DPU_VIG_GAMUT_BLOB_MAP_EN	BIT(0)
 
 static_assert(DPU_VIG_GAMUT_BLOB_MAP_WORDS == DPU_VIG_GAMUT_MAP_CHANNELS * DPU_VIG_GAMUT_MAP_WORDS);
+static_assert(DPU_VIG_GAMUT_MAP_DWORDS == DPU_VIG_GAMUT_MAP_CHANNELS * DPU_VIG_GAMUT_MAP_WORDS);
 static_assert(DPU_VIG_GAMUT_BLOB_COL == DPU_VIG_GAMUT_BLOB_MAP + 4 * DPU_VIG_GAMUT_BLOB_MAP_WORDS);
 static_assert(DPU_VIG_GAMUT_BLOB_SIZE == ALIGN(DPU_VIG_GAMUT_BLOB_COL + 8 * DPU_VIG_GAMUT_BLOB_ENTRIES, 8));
 
@@ -1213,17 +1214,19 @@ int dpu_reg_dma_gamut_test_action(int want, int applied, bool on)
 /**
  * dpu_reg_dma_gamut_colorop_action - what the colour flush does to one pipe's
  *                                    gamut for the 3D-LUT colour operation
- * @want: the data blob id the pipe's plane asks for, 0 for none
- * @applied: the blob id this pipe was last given, 0 for none
- * @failed: the blob id that last failed on this pipe, 0 for none
+ * @want: what the pipe's plane asks for -- its 3D LUT's data blob id, with its
+ *        input map's blob id in the upper 32 bits (0 there: the map off) -- 0 for none
+ * @applied: the same key for what this pipe was last given, 0 for none
+ * @failed: the key that last failed on this pipe, 0 for none
  * @on: the pipe's gamut enable as the register reads now
  * @test: the gamut TEST switch owns the block (set, or still applied)
  *
  * Return: 1 program, -1 switch off, 0 nothing.  A table lost with the block's
  * power (the enable read clear) is programmed again; a table that failed is
- * not retried until the plane asks for a different one.
+ * not retried until the plane asks for a different one -- a different map
+ * over the same lattice included, since the two load as one.
  */
-int dpu_reg_dma_gamut_colorop_action(u32 want, u32 applied, u32 failed, bool on, bool test)
+int dpu_reg_dma_gamut_colorop_action(u64 want, u64 applied, u64 failed, bool on, bool test)
 {
 	if (test)
 		return 0;

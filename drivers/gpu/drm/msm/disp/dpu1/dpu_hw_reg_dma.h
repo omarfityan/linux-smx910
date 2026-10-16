@@ -148,11 +148,13 @@ int dpu_reg_dma_disable_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
  * KWin's matcher hands a 1D LUT under 256 entries no transfer function.
  */
 #define DPU_VIG_GAMUT_MAP_SIZE		255
+/* the map's words: three channels of sixteen, as dpu_vig_gamut_map_from_lut32() fills them */
+#define DPU_VIG_GAMUT_MAP_DWORDS	48
 
 struct drm_color_lut32;
 void dpu_vig_gamut_from_lut32(const struct drm_color_lut32 *lut, u32 *out);
 int dpu_vig_gamut_map_from_lut32(const struct drm_color_lut32 *lut, u32 *words);
-int dpu_reg_dma_gamut_colorop_action(u32 want, u32 applied, u32 failed, bool on, bool test);
+int dpu_reg_dma_gamut_colorop_action(u64 want, u64 applied, u64 failed, bool on, bool test);
 void dpu_vig_gamut_test_lattice(int mode, u32 *out);
 int dpu_reg_dma_program_sspp_gamut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 				   struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,
