@@ -997,11 +997,21 @@
 		compatible = "qcom,pm8550-rpmh-regulators";
 		qcom,pmic-id = "b";
 
+		/*
+		 * TEST ARM -- the ADSP's sensor supply (sensor_vdd). This device's
+		 * stock dtbo gives remoteproc-adsp sensor_vdd-uV-uA = <0x1b7740 0x00>
+		 * (1.8 V), bound to L1B by __fixups__, and stock's PAS driver keeps
+		 * the vote while the ADSP runs. Mainline's PAS driver holds no board
+		 * supply, so this arm keeps the rail on from boot instead. It is
+		 * removed when the PAS driver holds optional board supplies and
+		 * &remoteproc_adsp names this rail as one of them.
+		 */
 		vreg_l1b_1p8: ldo1 {
 			regulator-name = "vreg_l1b_1p8";
 			regulator-min-microvolt = <1800000>;
 			regulator-max-microvolt = <1800000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-always-on;
 		};
 
 		vreg_l2b_3p0: ldo2 {
@@ -1152,11 +1162,24 @@
 			regulator-always-on;
 		};
 
+		/*
+		 * TEST ARM -- the ADSP's sensor I/O supply (sensor_vddio). 3.0 V is
+		 * this device's own value: its stock dtbo gives remoteproc-adsp
+		 * sensor_vddio-uV-uA = <0x2dc6c0 0x00>, bound to L16B by __fixups__,
+		 * inside the rail's own stock range of 1.8-3.0 V (the pm_humu_l16
+		 * fragment). The 2.8 V this node carried before was the Galaxy Z
+		 * Fold5's value (sm8550-samsung-q5q.dts), never this tablet's. The
+		 * label and regulator-name keep their old "2p8" spelling for this
+		 * arm only, so nothing that resolves the label can change with it.
+		 * The always-on vote is removed when the PAS driver holds optional
+		 * board supplies and &remoteproc_adsp names this rail as one of them.
+		 */
 		vreg_l16b_2p8: ldo16 {
 			regulator-name = "vreg_l16b_2p8";
-			regulator-min-microvolt = <2800000>;
-			regulator-max-microvolt = <2800000>;
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3000000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-always-on;
 		};
 
 		vreg_l17b_2p5: ldo17 {
