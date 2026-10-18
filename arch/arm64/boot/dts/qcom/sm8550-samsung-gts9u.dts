@@ -1152,10 +1152,19 @@
 			regulator-always-on;
 		};
 
-		vreg_l16b_2p8: ldo16 {
-			regulator-name = "vreg_l16b_2p8";
-			regulator-min-microvolt = <2800000>;
-			regulator-max-microvolt = <2800000>;
+		/*
+		 * This device's own value. Its stock dtbo binds L16B to the ADSP
+		 * remoteproc's sensor_vddio supply and requests 3.0 V there
+		 * (sensor_vddio-uV-uA = <0x2dc6c0 0x00>), inside the rail's own stock
+		 * range of 1.8-3.0 V (the pm_humu_l16 fragment). The 2.8 V this node
+		 * carried before was the Galaxy Z Fold5's value
+		 * (sm8550-samsung-q5q.dts), never this tablet's. min = max pins the
+		 * rail, because the remoteproc driver requests no voltage.
+		 */
+		vreg_l16b_3p0: ldo16 {
+			regulator-name = "vreg_l16b_3p0";
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3000000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
@@ -2869,6 +2878,18 @@
 	status = "okay";
 	firmware-name = "qcom/sm8550/samsung/gts9u/adsp.mdt",
 			"qcom/sm8550/samsung/gts9u/adsp_dtb.mdt";
+
+	/*
+	 * Held by the application processor for as long as the ADSP runs, as
+	 * this device's stock tree does: its remoteproc-adsp node names the
+	 * supplies "cx", "mx", "sensor_vdd" and "sensor_vddio", binds sensor_vdd
+	 * to L1B (1.8 V) and sensor_vddio to L16B (3.0 V), and its remoteproc
+	 * driver does not release them at handover. The ADSP's sensor
+	 * configurations name only a placeholder rail, so the sensor core does
+	 * not switch these supplies itself.
+	 */
+	sensor-vdd-supply = <&vreg_l1b_1p8>;
+	sensor-vddio-supply = <&vreg_l16b_3p0>;
 };
 
 /*
