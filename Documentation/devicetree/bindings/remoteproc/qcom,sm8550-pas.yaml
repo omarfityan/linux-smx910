@@ -66,6 +66,16 @@ properties:
       - description: DSM Memory region 2
       - description: Memory region for Qlink Logging
 
+  sensor-vdd-supply:
+    description:
+      Core supply of the sensors on the remote processor's own sensor buses.
+      The remote processor cannot vote it itself, so the application processor
+      holds it for as long as the remote processor runs.
+
+  sensor-vddio-supply:
+    description:
+      I/O supply of the same sensors, held the same way.
+
 required:
   - compatible
   - reg
@@ -237,6 +247,17 @@ allOf:
             - const: cx
             - const: mxc
             - const: nsp
+
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: qcom,sm8550-adsp-pas
+    then:
+      properties:
+        sensor-vdd-supply: false
+        sensor-vddio-supply: false
 
 unevaluatedProperties: false
 
