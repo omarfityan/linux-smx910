@@ -36,6 +36,14 @@
 
 #define MAX_ASSIGN_COUNT 3
 
+/*
+ * Supplies a remote processor depends on for its whole run but cannot vote
+ * itself, such as the rails of sensors on the ADSP's own sensor buses. Unlike
+ * cx and px, which are proxy votes released at handover, these are held from
+ * start until stop.
+ */
+#define QCOM_PAS_MAX_ACTIVE_SUPPLIES 2
+
 struct qcom_pas_data {
 	int crash_reason_smem;
 	const char *firmware_name;
@@ -49,6 +57,7 @@ struct qcom_pas_data {
 	bool decrypt_shutdown;
 
 	char **proxy_pd_names;
+	const char * const *active_supply_names;
 
 	const char *load_state;
 	const char *ssr_name;
@@ -73,6 +82,10 @@ struct qcom_pas {
 
 	struct regulator *cx_supply;
 	struct regulator *px_supply;
+	struct regulator *active_supplies[QCOM_PAS_MAX_ACTIVE_SUPPLIES];
+	const char *active_supply_names[QCOM_PAS_MAX_ACTIVE_SUPPLIES];
+	int active_supply_count;
+	bool active_supplies_enabled;
 
 	struct device *proxy_pds[3];
 
@@ -187,6 +200,44 @@ static void qcom_pas_pds_disable(struct qcom_pas *pas, struct device **pds,
 		dev_pm_genpd_set_performance_state(pds[i], 0);
 		pm_runtime_put(pds[i]);
 	}
+}
+
+static int qcom_pas_active_supplies_enable(struct qcom_pas *pas)
+{
+	int ret;
+	int i;
+
+	for (i = 0; i < pas->active_supply_count; i++) {
+		ret = regulator_enable(pas->active_supplies[i]);
+		if (ret) {
+			dev_err(pas->dev, "failed to enable %s supply: %d\n",
+				pas->active_supply_names[i], ret);
+			goto unroll;
+		}
+	}
+
+	pas->active_supplies_enabled = true;
+
+	return 0;
+
+unroll:
+	for (i--; i >= 0; i--)
+		regulator_disable(pas->active_supplies[i]);
+
+	return ret;
+}
+
+static void qcom_pas_active_supplies_disable(struct qcom_pas *pas)
+{
+	int i;
+
+	if (!pas->active_supplies_enabled)
+		return;
+
+	for (i = pas->active_supply_count - 1; i >= 0; i--)
+		regulator_disable(pas->active_supplies[i]);
+
+	pas->active_supplies_enabled = false;
 }
 
 static int qcom_pas_shutdown_poll_decrypt(struct qcom_pas *pas)
@@ -305,10 +356,14 @@ static int qcom_pas_start(struct rproc *rproc)
 			goto disable_cx_supply;
 	}
 
+	ret = qcom_pas_active_supplies_enable(pas);
+	if (ret)
+		goto disable_px_supply;
+
 	if (pas->dtb_pas_id) {
 		ret = qcom_pas_map_carveout(rproc, pas->dtb_mem_phys, pas->dtb_mem_size);
 		if (ret)
-			goto disable_px_supply;
+			goto disable_active_supplies;
 
 		ret = qcom_scm_pas_prepare_and_auth_reset(pas->dtb_pas_ctx);
 		if (ret) {
@@ -362,6 +417,8 @@ release_pas_metadata:
 unmap_dtb_carveout:
 	if (pas->dtb_pas_id)
 		qcom_pas_unmap_carveout(rproc, pas->dtb_mem_phys, pas->dtb_mem_size);
+disable_active_supplies:
+	qcom_pas_active_supplies_disable(pas);
 disable_px_supply:
 	if (pas->px_supply)
 		regulator_disable(pas->px_supply);
@@ -426,6 +483,9 @@ static int qcom_pas_stop(struct rproc *rproc)
 	handover = qcom_q6v5_unprepare(&pas->q6v5);
 	if (handover)
 		qcom_pas_handover(&pas->q6v5);
+
+	/* Held for the whole run, so released only once the remote processor is down. */
+	qcom_pas_active_supplies_disable(pas);
 
 	if (pas->smem_host_id)
 		ret = qcom_smem_bust_hwspin_lock_by_host(pas->smem_host_id);
@@ -546,8 +606,11 @@ static int qcom_pas_init_clock(struct qcom_pas *pas)
 	return 0;
 }
 
-static int qcom_pas_init_regulator(struct qcom_pas *pas)
+static int qcom_pas_init_regulator(struct qcom_pas *pas,
+				   const char * const *active_supply_names)
 {
+	int i;
+
 	pas->cx_supply = devm_regulator_get_optional(pas->dev, "cx");
 	if (IS_ERR(pas->cx_supply)) {
 		if (PTR_ERR(pas->cx_supply) == -ENODEV)
@@ -565,6 +628,26 @@ static int qcom_pas_init_regulator(struct qcom_pas *pas)
 			pas->px_supply = NULL;
 		else
 			return PTR_ERR(pas->px_supply);
+	}
+
+	for (i = 0; active_supply_names && active_supply_names[i]; i++) {
+		const char *name = active_supply_names[i];
+		struct regulator *reg;
+
+		if (WARN_ON(i >= QCOM_PAS_MAX_ACTIVE_SUPPLIES))
+			return -EINVAL;
+
+		reg = devm_regulator_get_optional(pas->dev, name);
+		if (IS_ERR(reg)) {
+			if (PTR_ERR(reg) == -ENODEV)
+				continue;
+			return dev_err_probe(pas->dev, PTR_ERR(reg),
+					     "failed to get %s supply\n", name);
+		}
+
+		pas->active_supply_names[pas->active_supply_count] = name;
+		pas->active_supplies[pas->active_supply_count] = reg;
+		pas->active_supply_count++;
 	}
 
 	return 0;
@@ -813,7 +896,7 @@ static int qcom_pas_probe(struct platform_device *pdev)
 	if (ret)
 		goto unassign_mem;
 
-	ret = qcom_pas_init_regulator(pas);
+	ret = qcom_pas_init_regulator(pas, desc->active_supply_names);
 	if (ret)
 		goto unassign_mem;
 
@@ -1386,6 +1469,11 @@ static const struct qcom_pas_data sm8550_adsp_resource = {
 	.proxy_pd_names = (char*[]){
 		"lcx",
 		"lmx",
+		NULL
+	},
+	.active_supply_names = (const char * const[]){
+		"sensor-vdd",
+		"sensor-vddio",
 		NULL
 	},
 	.load_state = "adsp",
