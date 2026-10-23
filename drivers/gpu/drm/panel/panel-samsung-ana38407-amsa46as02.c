@@ -168,14 +168,13 @@ static const u16 ana38407_wrdisbv_hbm[292] = {
 #define ANA38407_BL_DEFAULT_LEVEL	(ARRAY_SIZE(ana38407_wrdisbv) - 1)
 
 /*
- * SESS-142 TCON pre-emphasis probe. The device's own downstream source
+ * TCON pre-emphasis probe. The device's own downstream source
  * (GTS9U_ANA38407_AMSA46AS02.dat: TCON_PE_ON) sets pre-emphasis on six TCON
  * channels (registers 0x6A..0x6F) AFTER panel-on, driven from userspace -- so
  * a bare kernel (TWRP) never emits it, yet the downstream stack flickers under
  * TWRP and is clean under OneUI. Pre-emphasis conditions the signal edge at the
- * source-driver/slice-channel boundaries; a sess-142 candidate for the row-154
- * dark-seam-flicker suppressor (mechanism uncertain -- see SESS142-INTERIM
- * notes). tcon_pe < 0 (default) = do NOT send the block (original behaviour,
+ * source-driver/slice-channel boundaries; it was a candidate for the row-154
+ * dark-seam-flicker suppressor (mechanism uncertain). tcon_pe < 0 (default) = do NOT send the block (original behaviour,
  * the flickering control); tcon_pe >= 0 = send the block with that value as the
  * C1 pre-emphasis byte (device's own ON value = 0x04; .dat OFF value = 0x00).
  * Set at module load:  insmod panel.ko tcon_pe=4
@@ -185,12 +184,12 @@ module_param(tcon_pe, short, 0644);
 MODULE_PARM_DESC(tcon_pe, "TCON pre-emphasis level on regs 0x6A-0x6F (<0=off/don't-send, 0x04=device ON)");
 
 /*
- * SESS-142 GLUT wrong-table probe. The panel-on GLUT_SETTING below transcribes
+ * GLUT wrong-table probe. The panel-on GLUT_SETTING below transcribes
  * the device's downstream glut_offset_60HS[bl255] table (non-zero). But the
  * downstream selects the GLUT table by VRR mode base (ss_get_vrr_mode_base):
  * for the 60PHS regime this panel runs (120HS scan + LFD-to-60, our VRR_SETTING
  * below), vrr_base = VRR_120HS -> the 120HS GLUT table, which OneUI emits as
- * ALL ZEROS at every brightness (live capture on rooted OneUI, sess-142). I.e.
+ * ALL ZEROS at every brightness (live capture on rooted OneUI). I.e.
  * mainline sends the 60HS gamma offset to a 120HS-base-driven panel -- the wrong
  * table. glut_zero=1 sends an all-zero GLUT (matching OneUI's live 120HS-base
  * output) as a single-variable capture-and-match test of the row-154 flicker.
@@ -201,31 +200,34 @@ module_param(glut_zero, bool, 0644);
 MODULE_PARM_DESC(glut_zero, "send all-zero GLUT (EB/EC) to match OneUI's 120HS-base output (default 0 = original 60HS table)");
 
 /*
- * SESS-143 mDNIe probe. OneUI programs the DDIC's mDNIe image-quality engine
- * (Samsung "Mobile DNIe": ASCR adaptive contrast/colour + AOLCE local-contrast
- * + a tone LUT) at panel-on as a PERSISTENT state; mainline and TWRP send NONE
- * of it. The sess-142 discriminator localized the row-154 dark-seam-flicker
- * suppressor to exactly such a OneUI boot-persistent DDIC command that mainline
- * omits, and a global low-gray contrast/tone transform is the coherent
- * threshold-raising mechanism (the per-frame DSC-slice-row transient is real in
- * both stacks; mDNIe would push it sub-visible). FFC (the prior #1 lead) was
- * refuted: it is an EMPTY command set on this wifi-only panel. The three writes
- * below (registers 0xDF/0xDE/0xDD) are the device's own UI_DYNAMIC scenario,
- * byte-verified against both GTS9U_ANA38407_AMSA46AS02_mdnie.h AND the live
- * rooted-OneUI capture (the runtime value 0xDD[17]=0x00 trans_on, not the
- * static table's 0xFF, is used -- it is what actually drove the clean panel).
- * mdnie=1 sends the UI_DYNAMIC ("Vivid") block; mdnie=2 sends the GRAYSCALE
- * scenario instead -- a DECISIVE engagement probe: if the mDNIe engine actually
- * engages, grayscale desaturates ALL colour to black-and-white (binary, no
- * subjective saturation judgment). Vivid (1) vs ordinary colour is ambiguous on
- * dark content; grayscale (2) is unmissable. Both share the identical DE LUT and
- * the DD enable; only DF's SCR colour matrix differs (grayscale = Rec.601 luma
- * weights). default 0 = do NOT send (original behaviour, the flickering control).
- * Set at module load:  insmod panel.ko mdnie=1   (or mdnie=2 for the gray probe)
+ * mDNIe scenario selection. OneUI programs the DDIC's mDNIe image-quality
+ * engine (Samsung "Mobile DNIe": ASCR adaptive contrast/colour + AOLCE
+ * local-contrast + a tone LUT) at panel-on as a PERSISTENT state; a bare
+ * kernel (TWRP) sends none of it. Each scenario is three writes, registers
+ * 0xDF/0xDE/0xDD, taken from the device's own GTS9U_ANA38407_AMSA46AS02_mdnie.h.
+ *
+ * mdnie=3 (the default) sends stock OneUI's start-up state: UI_APP +
+ * AUTO_MODE = UI_AUTO_MDNIE, the tables UI_AUTO_MDNIE_1/2/3, transcribed by
+ * utilities/display/mdnie-table-extract.py and checked byte-for-byte by
+ * utilities/display/mdnie-table-compare.py. Stock's "Vivid" screen mode is
+ * AUTO_MODE, which the downstream table resolves to this scenario.
+ *
+ * mdnie=1 sends the UI_DYNAMIC scenario (stock's DYNAMIC screen mode),
+ * byte-verified against the header AND a live rooted-OneUI capture; its
+ * 0xDD[17] is the runtime-captured 0x00 (trans_on), not the static table's
+ * 0xFF.
+ *
+ * mdnie=2 sends the GRAYSCALE scenario, an engagement probe: if the engine
+ * engages, all colour desaturates to black-and-white, which is unmissable even
+ * on dark content. It shares UI_DYNAMIC's DE LUT; only DF's SCR colour matrix
+ * (Rec.601 luma weights) and DD[17] differ.
+ *
+ * mdnie=0 sends no mDNIe at all (debug only; the DDIC keeps its reset state).
+ * Set at module load:  insmod panel.ko mdnie=1
  */
-static int mdnie;
+static int mdnie = 3;
 module_param(mdnie, int, 0644);
-MODULE_PARM_DESC(mdnie, "send OneUI mDNIe at panel-on: 0=off (default), 1=UI_DYNAMIC/Vivid, 2=GRAYSCALE (engagement probe)");
+MODULE_PARM_DESC(mdnie, "mDNIe scenario sent at panel-on: 0=off (none sent, debug), 1=UI_DYNAMIC, 2=GRAYSCALE (engagement probe), 3=UI_AUTO (default, stock's UI_APP + AUTO_MODE)");
 
 /*
  * acl -- ACL (Automatic Current Limiting) level written to WRACL (0x55) at
@@ -908,7 +910,7 @@ static int ana38407_on(struct ana38407 *ctx)
 	/*
 	 * VRR_SETTING (rev D), transcribed from this device's own runtime-parsed
 	 * panel_data_file/GTS9U_ANA38407_AMSA46AS02.dat (the VRR_SETTING table),
-	 * cross-checked against the sess-133 live ss_print_cmd_desc capture. The
+	 * cross-checked against a live ss_print_cmd_desc capture. The
 	 * DDIC always SCANS at 120HS; the refresh rate the host actually delivers
 	 * is selected by the Low-Frequency-Driving divisor, not by the scan mode:
 	 *
@@ -979,7 +981,7 @@ static int ana38407_on(struct ana38407 *ctx)
 	ana38407_lock_lvl1(&dsi_ctx);
 
 	/*
-	 * TCON_PE_ON (sess-142 probe; off by default). Transcribed byte-exact
+	 * TCON_PE_ON (probe; off by default). Transcribed byte-exact
 	 * from GTS9U_ANA38407_AMSA46AS02.dat: for each TCON channel 0x6A..0x6F,
 	 * the indirect-register-write envelope sets the pre-emphasis byte (0xC1)
 	 * via offset 0xB0 0x03 and the 0xC0 address payload. See the tcon_pe
@@ -1006,16 +1008,14 @@ static int ana38407_on(struct ana38407 *ctx)
 	}
 
 	/*
-	 * mDNIe (sess-143 probe; off by default). OneUI's UI_DYNAMIC scenario,
-	 * registers 0xDF (ASCR/skin) / 0xDE (tone LUT) / 0xDD (mDNIe master enable
-	 * + AOLCE/gamut). Bytes byte-verified against the device's own
-	 * GTS9U_ANA38407_AMSA46AS02_mdnie.h AND the live rooted-OneUI capture;
-	 * 0xDD[17]=0x00 (trans_on) is the runtime-captured value, not the static
-	 * table's 0xFF. Sent last, matching OneUI's post-brightness order, with its
-	 * exact F0+F1-unlock / F0-only-lock asymmetry. See the mdnie param note.
+	 * mDNIe (default UI_AUTO; see the mdnie param note). Registers 0xDF
+	 * (ASCR/skin) / 0xDE (tone LUT) / 0xDD (mDNIe master enable + AOLCE/gamut),
+	 * from the device's own GTS9U_ANA38407_AMSA46AS02_mdnie.h. Sent last, matching OneUI's post-brightness order, with its
+	 * exact F0+F1-unlock / F0-only-lock asymmetry.
 	 */
 	if (mdnie) {
-		static const u8 mdnie_df[] = {
+		/* UI_DYNAMIC scenario (mdnie=1). */
+		static const u8 ana38407_mdnie_ui_dynamic_df[] = {
 			0xdf, 0x11, 0x6a, 0x9a, 0x25, 0x1a, 0x16, 0x2a, 0x00, 0x37, 0x5a, 0x00,
 			0x4e, 0xc5, 0x00, 0x5d, 0x17, 0x00, 0x30, 0xc3, 0xe3, 0x00, 0x00, 0xf2,
 			0xef, 0x00, 0xf0, 0x24, 0xf0, 0xff, 0xfc, 0xf6, 0x63, 0xe8, 0xfd, 0x16,
@@ -1028,7 +1028,7 @@ static int ana38407_on(struct ana38407 *ctx)
 			0x00, 0x04, 0x80, 0x05, 0x00, 0x05, 0x80, 0x06, 0x00, 0x06, 0x80, 0x07,
 			0x00, 0x07, 0x80, 0x08, 0x00
 		};
-		static const u8 mdnie_de[] = {
+		static const u8 ana38407_mdnie_ui_dynamic_de[] = {
 			0xde, 0x00, 0x40, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x30,
 			0x01, 0x00, 0x70, 0x01, 0x34, 0x01, 0x40, 0x66, 0x03, 0x01, 0x11, 0x00,
@@ -1047,16 +1047,17 @@ static int ana38407_on(struct ana38407 *ctx)
 			0x88, 0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0, 0xc8, 0xd0, 0xd8, 0xe0,
 			0xe8, 0xf0, 0xf8, 0x01, 0x00
 		};
-		static const u8 mdnie_dd[] = {
+		static const u8 ana38407_mdnie_ui_dynamic_dd[] = {
 			0xdd, 0x01, 0x00, 0xf0, 0x07, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01
 		};
 		/*
-		 * GRAYSCALE scenario (mdnie=2 engagement probe): identical DE LUT + DD
-		 * enable; DF carries the Rec.601 luma SCR matrix that desaturates all
-		 * colour. If mDNIe engages, the screen goes black-and-white.
+		 * GRAYSCALE scenario (mdnie=2 engagement probe): reuses the
+		 * UI_DYNAMIC DE LUT; DF carries the Rec.601 luma SCR matrix that
+		 * desaturates all colour. If mDNIe engages, the screen goes
+		 * black-and-white.
 		 */
-		static const u8 mdnie_gray_df[] = {
+		static const u8 ana38407_mdnie_grayscale_df[] = {
 			0xdf, 0x01, 0x6a, 0x9a, 0x25, 0x1a, 0x16, 0x2a, 0x00, 0x37, 0x5a, 0x00,
 			0x4e, 0xc5, 0x00, 0x5d, 0x17, 0x00, 0x30, 0xc3, 0x4c, 0x4c, 0x4c, 0xe2,
 			0xe2, 0xe2, 0x69, 0x69, 0x69, 0xff, 0xff, 0xff, 0xb3, 0x4c, 0xb3, 0x4c,
@@ -1069,18 +1070,76 @@ static int ana38407_on(struct ana38407 *ctx)
 			0x00, 0x04, 0x80, 0x05, 0x00, 0x05, 0x80, 0x06, 0x00, 0x06, 0x80, 0x07,
 			0x00, 0x07, 0x80, 0x08, 0x00
 		};
-		static const u8 mdnie_gray_dd[] = {
+		static const u8 ana38407_mdnie_grayscale_dd[] = {
 			0xdd, 0x01, 0x00, 0xf0, 0x07, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x04, 0x01
 		};
-		const u8 *df = (mdnie == 2) ? mdnie_gray_df : mdnie_df;
-		const u8 *dd = (mdnie == 2) ? mdnie_gray_dd : mdnie_dd;
+		/*
+		 * UI_AUTO scenario (mdnie=3, default): stock's UI_APP + AUTO_MODE
+		 * tables, GTS9U_ANA38407_AMSA46AS02_mdnie.h UI_AUTO_MDNIE_1/2/3.
+		 */
+		static const u8 ana38407_mdnie_ui_auto_df[] = {
+			0xdf, 0x11, 0x6a, 0x9a, 0x25, 0x1a, 0x16, 0x2a, 0x00, 0x37, 0x5a, 0x00,
+			0x4e, 0xc5, 0x00, 0x5d, 0x17, 0x00, 0x30, 0xc3, 0xd9, 0x00, 0x15, 0xfa,
+			0xff, 0x00, 0xff, 0x00, 0xff, 0xff, 0xff, 0xfb, 0x00, 0xea, 0xf0, 0x10,
+			0xff, 0x00, 0xff, 0x46, 0x00, 0xff, 0xff, 0x00, 0xff, 0x31, 0xf7, 0x08,
+			0x00, 0xf3, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x80, 0x01, 0x00, 0x01, 0x80, 0x02, 0x00, 0x02, 0x80, 0x03, 0x00, 0x03,
+			0x80, 0x04, 0x00, 0x04, 0x80, 0x05, 0x00, 0x05, 0x80, 0x06, 0x00, 0x06,
+			0x80, 0x07, 0x00, 0x07, 0x80, 0x08, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01,
+			0x00, 0x01, 0x80, 0x02, 0x00, 0x02, 0x80, 0x03, 0x00, 0x03, 0x80, 0x04,
+			0x00, 0x04, 0x80, 0x05, 0x00, 0x05, 0x80, 0x06, 0x00, 0x06, 0x80, 0x07,
+			0x00, 0x07, 0x80, 0x08, 0x00
+		};
+		static const u8 ana38407_mdnie_ui_auto_de[] = {
+			0xde, 0x00, 0x40, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x30,
+			0x01, 0x00, 0x70, 0x01, 0x34, 0x01, 0x40, 0x66, 0x03, 0x01, 0x11, 0x00,
+			0x20, 0x00, 0x08, 0x08, 0x00, 0x0a, 0x0a, 0x06, 0xae, 0x00, 0x00, 0x10,
+			0x20, 0x40, 0x60, 0x00, 0x40, 0x00, 0x50, 0x00, 0x60, 0x00, 0x70, 0x00,
+			0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x00, 0x20, 0x40, 0x60, 0x01, 0x40,
+			0x01, 0x80, 0x01, 0x80, 0x01, 0x80, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x40, 0x03, 0xb6, 0x23, 0x24, 0x00, 0x72, 0x01, 0x00,
+			0x0d, 0x00, 0x04, 0x07, 0x40, 0x00, 0x6e, 0x82, 0xe6, 0xff, 0x00, 0xff,
+			0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x14, 0x00, 0x01, 0x00, 0x01, 0x00,
+			0x10, 0x00, 0x00, 0x28, 0x3c, 0x04, 0x0f, 0x01, 0x00, 0x00, 0x08, 0x10,
+			0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70,
+			0x78, 0x80, 0x88, 0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0, 0xc8, 0xd0,
+			0xd8, 0xe0, 0xe8, 0xf0, 0xf8, 0x01, 0x00, 0x00, 0x08, 0x10, 0x18, 0x20,
+			0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80,
+			0x88, 0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0, 0xc8, 0xd0, 0xd8, 0xe0,
+			0xe8, 0xf0, 0xf8, 0x01, 0x00
+		};
+		static const u8 ana38407_mdnie_ui_auto_dd[] = {
+			0xdd, 0x01, 0x00, 0xf0, 0x07, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x04, 0x01
+		};
+		const u8 *df = ana38407_mdnie_ui_dynamic_df;
+		const u8 *de = ana38407_mdnie_ui_dynamic_de;
+		const u8 *dd = ana38407_mdnie_ui_dynamic_dd;
+		size_t df_len = sizeof(ana38407_mdnie_ui_dynamic_df);
+		size_t de_len = sizeof(ana38407_mdnie_ui_dynamic_de);
+		size_t dd_len = sizeof(ana38407_mdnie_ui_dynamic_dd);
+
+		if (mdnie == 2) {
+			df = ana38407_mdnie_grayscale_df;
+			df_len = sizeof(ana38407_mdnie_grayscale_df);
+			dd = ana38407_mdnie_grayscale_dd;
+			dd_len = sizeof(ana38407_mdnie_grayscale_dd);
+		} else if (mdnie == 3) {
+			df = ana38407_mdnie_ui_auto_df;
+			df_len = sizeof(ana38407_mdnie_ui_auto_df);
+			de = ana38407_mdnie_ui_auto_de;
+			de_len = sizeof(ana38407_mdnie_ui_auto_de);
+			dd = ana38407_mdnie_ui_auto_dd;
+			dd_len = sizeof(ana38407_mdnie_ui_auto_dd);
+		}
 
 		ana38407_unlock_lvl0(&dsi_ctx);
 		ana38407_unlock_lvl1(&dsi_ctx);
-		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, df, sizeof(mdnie_df));
-		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, mdnie_de, sizeof(mdnie_de));
-		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, dd, sizeof(mdnie_dd));
+		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, df, df_len);
+		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, de, de_len);
+		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, dd, dd_len);
 		ana38407_lock_lvl0(&dsi_ctx);	/* OneUI locks F0 only (asymmetric) */
 	}
 
