@@ -151,6 +151,88 @@ static const u16 ana38407_wrdisbv_hbm[292] = {
 	2042, 2044, 2046, 2047,
 };
 
+/*
+ * Nominal luminance in cd/m2 for every platform level 0..547: the <Candela>
+ * column of NORMAL_CANDELA_MAP (levels 0..255) followed by that of
+ * HBM_CANDELA_MAP (levels 256..547) in GTS9U_ANA38407_AMSA46AS02.dat -- the
+ * same rows the two WRDISBV tables above are transcribed from. The data file
+ * labels the column "Candela round-off": these are the vendor's figures
+ * rounded to whole cd/m2, not measurements of this unit. Luminance is
+ * continuous across the HBM boundary (420 at 255, 422 at 256) even though
+ * WRDISBV restarts there.
+ */
+static const u16 ana38407_luminance[] = {
+	  2,   2,   3,   3,   4,   5,   5,   6,
+	  7,   7,   8,   9,  10,  11,  12,  13,
+	 13,  14,  15,  16,  17,  18,  19,  20,
+	 21,  22,  23,  25,  26,  27,  28,  29,
+	 30,  31,  32,  34,  35,  36,  37,  38,
+	 40,  41,  42,  43,  45,  46,  47,  48,
+	 50,  51,  52,  54,  55,  56,  58,  59,
+	 60,  62,  63,  64,  66,  67,  68,  70,
+	 71,  73,  74,  76,  77,  78,  80,  81,
+	 83,  84,  86,  87,  89,  90,  92,  93,
+	 95,  96,  98,  99, 101, 102, 104, 105,
+	107, 108, 110, 112, 113, 115, 116, 118,
+	119, 121, 123, 124, 126, 127, 129, 131,
+	132, 134, 136, 137, 139, 140, 142, 144,
+	145, 147, 149, 150, 152, 154, 156, 157,
+	159, 161, 162, 164, 166, 167, 169, 171,
+	173, 174, 176, 178, 180, 181, 183, 185,
+	187, 188, 190, 192, 194, 195, 197, 199,
+	201, 203, 204, 206, 208, 210, 212, 214,
+	215, 217, 219, 221, 223, 225, 226, 228,
+	230, 232, 234, 236, 237, 239, 241, 243,
+	245, 247, 249, 251, 253, 254, 256, 258,
+	260, 262, 264, 266, 268, 270, 272, 274,
+	275, 277, 279, 281, 283, 285, 287, 289,
+	291, 293, 295, 297, 299, 301, 303, 305,
+	307, 309, 311, 313, 315, 317, 319, 321,
+	323, 325, 327, 329, 331, 333, 335, 337,
+	339, 341, 343, 345, 347, 349, 351, 353,
+	355, 357, 359, 361, 363, 365, 368, 370,
+	372, 374, 376, 378, 380, 382, 384, 386,
+	388, 390, 393, 395, 397, 399, 401, 403,
+	405, 407, 409, 411, 414, 416, 418, 420,
+	422, 423, 425, 427, 428, 430, 432, 433,
+	435, 436, 438, 440, 441, 443, 445, 446,
+	448, 450, 451, 453, 455, 456, 458, 460,
+	461, 463, 464, 466, 468, 469, 471, 473,
+	474, 476, 478, 479, 481, 483, 484, 486,
+	488, 489, 491, 492, 494, 496, 497, 499,
+	501, 502, 504, 506, 507, 509, 511, 512,
+	514, 516, 517, 519, 520, 522, 524, 525,
+	527, 529, 530, 532, 534, 535, 537, 539,
+	540, 542, 544, 545, 547, 548, 550, 552,
+	553, 555, 557, 558, 560, 562, 563, 565,
+	567, 568, 570, 572, 573, 575, 576, 578,
+	580, 581, 583, 585, 586, 588, 590, 591,
+	593, 595, 596, 598, 600, 601, 603, 604,
+	606, 608, 609, 611, 613, 614, 616, 618,
+	619, 621, 623, 624, 626, 628, 629, 631,
+	632, 634, 636, 637, 639, 641, 642, 644,
+	646, 647, 649, 650, 652, 654, 656, 657,
+	659, 660, 662, 664, 665, 667, 669, 670,
+	672, 674, 675, 677, 679, 680, 682, 684,
+	685, 687, 688, 690, 692, 693, 695, 697,
+	698, 700, 702, 703, 705, 707, 708, 710,
+	712, 713, 715, 716, 718, 720, 721, 723,
+	725, 726, 728, 730, 731, 733, 735, 736,
+	738, 740, 741, 743, 744, 746, 748, 749,
+	751, 753, 754, 756, 758, 759, 761, 763,
+	764, 766, 768, 769, 771, 772, 774, 776,
+	777, 779, 781, 782, 784, 786, 787, 789,
+	791, 792, 794, 796, 797, 799, 800, 802,
+	804, 805, 807, 809, 810, 812, 814, 815,
+	817, 819, 820, 822, 824, 825, 827, 828,
+	830, 832, 833, 835, 837, 838, 840, 842,
+	843, 845, 847, 848, 850, 852, 853, 855,
+	856, 858, 860, 861, 863, 865, 866, 868,
+	870, 871, 873, 875, 876, 878, 880, 881,
+	883, 884, 886, 888, 889, 891, 893, 894,
+	896, 898, 899, 900,
+};
+
 /* First platform level served by the HBM table rather than the normal one. */
 #define ANA38407_BL_HBM_FIRST_LEVEL	ARRAY_SIZE(ana38407_wrdisbv)
 
@@ -1421,6 +1503,46 @@ static struct attribute *ana38407_attrs[] = {
 };
 ATTRIBUTE_GROUPS(ana38407);
 
+/*
+ * Read-only attributes on the backlight device. luminance_table lists the
+ * nominal luminance in cd/m2 of every level from 0 to max_brightness,
+ * space-separated, in level order; hbm_threshold is the first level served
+ * in high-brightness mode. Both are constants of the panel's data file.
+ */
+static_assert(ARRAY_SIZE(ana38407_luminance) == ANA38407_BL_MAX_LEVEL + 1);
+
+static ssize_t luminance_table_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	unsigned int i;
+	int n = 0;
+
+	for (i = 0; i < ARRAY_SIZE(ana38407_luminance); i++)
+		n += sysfs_emit_at(buf, n, "%s%u", i ? " " : "",
+				   ana38407_luminance[i]);
+	n += sysfs_emit_at(buf, n, "\n");
+
+	return n;
+}
+static DEVICE_ATTR_RO(luminance_table);
+
+static ssize_t hbm_threshold_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", (unsigned int)ANA38407_BL_HBM_FIRST_LEVEL);
+}
+static DEVICE_ATTR_RO(hbm_threshold);
+
+static struct attribute *ana38407_bl_attrs[] = {
+	&dev_attr_luminance_table.attr,
+	&dev_attr_hbm_threshold.attr,
+	NULL,
+};
+
+static const struct attribute_group ana38407_bl_group = {
+	.attrs = ana38407_bl_attrs,
+};
+
 static int ana38407_backlight_init(struct ana38407 *ctx)
 {
 	struct device *dev = &ctx->dsi->dev;
@@ -1483,7 +1605,11 @@ static int ana38407_backlight_init(struct ana38407 *ctx)
 	 */
 	ctx->panel.backlight = ctx->bl;
 
-	return 0;
+	/*
+	 * Publish the luminance attributes on the backlight device itself,
+	 * beside brightness and max_brightness, whose levels they describe.
+	 */
+	return devm_device_add_group(&ctx->bl->dev, &ana38407_bl_group);
 }
 
 static const struct drm_panel_funcs ana38407_panel_funcs = {
