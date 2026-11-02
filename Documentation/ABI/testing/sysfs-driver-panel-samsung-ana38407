@@ -31,3 +31,30 @@ Description:
 		"addr[<reg>] len[<n>] : <byte> ...". A read while the panel
 		is off fails with -ENODEV; a failed or short transfer fails
 		with an error rather than printing a value.
+
+What:		/sys/class/backlight/<dsi-device>/luminance_table
+Date:		November 2026
+KernelVersion:	7.0
+Contact:	omar fityan <me@omarfityan.com>
+Description:
+		(RO) Nominal luminance, in cd/m2, of every brightness level
+		of the Samsung ANA38407 panel's backlight, from 0 to
+		max_brightness: max_brightness + 1 unsigned decimal integers,
+		space-separated, in level order, newline-terminated. The
+		values are the vendor's panel data file figures rounded to
+		whole cd/m2 (its NORMAL_CANDELA_MAP below hbm_threshold, its
+		HBM_CANDELA_MAP from hbm_threshold up), not measurements of
+		the individual unit. It is one table describing one property,
+		published whole so that a reader gets a consistent copy in a
+		single read. It is a constant of the panel and never changes.
+
+What:		/sys/class/backlight/<dsi-device>/hbm_threshold
+Date:		November 2026
+KernelVersion:	7.0
+Contact:	omar fityan <me@omarfityan.com>
+Description:
+		(RO) The first brightness level served in the panel's
+		high-brightness mode, as an unsigned decimal integer. Levels
+		from it up to max_brightness drive the DDIC's high-brightness
+		state; luminance stays continuous across the boundary (see
+		luminance_table). A constant of the panel.

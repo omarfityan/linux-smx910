@@ -1831,9 +1831,7 @@ static struct attribute *ana38407_bl_attrs[] = {
 	NULL,
 };
 
-static const struct attribute_group ana38407_bl_group = {
-	.attrs = ana38407_bl_attrs,
-};
+ATTRIBUTE_GROUPS(ana38407_bl);
 
 static int ana38407_backlight_init(struct ana38407 *ctx)
 {
@@ -1882,6 +1880,12 @@ static int ana38407_backlight_init(struct ana38407 *ctx)
 		 */
 		.max_brightness = ANA38407_BL_MAX_LEVEL,
 		.brightness = ANA38407_BL_DEFAULT_LEVEL,
+		/*
+		 * The luminance attributes, published on the backlight device
+		 * beside brightness and max_brightness, whose levels they
+		 * describe. Created with the device, before it is announced.
+		 */
+		.groups = ana38407_bl_groups,
 	};
 
 	ctx->bl = devm_backlight_device_register(dev, dev_name(dev), dev, ctx,
@@ -1897,11 +1901,7 @@ static int ana38407_backlight_init(struct ana38407 *ctx)
 	 */
 	ctx->panel.backlight = ctx->bl;
 
-	/*
-	 * Publish the luminance attributes on the backlight device itself,
-	 * beside brightness and max_brightness, whose levels they describe.
-	 */
-	return devm_device_add_group(&ctx->bl->dev, &ana38407_bl_group);
+	return 0;
 }
 
 static const struct drm_panel_funcs ana38407_panel_funcs = {

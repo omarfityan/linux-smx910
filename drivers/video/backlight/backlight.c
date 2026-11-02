@@ -396,6 +396,9 @@ struct backlight_device *backlight_device_register(const char *name,
 		new_bd->props.type = BACKLIGHT_RAW;
 	}
 
+	/* Before device_register(), so they exist when KOBJ_ADD goes out. */
+	new_bd->dev.groups = new_bd->props.groups;
+
 	rc = device_register(&new_bd->dev);
 	if (rc) {
 		put_device(&new_bd->dev);

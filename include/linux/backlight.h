@@ -235,6 +235,17 @@ struct backlight_properties {
 	 * @scale: The type of the brightness scale.
 	 */
 	enum backlight_scale scale;
+
+	/**
+	 * @groups: Optional driver-specific attribute groups.
+	 *
+	 * Created together with the device by backlight_device_register(),
+	 * before the KOBJ_ADD uevent announces it. Attributes added with
+	 * device_add_group() after registration appear only after that
+	 * uevent, so a listener that reads the device as soon as it is
+	 * announced can miss them.
+	 */
+	const struct attribute_group **groups;
 };
 
 /**
