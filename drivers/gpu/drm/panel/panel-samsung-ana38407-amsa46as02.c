@@ -26,6 +26,7 @@
 #include <drm/display/drm_dsc_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
+#include <drm/drm_edid.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
@@ -1437,6 +1438,93 @@ static int ana38407_unprepare(struct drm_panel *panel)
 	return dsi_ctx.accum_err;
 }
 
+/*
+ * The panel's EDID. A DSI panel has no DDC channel, so without this the
+ * connector carries no EDID and userspace learns nothing of the panel's
+ * colour or luminance capability. Every value comes from this device's own
+ * downstream device tree (the panel node of gts9uwifi_eur_open_w00_r03.dts):
+ *
+ *   qcom,mdss-dsi-panel-hdr-color-primaries, 1/50000 units, ordered white,
+ *   red, green, blue -- the DCI-P3 primaries with a D65 white:
+ *	white 15635 16450 -> 0.3127 0.3290
+ *	red   34000 16000 -> 0.680  0.320
+ *	green 13250 34500 -> 0.265  0.690
+ *	blue   7500  3000 -> 0.150  0.060
+ *   qcom,mdss-dsi-panel-peak-brightness    5400000 -> 540 cd/m2
+ *   qcom,mdss-dsi-panel-average-brightness 2000000 -> 200 cd/m2
+ *   qcom,mdss-dsi-panel-blackness-level       2000 -> 0.2 cd/m2
+ *   (luminances in units of 0.0001 cd/m2)
+ *
+ * Base block, EDID 1.4: manufacturer SDC (Samsung Display, the tree's
+ * samsung,panel-vendor), product 0, model year 2023, digital input with
+ * colour depth and interface undefined, 31 x 20 cm, gamma 2.2, RGB 4:4:4
+ * only, the chromaticities above as 10-bit fractions, no timings, and the
+ * descriptors "AMSA46AS02" (monitor name) and "ANA38407" (alphanumeric
+ * data). The "sRGB is the default colour space" feature bit is clear on
+ * purpose: the primaries are P3, and a consumer that sees the bit may use
+ * sRGB in place of them.
+ *
+ * CTA-861 extension: a single HDR Static Metadata Data Block declaring the
+ * traditional-gamma SDR EOTF only (no PQ, no HLG), Static Metadata
+ * Descriptor type 1, and the luminances as CTA-861.3 code values:
+ *	max      CV 110: 50 * 2^(110/32)          = 541.7 cd/m2 (for 540)
+ *	max-FALL CV  64: 50 * 2^(64/32)           = 200.0 cd/m2
+ *	min      CV  49: 541.7 * (49/255)^2 / 100 = 0.200 cd/m2
+ * There is no Colorimetry Data Block, so no BT.2020 or other extended
+ * colorimetry is claimed.
+ *
+ * There is no detailed timing descriptor. EDID 1.4 expects the first
+ * descriptor to be the preferred timing, but the preferred 120 Hz mode's
+ * 710.5 MHz pixel clock does not fit the descriptor's 16-bit field of
+ * 10 kHz units (655.35 MHz at most). The modes come from ana38407_modes[]
+ * regardless: drm_edid_connector_update() adds none, so this EDID carries
+ * identity, colour and luminance only. Without a descriptor the only size
+ * in it is the base block's whole centimetres: EDID consumers such as KWin
+ * read 310 x 200 mm, while the connector's display_info keeps 313 x 196.
+ *
+ * Regenerate the bytes and both checksums with the project's EDID
+ * generator rather than editing them by hand.
+ */
+static const u8 ana38407_edid[256] = {
+	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x4c, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xff, 0x21, 0x01, 0x04, 0x80, 0x1f, 0x14, 0x78, 0x00, 0x0f, 0x91, 0xae, 0x52, 0x43, 0xb0, 0x26,
+	0x0f, 0x50, 0x54, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x41, 0x4d, 0x53, 0x41, 0x34,
+	0x36, 0x41, 0x53, 0x30, 0x32, 0x0a, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfe, 0x00, 0x41, 0x4e, 0x41,
+	0x33, 0x38, 0x34, 0x30, 0x37, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x24,
+	0x02, 0x03, 0x0b, 0x00, 0xe6, 0x06, 0x01, 0x01, 0x6e, 0x40, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23,
+};
+
+static void ana38407_publish_edid(struct ana38407 *ctx,
+				  struct drm_connector *connector)
+{
+	const struct drm_edid *drm_edid;
+	int ret;
+
+	drm_edid = drm_edid_alloc(ana38407_edid, sizeof(ana38407_edid));
+	if (!drm_edid_valid(drm_edid)) {
+		dev_warn_once(&ctx->dsi->dev,
+			      "built-in EDID not published (alloc/validation)\n");
+		drm_edid_free(drm_edid);
+		return;
+	}
+
+	ret = drm_edid_connector_update(connector, drm_edid);
+	if (ret)
+		dev_warn(&ctx->dsi->dev, "EDID connector update failed: %d\n",
+			 ret);
+	drm_edid_free(drm_edid);
+}
+
 static int ana38407_get_modes(struct drm_panel *panel,
 			      struct drm_connector *connector)
 {
@@ -1454,6 +1542,13 @@ static int ana38407_get_modes(struct drm_panel *panel,
 		drm_mode_set_name(mode);
 		drm_mode_probed_add(connector, mode);
 	}
+
+	/*
+	 * Before the size below: drm_edid_connector_update() resets the display
+	 * info and sets 310 x 200 mm from the EDID's whole centimetres. DRM keeps
+	 * the exact 313 x 196 set here; EDID consumers (KWin) read 310 x 200.
+	 */
+	ana38407_publish_edid(ctx, connector);
 
 	connector->display_info.width_mm = ana38407_modes[0].mode.width_mm;
 	connector->display_info.height_mm = ana38407_modes[0].mode.height_mm;
