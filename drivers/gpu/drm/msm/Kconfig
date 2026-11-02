@@ -112,6 +112,21 @@ config DRM_MSM_DPU
 	  the MSM DRM driver. It is the display controller found in devices
 	  using e.g. SDM845 and newer platforms.
 
+config DRM_MSM_DPU_COLOUR_TEST
+	bool "DPU colour test switches for the colour measurement tools"
+	depends on DRM_MSM_DPU
+	default n
+	help
+	  Test-only module parameters (colorop_gamut_test, colorop_gamut_map,
+	  colorop_igc_test_program, colorop_igc_keep_on, colorop_igc_test_invert,
+	  oneui_dspp_inject, lutdma_selftest), the debugfs node
+	  vig_gamut_test_blob and the register-DMA engine self-test, used by the
+	  project's colour measurement tools (the known-value / CRC kit) to drive
+	  the DPU colour blocks directly. They bypass the atomic colour pipeline
+	  and can leave a wrong picture on screen.
+
+	  This must be off in a shipped kernel. If unsure, say N.
+
 config DRM_MSM_DP
 	bool "Enable DisplayPort support in MSM DRM driver"
 	depends on DRM_MSM

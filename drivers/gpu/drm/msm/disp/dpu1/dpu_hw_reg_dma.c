@@ -569,13 +569,8 @@ int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
  * this part that table lives in the source pipe's inverse-gamma block.  The
  * block has no CPU write path -- writing it is the reason this engine exists.
  *
- * 🔴 THE OFFSETS BELOW ARE DELIBERATELY A SECOND COPY of the ones the self-test
- * at the end of this file names SELFTEST_VIG_IGC_*.  Sharing them would let an
- * instrument and the feature it is supposed to prove fail together on the same
- * wrong constant, which is the one thing a control must not do.  The self-test
- * also hardcodes its block base while this path takes it from the catalogue, so
- * the two disagree loudly if the catalogue is wrong rather than agreeing
- * quietly.
+ * The offsets below are taken from the catalogue.  The register self-test
+ * (CONFIG_DRM_MSM_DPU_COLOUR_TEST) carries its own hardcoded copy as an independent control.
  * ------------------------------------------------------------------------ */
 
 /*
@@ -609,7 +604,7 @@ int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
  * 🔴 DITHER OFF -- the vendor's value unless its client asks for dither
  * (sde_hw_reg_dma_v1_color_proc.c: strength | BIT(4) only on IGC_DITHER_ENABLE,
  * else 0), and a DRM colour pipeline has no way to ask.  This used to be 0x16
- * (enable + strength 6): the 482 register self-test's SENTINEL, carried into
+ * (enable + strength 6): the register self-test's sentinel, carried into
  * every table load.  Measured in the pixels (the layer-mixer CRC decoded on
  * the grey dictionary): with 0x16 no plane grey below a PQ curve's clip was a
  * solid ten-bit value, black was lifted and white arrived late; with 0 every
@@ -655,10 +650,15 @@ int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
  * default: 1 runs it as it was, so the loss it causes can be shown in the same
  * boot as the fix.
  */
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
 static int dpu_reg_dma_igc_test_program;
 module_param_named(colorop_igc_test_program, dpu_reg_dma_igc_test_program, int, 0644);
 MODULE_PARM_DESC(colorop_igc_test_program,
 	"TEST ONLY, default 0: 1 loads the inverse-gamma table with the device's own program, which loses the last word of channels 0 and 1 -- a control for the fixed program");
+#define DPU_REG_DMA_IGC_TEST_PROGRAM()	READ_ONCE(dpu_reg_dma_igc_test_program)
+#else
+#define DPU_REG_DMA_IGC_TEST_PROGRAM()	0
+#endif
 
 /* one endpoint register a channel -- the loop below indexes them by channel */
 static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
@@ -699,6 +699,7 @@ static_assert(DPU_VIG_IGC_LAST_N == DPU_VIG_IGC_CHANNELS,
  * -- and switch it off again on 0.  A measurement switch for the hardware
  * arms only: nothing else drives the block.
  */
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
 static int dpu_reg_dma_gamut_test;
 module_param_named(colorop_gamut_test, dpu_reg_dma_gamut_test, int, 0644);
 MODULE_PARM_DESC(colorop_gamut_test,
@@ -721,6 +722,17 @@ const u32 *dpu_reg_dma_gamut_test_map(void)
 		return NULL;
 	return dpu_reg_dma_gamut_map;
 }
+#else
+int dpu_reg_dma_gamut_test_mode(void)
+{
+	return 0;
+}
+
+const u32 *dpu_reg_dma_gamut_test_map(void)
+{
+	return NULL;
+}
+#endif
 
 /**
  * dpu_vig_gamut_test_lattice - a test lattice, packed as the LUT bus takes it
@@ -992,6 +1004,7 @@ bool dpu_vig_gamut_blob_map(const u8 *blob, u32 *map)
 	return get_unaligned_le64(blob + DPU_VIG_GAMUT_BLOB_FLAGS) & DPU_VIG_GAMUT_BLOB_MAP_EN;
 }
 
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
 static u8 *dpu_vig_gamut_blob;		/* the held table, NULL until one is written */
 static DEFINE_MUTEX(dpu_vig_gamut_blob_lock);
 
@@ -1076,6 +1089,16 @@ void dpu_reg_dma_debugfs_init(struct dentry *parent)
 {
 	debugfs_create_file("vig_gamut_test_blob", 0600, parent, NULL, &dpu_vig_gamut_blob_fops);
 }
+#else
+int dpu_reg_dma_gamut_test_blob(u32 *lattice, u32 *map)
+{
+	return -ENOENT;
+}
+
+void dpu_reg_dma_debugfs_init(struct dentry *parent)
+{
+}
+#endif
 
 /**
  * dpu_reg_dma_gamut_bank - which bank a map-less gamut load writes: the device's own rule
@@ -1457,7 +1480,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	dpu_reg_dma_buf_reset(rdma);
 	ret = dpu_reg_dma_decode_sel(rdma, blk);
 
-	program = READ_ONCE(dpu_reg_dma_igc_test_program);
+	program = DPU_REG_DMA_IGC_TEST_PROGRAM();
 	for (ch = 0; ch < DPU_VIG_IGC_CHANNELS && !ret; ch++) {
 		ret = dpu_reg_dma_single_write(rdma, dma_off + DPU_VIG_IGC_INDEX, 0);
 		if (ret)
@@ -1679,6 +1702,7 @@ int dpu_reg_dma_disable_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	return (by_cpu & DPU_VIG_IGC_LUT_ENABLE) ? -EIO : 0;
 }
 
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
 /* ------------------------------------------------------------------------ *
  * Engine self-test
  *
@@ -2714,3 +2738,17 @@ void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
 			? "PASS" : "FAIL",
 		 ret);
 }
+#else
+void dpu_reg_dma_selftest_bind(struct dpu_kms *dpu_kms)
+{
+}
+
+void dpu_reg_dma_selftest_unbind(struct dpu_kms *dpu_kms)
+{
+}
+
+void dpu_reg_dma_selftest_run(struct dpu_kms *dpu_kms,
+			      struct dpu_hw_dspp *dspp, struct dpu_hw_ctl *ctl)
+{
+}
+#endif

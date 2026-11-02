@@ -409,10 +409,14 @@ MODULE_PARM_DESC(plane_colorops,
  * carries through the previous curve.  It is runtime-writable only so an arm
  * can turn it on around one measurement and back off.
  */
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
 static bool dpu_colorop_igc_keep_on;
 module_param_named(colorop_igc_keep_on, dpu_colorop_igc_keep_on, bool, 0644);
 MODULE_PARM_DESC(colorop_igc_keep_on,
 	"TEST ONLY, default off: leave a video pipe's inverse gamma on when no plane wants it, instead of switching it off");
+#else
+static const bool dpu_colorop_igc_keep_on;
+#endif
 
 /*
  * A TEST SWITCH, off by default: load every video pipe's inverse-gamma table
@@ -435,7 +439,11 @@ MODULE_PARM_DESC(colorop_igc_keep_on,
  * GENERAL: the video is a negative while it is on.  Toggle it only while nothing
  * is on the plane path, and turn it back off.
  */
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
 static bool dpu_colorop_igc_test_invert;
+#else
+static const bool dpu_colorop_igc_test_invert;
+#endif
 /*
  * The video pipes' gamut TEST switch (colorop_gamut_test in dpu_hw_reg_dma.c,
  * 0 = off by default).  Per pipe, at each colour flush: bank A of the lattice
@@ -539,7 +547,8 @@ static void dpu_colorop_gamut_lut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *r
 		   (u64)pstate->pipeline_gamut_map_id << 32 | pstate->pipeline_gamut_id : 0;
 	u64 *applied = &dpu_kms->colorop_gamut_lut_id[sspp->idx];
 	u64 *failed = &dpu_kms->colorop_gamut_failed_id[sspp->idx];
-	bool test = dpu_reg_dma_gamut_test_mode() || dpu_colorop_gamut_applied[sspp->idx];
+	bool test = IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST) &&
+		    (dpu_reg_dma_gamut_test_mode() || dpu_colorop_gamut_applied[sspp->idx]);
 	u32 *lattice;
 	int act, ret;
 
@@ -587,9 +596,11 @@ static void dpu_colorop_gamut_lut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *r
 	*failed = 0;
 }
 
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
 module_param_named(colorop_igc_test_invert, dpu_colorop_igc_test_invert, bool, 0644);
 MODULE_PARM_DESC(colorop_igc_test_invert,
 	"TEST ONLY, default off: load every video pipe's inverse-gamma table inverted, each entry v as 4095 - v -- a third table with the compositor's own colour matrix; the video is a negative while it is on");
+#endif
 
 /* DRM object ids are positive ints, so the top bit is free to mark a transformed table */
 #define DPU_COLOROP_IGC_ID_INVERTED	BIT(31)
@@ -1236,7 +1247,8 @@ void dpu_colorop_crtc_flush(struct drm_crtc *crtc, struct dpu_hw_ctl *ctl)
 			}
 
 			/* before the skips below: the gamut keeps its own state */
-			dpu_colorop_gamut_test(dpu_kms, rdma, ctl, sspp);
+			if (IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST))
+				dpu_colorop_gamut_test(dpu_kms, rdma, ctl, sspp);
 			dpu_colorop_gamut_lut(dpu_kms, rdma, ctl, sspp, pstate);
 			if (pstate->pipeline_gamut)
 				gamut_wanted |= bit;
@@ -1324,7 +1336,8 @@ void dpu_colorop_crtc_flush(struct drm_crtc *crtc, struct dpu_hw_ctl *ctl)
 
 		if (!dpu_kms->colorop_gamut_lut_id[s] || (gamut_wanted & BIT(s)))
 			continue;
-		if (dpu_reg_dma_gamut_test_mode() || dpu_colorop_gamut_applied[s])
+		if (IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST) &&
+		    (dpu_reg_dma_gamut_test_mode() || dpu_colorop_gamut_applied[s]))
 			continue;
 
 		sspp = dpu_rm_get_sspp(&dpu_kms->rm, s);

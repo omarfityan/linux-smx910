@@ -89,6 +89,7 @@
 #define ONEUI_INJECT_SIXZONE		BIT(3)
 #define ONEUI_INJECT_SIXZONE_CTRL	BIT(4)
 
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
 static int oneui_dspp_inject;
 /*
  * Set on every param write, consumed on the next atomic commit: the inject is
@@ -114,6 +115,9 @@ static const struct kernel_param_ops oneui_dspp_inject_ops = {
 module_param_cb(oneui_dspp_inject, &oneui_dspp_inject_ops, &oneui_dspp_inject, 0644);
 MODULE_PARM_DESC(oneui_dspp_inject,
 	"DSPP colour-inject flicker test (bitmask: 1=identity-PCC 2=tint-PCC 4=force-DSPP 8=six-zone-faithful 16=six-zone-control; 0=off/revert)");
+#else
+static const int oneui_dspp_inject;
+#endif
 
 static struct dpu_kms *_dpu_crtc_get_kms(struct drm_crtc *crtc)
 {
@@ -973,6 +977,7 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	}
 }
 
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
 /*
  * DSPP sub-block offsets within the DSPP block.  These are identical
  * mainline<->downstream: the mainline catalog DSPP_0 base (0x54000) is off by
@@ -1179,6 +1184,7 @@ static void _dpu_crtc_lutdma_selftest(struct drm_crtc *crtc)
 
 	dpu_reg_dma_selftest_run(dpu_kms, dspp, mixer[0].lm_ctl);
 }
+#endif
 
 static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
 		struct drm_atomic_state *state)
@@ -1212,9 +1218,11 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
 
 	_dpu_crtc_setup_cp_blocks(crtc);
 
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
 	_dpu_crtc_oneui_dspp_inject(crtc);
 
 	_dpu_crtc_lutdma_selftest(crtc);
+#endif
 
 	/*
 	 * PP_DONE irq is only used by command mode for now.
