@@ -1,0 +1,33 @@
+What:		/sys/bus/mipi-dsi/devices/<dsi-device>/mdnie_scenario
+Date:		November 2026
+KernelVersion:	7.0
+Contact:	omar fityan <me@omarfityan.com>
+Description:
+		(RW) The scenario the Samsung ANA38407 DDIC's mDNIe
+		image-quality engine runs. Reading lists the accepted values
+		with the selected one in brackets, e.g. "[ui_auto] hdr_video".
+
+		ui_auto:   stock's start-up UI scenario (UI_APP + AUTO_MODE);
+			   the default.
+		hdr_video: the HDR-neutral HDR_VIDEO_1 scenario, whose colour
+			   remap is the identity; stock selects it while HDR
+			   video is on screen.
+
+		A write while the panel is on takes effect immediately; a
+		write while it is off is applied at the next panel-on. The
+		selection persists across panel power cycles but not across
+		a driver reload. It takes effect only while the driver's mdnie
+		module parameter is 3 (its default); other values are debug
+		overrides.
+
+What:		/sys/bus/mipi-dsi/devices/<dsi-device>/dcs_read
+Date:		November 2026
+KernelVersion:	7.0
+Contact:	omar fityan <me@omarfityan.com>
+Description:
+		(RW) Debug read-back of one DDIC register over DSI. Write
+		"<register-hex> <length>" (length 1..16) to select; read to
+		perform the read, which prints
+		"addr[<reg>] len[<n>] : <byte> ...". A read while the panel
+		is off fails with -ENODEV; a failed or short transfer fails
+		with an error rather than printing a value.

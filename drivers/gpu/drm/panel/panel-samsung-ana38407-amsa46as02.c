@@ -305,11 +305,26 @@ MODULE_PARM_DESC(glut_zero, "send all-zero GLUT (EB/EC) to match OneUI's 120HS-b
  * (Rec.601 luma weights) and DD[17] differ.
  *
  * mdnie=0 sends no mDNIe at all (debug only; the DDIC keeps its reset state).
+ *
+ * mdnie=3 is also the only value under which the runtime mdnie_scenario
+ * attribute takes effect: it chooses between UI_AUTO and the HDR-neutral
+ * HDR_VIDEO_1 scenario. Any other value is a debug override that pins the
+ * panel to its scenario; a selection written meanwhile is recorded and is
+ * applied at the first panel-on after mdnie is 3 again. Values outside 0..3
+ * are treated as 3.
  * Set at module load:  insmod panel.ko mdnie=1
  */
 static int mdnie = 3;
 module_param(mdnie, int, 0644);
 MODULE_PARM_DESC(mdnie, "mDNIe scenario sent at panel-on: 0=off (none sent, debug), 1=UI_DYNAMIC, 2=GRAYSCALE (engagement probe), 3=UI_AUTO (default, stock's UI_APP + AUTO_MODE)");
+
+enum ana38407_mdnie {
+	ANA38407_MDNIE_OFF = 0,
+	ANA38407_MDNIE_UI_DYNAMIC = 1,
+	ANA38407_MDNIE_GRAYSCALE = 2,
+	ANA38407_MDNIE_UI_AUTO = 3,
+	ANA38407_MDNIE_HDR_VIDEO = 4,
+};
 
 /*
  * acl -- ACL (Automatic Current Limiting) level written to WRACL (0x55) at
@@ -396,7 +411,40 @@ struct ana38407 {
 	/* Selected by the dcs_read sysfs attribute; guarded by cmd_lock. */
 	u8 read_addr;
 	u8 read_len;
+
+	/*
+	 * mDNIe scenario state, guarded by cmd_lock. mdnie_hdr is what
+	 * userspace last selected through mdnie_scenario (it persists across
+	 * panel power cycles); mdnie_sent is what the DDIC was last sent while
+	 * ddic_ready, or -1 when that is unknown (a failed send), so a repeated
+	 * selection is a no-op and a failed one is retried.
+	 */
+	bool mdnie_hdr;
+	int mdnie_sent;
 };
+
+/*
+ * The scenario panel-on sends, and the one a mdnie_scenario write converges
+ * to: the module parameter's debug override when it names one, otherwise the
+ * runtime selection.
+ */
+static enum ana38407_mdnie ana38407_mdnie_wanted(struct ana38407 *ctx)
+{
+	int sel = READ_ONCE(mdnie);
+
+	switch (sel) {
+	case ANA38407_MDNIE_OFF:
+	case ANA38407_MDNIE_UI_DYNAMIC:
+	case ANA38407_MDNIE_GRAYSCALE:
+		return sel;
+	default:
+		return ctx->mdnie_hdr ? ANA38407_MDNIE_HDR_VIDEO :
+					ANA38407_MDNIE_UI_AUTO;
+	}
+}
+
+static void ana38407_send_mdnie(struct mipi_dsi_multi_context *dsi_ctx,
+				enum ana38407_mdnie scenario);
 
 /*
  * The panel power on this board is a single GPIO-gated rail (panel_ldo_en,
@@ -799,6 +847,7 @@ static int ana38407_on(struct ana38407 *ctx)
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
 	struct drm_dsc_picture_parameter_set pps;
 	const struct ana38407_mode_data *md;
+	enum ana38407_mdnie scenario;
 
 	ctx->cur_mode = ana38407_get_current_mode(ctx);
 	md = &ana38407_modes[ctx->cur_mode];
@@ -1090,12 +1139,32 @@ static int ana38407_on(struct ana38407 *ctx)
 	}
 
 	/*
-	 * mDNIe (default UI_AUTO; see the mdnie param note). Registers 0xDF
-	 * (ASCR/skin) / 0xDE (tone LUT) / 0xDD (mDNIe master enable + AOLCE/gamut),
-	 * from the device's own GTS9U_ANA38407_AMSA46AS02_mdnie.h. Sent last, matching OneUI's post-brightness order, with its
-	 * exact F0+F1-unlock / F0-only-lock asymmetry.
+	 * mDNIe, sent last, matching OneUI's post-brightness order: the
+	 * scenario ana38407_mdnie_wanted() names (UI_AUTO by default).
 	 */
-	if (mdnie) {
+	scenario = ana38407_mdnie_wanted(ctx);
+	ana38407_send_mdnie(&dsi_ctx, scenario);
+	ctx->mdnie_sent = dsi_ctx.accum_err ? -1 : (int)scenario;
+
+	return dsi_ctx.accum_err;
+}
+
+/*
+ * mDNIe scenario write. Registers 0xDF (ASCR/skin) / 0xDE (tone LUT) / 0xDD
+ * (mDNIe master enable + AOLCE/gamut), from the device's own
+ * GTS9U_ANA38407_AMSA46AS02_mdnie.h, with OneUI's exact F0+F1-unlock /
+ * F0-only-lock asymmetry -- the vendor's MDNIE_CMDS_SET is level_1_key_on,
+ * level_2_key_on, <scenario>_1, _2, _3, level_1_key_off.
+ *
+ * The same block serves panel-on and the runtime mdnie_scenario write, so
+ * the DDIC sees one byte stream per scenario whichever path sent it. Takes
+ * no lock: every caller holds cmd_lock, as for ana38407_send_brightness().
+ * ANA38407_MDNIE_OFF sends nothing.
+ */
+static void ana38407_send_mdnie(struct mipi_dsi_multi_context *dsi_ctx,
+				enum ana38407_mdnie scenario)
+{
+	if (scenario != ANA38407_MDNIE_OFF) {
 		/* UI_DYNAMIC scenario (mdnie=1). */
 		static const u8 ana38407_mdnie_ui_dynamic_df[] = {
 			0xdf, 0x11, 0x6a, 0x9a, 0x25, 0x1a, 0x16, 0x2a, 0x00, 0x37, 0x5a, 0x00,
@@ -1196,6 +1265,53 @@ static int ana38407_on(struct ana38407 *ctx)
 			0xdd, 0x01, 0x00, 0xf0, 0x07, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x04, 0x01
 		};
+		/*
+		 * HDR_VIDEO_1 scenario: what stock loads while an HDR video
+		 * layer is on screen (hdr_tune_value_dsi0[1] in the same
+		 * header, HDR_VIDEO_1_MDNIE_1/2/3). Its SCR is the identity --
+		 * every colour vertex, skin vertices included, maps to itself
+		 * -- so the DDIC passes the host's colours through instead of
+		 * applying UI_AUTO's remap. Against UI_AUTO it differs only in
+		 * DF[1] (0x01 against 0x11), the SCR block DF[20..49] and DE[120]
+		 * (fa_max_de_gain, low byte 0x10 -> 0x00); the DD tables are
+		 * byte-identical.
+		 */
+		static const u8 ana38407_mdnie_hdr_video_1_df[] = {
+			0xdf, 0x01, 0x6a, 0x9a, 0x25, 0x1a, 0x16, 0x2a, 0x00, 0x37, 0x5a, 0x00,
+			0x4e, 0xc5, 0x00, 0x5d, 0x17, 0x00, 0x30, 0xc3, 0xff, 0x00, 0x00, 0xff,
+			0xff, 0x00, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0xff, 0x00,
+			0xff, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00,
+			0x00, 0xff, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x80, 0x01, 0x00, 0x01, 0x80, 0x02, 0x00, 0x02, 0x80, 0x03, 0x00, 0x03,
+			0x80, 0x04, 0x00, 0x04, 0x80, 0x05, 0x00, 0x05, 0x80, 0x06, 0x00, 0x06,
+			0x80, 0x07, 0x00, 0x07, 0x80, 0x08, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01,
+			0x00, 0x01, 0x80, 0x02, 0x00, 0x02, 0x80, 0x03, 0x00, 0x03, 0x80, 0x04,
+			0x00, 0x04, 0x80, 0x05, 0x00, 0x05, 0x80, 0x06, 0x00, 0x06, 0x80, 0x07,
+			0x00, 0x07, 0x80, 0x08, 0x00
+		};
+		static const u8 ana38407_mdnie_hdr_video_1_de[] = {
+			0xde, 0x00, 0x40, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x30,
+			0x01, 0x00, 0x70, 0x01, 0x34, 0x01, 0x40, 0x66, 0x03, 0x01, 0x11, 0x00,
+			0x20, 0x00, 0x08, 0x08, 0x00, 0x0a, 0x0a, 0x06, 0xae, 0x00, 0x00, 0x10,
+			0x20, 0x40, 0x60, 0x00, 0x40, 0x00, 0x50, 0x00, 0x60, 0x00, 0x70, 0x00,
+			0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x00, 0x20, 0x40, 0x60, 0x01, 0x40,
+			0x01, 0x80, 0x01, 0x80, 0x01, 0x80, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x40, 0x03, 0xb6, 0x23, 0x24, 0x00, 0x72, 0x01, 0x00,
+			0x0d, 0x00, 0x04, 0x07, 0x40, 0x00, 0x6e, 0x82, 0xe6, 0xff, 0x00, 0xff,
+			0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x14, 0x00, 0x01, 0x00, 0x01, 0x00,
+			0x00, 0x00, 0x00, 0x28, 0x3c, 0x04, 0x0f, 0x01, 0x00, 0x00, 0x08, 0x10,
+			0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70,
+			0x78, 0x80, 0x88, 0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0, 0xc8, 0xd0,
+			0xd8, 0xe0, 0xe8, 0xf0, 0xf8, 0x01, 0x00, 0x00, 0x08, 0x10, 0x18, 0x20,
+			0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80,
+			0x88, 0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0, 0xc8, 0xd0, 0xd8, 0xe0,
+			0xe8, 0xf0, 0xf8, 0x01, 0x00
+		};
+		static const u8 ana38407_mdnie_hdr_video_1_dd[] = {
+			0xdd, 0x01, 0x00, 0xf0, 0x07, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x04, 0x01
+		};
 		const u8 *df = ana38407_mdnie_ui_dynamic_df;
 		const u8 *de = ana38407_mdnie_ui_dynamic_de;
 		const u8 *dd = ana38407_mdnie_ui_dynamic_dd;
@@ -1203,29 +1319,34 @@ static int ana38407_on(struct ana38407 *ctx)
 		size_t de_len = sizeof(ana38407_mdnie_ui_dynamic_de);
 		size_t dd_len = sizeof(ana38407_mdnie_ui_dynamic_dd);
 
-		if (mdnie == 2) {
+		if (scenario == ANA38407_MDNIE_GRAYSCALE) {
 			df = ana38407_mdnie_grayscale_df;
 			df_len = sizeof(ana38407_mdnie_grayscale_df);
 			dd = ana38407_mdnie_grayscale_dd;
 			dd_len = sizeof(ana38407_mdnie_grayscale_dd);
-		} else if (mdnie == 3) {
+		} else if (scenario == ANA38407_MDNIE_UI_AUTO) {
 			df = ana38407_mdnie_ui_auto_df;
 			df_len = sizeof(ana38407_mdnie_ui_auto_df);
 			de = ana38407_mdnie_ui_auto_de;
 			de_len = sizeof(ana38407_mdnie_ui_auto_de);
 			dd = ana38407_mdnie_ui_auto_dd;
 			dd_len = sizeof(ana38407_mdnie_ui_auto_dd);
+		} else if (scenario == ANA38407_MDNIE_HDR_VIDEO) {
+			df = ana38407_mdnie_hdr_video_1_df;
+			df_len = sizeof(ana38407_mdnie_hdr_video_1_df);
+			de = ana38407_mdnie_hdr_video_1_de;
+			de_len = sizeof(ana38407_mdnie_hdr_video_1_de);
+			dd = ana38407_mdnie_hdr_video_1_dd;
+			dd_len = sizeof(ana38407_mdnie_hdr_video_1_dd);
 		}
 
-		ana38407_unlock_lvl0(&dsi_ctx);
-		ana38407_unlock_lvl1(&dsi_ctx);
-		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, df, df_len);
-		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, de, de_len);
-		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, dd, dd_len);
-		ana38407_lock_lvl0(&dsi_ctx);	/* OneUI locks F0 only (asymmetric) */
+		ana38407_unlock_lvl0(dsi_ctx);
+		ana38407_unlock_lvl1(dsi_ctx);
+		mipi_dsi_dcs_write_buffer_multi(dsi_ctx, df, df_len);
+		mipi_dsi_dcs_write_buffer_multi(dsi_ctx, de, de_len);
+		mipi_dsi_dcs_write_buffer_multi(dsi_ctx, dd, dd_len);
+		ana38407_lock_lvl0(dsi_ctx);	/* OneUI locks F0 only (asymmetric) */
 	}
-
-	return dsi_ctx.accum_err;
 }
 
 static int ana38407_prepare(struct drm_panel *panel)
@@ -1497,8 +1618,84 @@ out:
 
 static DEVICE_ATTR_RW(dcs_read);
 
+/*
+ * ===========================================================================
+ * mDNIe scenario selection
+ * ===========================================================================
+ *
+ * Selects the scenario the DDIC's mDNIe engine runs while the mdnie module
+ * parameter is 3 (its default):
+ *
+ *	ui_auto    UI_AUTO, stock's start-up UI_APP + AUTO_MODE state (default)
+ *	hdr_video  HDR_VIDEO_1, the identity scenario stock loads while HDR
+ *	           video is on screen
+ *
+ * Reading shows both names with the selected one in brackets. The selection
+ * persists across panel power cycles. A write while the DDIC is up sends the
+ * scenario at once -- DF/DE/DD inside the same level-key window panel-on
+ * uses, serialised against brightness updates and dcs_read by cmd_lock; a
+ * write while it is down is applied at the next panel-on. A write that does
+ * not change what the DDIC holds sends nothing, and a failed send returns
+ * the error and is retried by the next write or panel-on.
+ *
+ * This is the counterpart of stock's /sys/class/mdnie/mdnie/hdr, which the
+ * vendor's hardware composer writes as HDR layers come and go. The driver
+ * provides only the switch; deciding when HDR is being presented is the
+ * compositor's business.
+ */
+static const char * const ana38407_mdnie_scenario_names[] = {
+	"ui_auto",
+	"hdr_video",
+};
+
+static ssize_t mdnie_scenario_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct ana38407 *ctx = dev_get_drvdata(dev);
+	bool hdr;
+
+	mutex_lock(&ctx->cmd_lock);
+	hdr = ctx->mdnie_hdr;
+	mutex_unlock(&ctx->cmd_lock);
+
+	return sysfs_emit(buf, "%s\n", hdr ? "ui_auto [hdr_video]" :
+					     "[ui_auto] hdr_video");
+}
+
+static ssize_t mdnie_scenario_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct ana38407 *ctx = dev_get_drvdata(dev);
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+	enum ana38407_mdnie want;
+	int sel;
+
+	sel = sysfs_match_string(ana38407_mdnie_scenario_names, buf);
+	if (sel < 0)
+		return sel;
+
+	mutex_lock(&ctx->cmd_lock);
+	ctx->mdnie_hdr = sel == 1;
+	want = ana38407_mdnie_wanted(ctx);
+	if (ctx->ddic_ready && want != ANA38407_MDNIE_OFF &&
+	    ctx->mdnie_sent != (int)want) {
+		ana38407_send_mdnie(&dsi_ctx, want);
+		ctx->mdnie_sent = dsi_ctx.accum_err ? -1 : (int)want;
+	}
+	mutex_unlock(&ctx->cmd_lock);
+
+	if (dsi_ctx.accum_err)
+		return dsi_ctx.accum_err;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(mdnie_scenario);
+
 static struct attribute *ana38407_attrs[] = {
 	&dev_attr_dcs_read.attr,
+	&dev_attr_mdnie_scenario.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ana38407);
