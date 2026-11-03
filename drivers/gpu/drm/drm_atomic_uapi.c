@@ -1273,10 +1273,33 @@ int drm_atomic_set_property(struct drm_atomic_state *state,
 	case DRM_MODE_OBJECT_COLOROP: {
 		struct drm_colorop *colorop = obj_to_colorop(obj);
 		struct drm_colorop_state *colorop_state;
+		struct drm_plane_state *plane_state;
 
 		colorop_state = drm_atomic_get_colorop_state(state, colorop);
 		if (IS_ERR(colorop_state)) {
 			ret = PTR_ERR(colorop_state);
+			break;
+		}
+
+		/* as for every other object: an async flip allows only no-op changes */
+		if (async_flip) {
+			ret = drm_atomic_colorop_get_property(colorop, colorop_state,
+							      prop, &old_val);
+			ret = drm_atomic_check_prop_changes(ret, old_val, prop_value, prop);
+			break;
+		}
+
+		/*
+		 * A colorop's state is consumed by the check and the commit of
+		 * the plane it belongs to, so a commit that sets only colorop
+		 * properties must bring that plane -- and with it the plane's
+		 * CRTC -- into the state.  Otherwise no plane or CRTC check sees
+		 * the change and no flush applies it.  The plane's lock is
+		 * already held: taking the colorop state took it.
+		 */
+		plane_state = drm_atomic_get_plane_state(state, colorop->plane);
+		if (IS_ERR(plane_state)) {
+			ret = PTR_ERR(plane_state);
 			break;
 		}
 
