@@ -141,6 +141,11 @@ struct dpu_kms {
 	 * upper 32 bits (0 there: the map off) -- so a new map over the same
 	 * lattice is a new table.  Whether the block still holds its table is
 	 * asked of its enable bit, as for inverse gamma.
+	 *
+	 * @colorop_igc_lut_id and @colorop_igc_lut_flags are, per pipe, the blob
+	 * id and the DPU_PLANE_IGC_* flags of the inverse-gamma table last
+	 * loaded: the pair a plane state's @pipeline_igc_id and
+	 * @pipeline_igc_flags are compared against.
 	 */
 	struct dpu_reg_dma colorop_rdma;
 	u32 colorop_igc_on;
@@ -148,6 +153,7 @@ struct dpu_kms {
 	u32 colorop_igc_bank_known;
 	u32 colorop_igc_bank1;
 	u32 colorop_igc_lut_id[SSPP_MAX];
+	u8 colorop_igc_lut_flags[SSPP_MAX];
 	u64 colorop_gamut_lut_id[SSPP_MAX];
 	u64 colorop_gamut_failed_id[SSPP_MAX];
 };

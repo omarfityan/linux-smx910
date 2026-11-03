@@ -434,7 +434,8 @@ static const bool dpu_colorop_igc_keep_on;
  * compositor sent is deterministic, keeps its matrix by construction, and
  * reproduces exactly every time.
  *
- * The table's id is tagged while it is on, so an inverted table is never taken
+ * The table carries DPU_PLANE_IGC_INVERTED while it is on, so an inverted
+ * table is never taken
  * for the one it was made from and a toggle is always a reload.  🔴 NOT SAFE IN
  * GENERAL: the video is a negative while it is on.  Toggle it only while nothing
  * is on the plane path, and turn it back off.
@@ -602,34 +603,27 @@ MODULE_PARM_DESC(colorop_igc_test_invert,
 	"TEST ONLY, default off: load every video pipe's inverse-gamma table inverted, each entry v as 4095 - v -- a third table with the compositor's own colour matrix; the video is a negative while it is on");
 #endif
 
-/* DRM object ids are positive ints, so the top bit is free to mark a transformed table */
-#define DPU_COLOROP_IGC_ID_INVERTED	BIT(31)
-
-/*
- * And the next one marks a table scaled for a 3D LUT behind it (dpu_colorop_igc.h): the flush
- * reloads on an id change, so tagging the id is what reloads the curve when the plane's 3D LUT
- * enters or leaves bypass.  Blob ids are allocated small and in order; one this high would need a
- * billion live objects.
- */
-#define DPU_COLOROP_IGC_ID_FULL_SCALE	BIT(30)
-
 /**
- * dpu_colorop_igc_scale - the inverse gamma's full scale and table id for one plane state
+ * dpu_colorop_igc_scale - the inverse gamma's full scale and derivation flags for one plane state
  * @lut3d:  the plane's 3D LUT is in force (not bypassed, with data)
  * @invert: colorop_igc_test_invert is on
- * @id:     the 1D LUT's blob id
  * @one:    filled with the twelve-bit value the curve's 1.0 maps to
  *
- * Return: the id the pipe's loaded table is known by.
+ * The flush reloads a pipe's table when the blob id OR these flags differ from what the
+ * pipe holds, so the same curve is reloaded when the plane's 3D LUT enters or leaves bypass.
+ *
+ * Return: the DPU_PLANE_IGC_* flags the loaded table is known by, beside its blob id.
  */
-static u32 dpu_colorop_igc_scale(bool lut3d, bool invert, u32 id, u16 *one)
+static u8 dpu_colorop_igc_scale(bool lut3d, bool invert, u16 *one)
 {
+	u8 flags = 0;
+
 	*one = lut3d ? DPU_IGC_OUT_MAX : DPU_IGC_OUT_ONE;
 	if (lut3d)
-		id |= DPU_COLOROP_IGC_ID_FULL_SCALE;
+		flags |= DPU_PLANE_IGC_FULL_SCALE;
 	if (invert)
-		id |= DPU_COLOROP_IGC_ID_INVERTED;
-	return id;
+		flags |= DPU_PLANE_IGC_INVERTED;
+	return flags;
 }
 
 static_assert(DPU_IGC_CHANNELS * (DPU_IGC_LUT_LEN / 2) == DPU_PLANE_IGC_DWORDS,
@@ -971,6 +965,7 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 
 	pstate->has_pipeline_igc = false;
 	pstate->pipeline_igc_id = 0;
+	pstate->pipeline_igc_flags = 0;
 	pstate->has_pipeline_fp16_csc = false;
 	drm_property_blob_put(pstate->pipeline_gamut);
 	pstate->pipeline_gamut = NULL;
@@ -1084,14 +1079,13 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 
 		/*
 		 * The inverse-gamma table, at the scale of what reads it: the mixer, or
-		 * the 3D LUT when one is in force (dpu_colorop_igc.h).  The id carries
+		 * the 3D LUT when one is in force (dpu_colorop_igc.h).  Its flags carry
 		 * the scale, so the flush reloads the curve when the 3D LUT comes or goes.
 		 */
 		if (!igc_cs->bypass && igc_cs->data) {
 			u16 one;
-			u32 id = dpu_colorop_igc_scale(!cs->bypass && cs->data,
-						       dpu_colorop_igc_test_invert,
-						       igc_cs->data->base.id, &one);
+			u8 flags = dpu_colorop_igc_scale(!cs->bypass && cs->data,
+							 dpu_colorop_igc_test_invert, &one);
 
 			if (dpu_colorop_lut_to_igc(igc_cs->data, one, pstate->pipeline_igc,
 						   pstate->pipeline_igc_last)) {
@@ -1101,7 +1095,8 @@ int dpu_plane_colorop_check(struct drm_atomic_state *state,
 				return -EINVAL;
 			}
 			pstate->has_pipeline_igc = true;
-			pstate->pipeline_igc_id = id;
+			pstate->pipeline_igc_id = igc_cs->data->base.id;
+			pstate->pipeline_igc_flags = flags;
 			if (dpu_colorop_igc_test_invert)
 				dpu_colorop_igc_invert(pstate->pipeline_igc,
 						       pstate->pipeline_igc_last);
@@ -1270,7 +1265,9 @@ void dpu_colorop_crtc_flush(struct drm_crtc *crtc, struct dpu_hw_ctl *ctl)
 			 * any measurement taken afterwards.
 			 */
 			same = dpu_kms->colorop_igc_lut_id[sspp->idx] ==
-					pstate->pipeline_igc_id;
+					pstate->pipeline_igc_id &&
+			       dpu_kms->colorop_igc_lut_flags[sspp->idx] ==
+					pstate->pipeline_igc_flags;
 			if (same && dpu_reg_dma_sspp_igc_is_on(sspp)) {
 				wanted |= bit;
 				continue;
@@ -1293,6 +1290,7 @@ void dpu_colorop_crtc_flush(struct drm_crtc *crtc, struct dpu_hw_ctl *ctl)
 							   pstate->pipeline_igc,
 							   pstate->pipeline_igc_last, true);
 			dpu_kms->colorop_igc_lut_id[sspp->idx] = pstate->pipeline_igc_id;
+			dpu_kms->colorop_igc_lut_flags[sspp->idx] = pstate->pipeline_igc_flags;
 			if (ret) {
 				/*
 				 * The sequence turns the block on before its

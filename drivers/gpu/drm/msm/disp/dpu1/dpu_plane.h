@@ -32,6 +32,9 @@
 /* three channels of 256 twelve-bit entries, packed two to a dword */
 #define DPU_PLANE_IGC_CHANNELS	3
 #define DPU_PLANE_IGC_DWORDS	(DPU_PLANE_IGC_CHANNELS * 128)
+/* how a plane's inverse-gamma table was derived from its blob (@pipeline_igc_flags) */
+#define DPU_PLANE_IGC_FULL_SCALE	BIT(0)	/* scaled for a 3D LUT behind it */
+#define DPU_PLANE_IGC_INVERTED		BIT(1)	/* the colour test's inversion */
 /* the gamut input map's words, three channels of sixteen (DPU_VIG_GAMUT_MAP_DWORDS) */
 #define DPU_PLANE_GAMUT_MAP_DWORDS	48
 
@@ -85,9 +88,14 @@ struct dpu_plane_state {
 	 * table on a pipe is still the table that pipe was asked for, so the
 	 * commit path can skip re-sending 384 dwords for every frame of a clip
 	 * whose colour has not changed.
+	 *
+	 * @pipeline_igc_flags says how the table was derived from that blob
+	 * (DPU_PLANE_IGC_*): the same blob is a different table when the 3D LUT
+	 * behind it comes or goes, so the reload key is the pair (id, flags).
 	 */
 	bool has_pipeline_igc;
 	u32 pipeline_igc_id;
+	u8 pipeline_igc_flags;
 	u32 pipeline_igc[DPU_PLANE_IGC_DWORDS];
 	/*
 	 * The endpoint register past each channel's last slot. It comes out of
