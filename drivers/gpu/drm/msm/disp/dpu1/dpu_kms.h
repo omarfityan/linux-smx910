@@ -140,7 +140,10 @@ struct dpu_kms {
 	 * one -- the 3D LUT's data blob id, with its input map's blob id in the
 	 * upper 32 bits (0 there: the map off) -- so a new map over the same
 	 * lattice is a new table.  Whether the block still holds its table is
-	 * asked of its enable bit, as for inverse gamma.
+	 * asked of its enable bit, as for inverse gamma.  A pair that failed is
+	 * retried a bounded number of times: @colorop_gamut_fail_count counts its
+	 * consecutive failures and @colorop_gamut_retry_at (jiffies) says when the
+	 * next retry may run (dpu_colorop_gamut_note_failure).
 	 *
 	 * @colorop_igc_lut_id and @colorop_igc_lut_flags are, per pipe, the blob
 	 * id and the DPU_PLANE_IGC_* flags of the inverse-gamma table last
@@ -156,6 +159,8 @@ struct dpu_kms {
 	u8 colorop_igc_lut_flags[SSPP_MAX];
 	u64 colorop_gamut_lut_id[SSPP_MAX];
 	u64 colorop_gamut_failed_id[SSPP_MAX];
+	unsigned long colorop_gamut_retry_at[SSPP_MAX];
+	u8 colorop_gamut_fail_count[SSPP_MAX];
 };
 
 struct vsync_info {

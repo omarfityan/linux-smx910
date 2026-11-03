@@ -531,6 +531,46 @@ static void dpu_colorop_gamut_test(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
 	*failed = 0;
 }
 
+/* retries of one failed (3D LUT, map) pair before its latch holds until a different pair */
+#define DPU_COLOROP_GAMUT_RETRIES	3
+/* the first retry's delay; each further one doubles it */
+#define DPU_COLOROP_GAMUT_RETRY_MS	1000
+
+/**
+ * dpu_colorop_gamut_note_failure - latch a 3D-LUT load that did not go in, and say so
+ * @dpu_kms: the KMS
+ * @sspp:    the pipe
+ * @pstate:  the plane state whose table it was
+ * @want:    the (3D LUT, map) pair that failed
+ * @err:     why
+ *
+ * The block is left off, which is the safe state, but the commit that asked for
+ * the table has already been accepted: the failure happens in the flush, after
+ * every check.  A compositor that caches its pipeline then commits the same pair
+ * for as long as the content lasts, so a silent latch would keep the 3D LUT off
+ * without a word.  The failure is logged as an error, and the pair is retried
+ * after DPU_COLOROP_GAMUT_RETRY_MS, doubling, DPU_COLOROP_GAMUT_RETRIES times --
+ * a transient timeout recovers, a persistent fault costs at most four transfers.
+ */
+static void dpu_colorop_gamut_note_failure(struct dpu_kms *dpu_kms, struct dpu_hw_sspp *sspp,
+					   const struct dpu_plane_state *pstate, u64 want, int err)
+{
+	u64 *failed = &dpu_kms->colorop_gamut_failed_id[sspp->idx];
+	u8 *count = &dpu_kms->colorop_gamut_fail_count[sspp->idx];
+
+	*count = (*failed == want && *count < U8_MAX) ? *count + 1 : 1;
+	*failed = want;
+	dpu_kms->colorop_gamut_retry_at[sspp->idx] = jiffies +
+		msecs_to_jiffies(DPU_COLOROP_GAMUT_RETRY_MS <<
+				 min_t(u8, *count - 1, DPU_COLOROP_GAMUT_RETRIES));
+	drm_err_ratelimited(dpu_kms->dev,
+			    "%s: 3D LUT %u (input map %u) did not load: %d; block off, %s\n",
+			    sspp->cap->name, pstate->pipeline_gamut_id,
+			    pstate->pipeline_gamut_map_id, err,
+			    *count <= DPU_COLOROP_GAMUT_RETRIES ? "will retry" :
+			    "held off until the plane asks for another table");
+}
+
 /*
  * The 3D-LUT colour operation on one pipe's gamut block, at each colour flush:
  * programmed -- with the plane's input map when one is in force -- when the
@@ -538,7 +578,8 @@ static void dpu_colorop_gamut_test(struct dpu_kms *dpu_kms, struct dpu_reg_dma *
  * reads clear (a power loss), switched off when the plane no longer asks for
  * one.  While the TEST switch is set -- or still applied, until its own return
  * to 0 switches the block off -- the test owns the block and this does nothing.
- * A failure switches the block off and latches the pair; a different pair lifts it.
+ * A failure switches the block off and latches the pair, retried with a back-off
+ * (dpu_colorop_gamut_note_failure); a different pair lifts it.
  */
 static void dpu_colorop_gamut_lut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 				  struct dpu_hw_ctl *ctl, struct dpu_hw_sspp *sspp,
@@ -551,6 +592,7 @@ static void dpu_colorop_gamut_lut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *r
 	bool test = IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST) &&
 		    (dpu_reg_dma_gamut_test_mode() || dpu_colorop_gamut_applied[sspp->idx]);
 	u32 *lattice;
+	bool retry;
 	int act, ret;
 
 	/*
@@ -561,7 +603,11 @@ static void dpu_colorop_gamut_lut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *r
 	if (test)
 		*applied = 0;
 
-	act = dpu_reg_dma_gamut_colorop_action(want, *applied, *failed,
+	/* a failed pair whose back-off has run out is offered to the action as not failed */
+	retry = want && *failed == want &&
+		dpu_kms->colorop_gamut_fail_count[sspp->idx] <= DPU_COLOROP_GAMUT_RETRIES &&
+		time_after_eq(jiffies, dpu_kms->colorop_gamut_retry_at[sspp->idx]);
+	act = dpu_reg_dma_gamut_colorop_action(want, *applied, retry ? 0 : *failed,
 					       dpu_reg_dma_sspp_gamut_is_on(sspp), test);
 	if (!act)
 		return;
@@ -575,7 +621,7 @@ static void dpu_colorop_gamut_lut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *r
 
 	lattice = kvzalloc(DPU_VIG_GAMUT_DWORDS * sizeof(u32), GFP_KERNEL);
 	if (!lattice) {
-		*failed = want;
+		dpu_colorop_gamut_note_failure(dpu_kms, sspp, pstate, want, -ENOMEM);
 		return;
 	}
 	dpu_vig_gamut_from_lut32(pstate->pipeline_gamut->data, lattice);
@@ -588,13 +634,14 @@ static void dpu_colorop_gamut_lut(struct dpu_kms *dpu_kms, struct dpu_reg_dma *r
 	pr_info("dpu: %s 3D LUT %u programmed: %d\n", sspp->cap->name, pstate->pipeline_gamut_id, ret);
 	if (ret) {
 		/* a part-written lattice must not be shown: off is the safe state */
-		*failed = want;
+		dpu_colorop_gamut_note_failure(dpu_kms, sspp, pstate, want, ret);
 		dpu_reg_dma_disable_sspp_gamut(dpu_kms, rdma, ctl, sspp);
 		*applied = 0;
 		return;
 	}
 	*applied = want;
 	*failed = 0;
+	dpu_kms->colorop_gamut_fail_count[sspp->idx] = 0;
 }
 
 #if IS_ENABLED(CONFIG_DRM_MSM_DPU_COLOUR_TEST)
