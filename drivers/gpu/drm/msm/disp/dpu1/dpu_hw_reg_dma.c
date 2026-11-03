@@ -11,6 +11,7 @@
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -109,12 +110,13 @@
 #define REG_DMA_QUEUE0_TRIGGER		BIT(0)
 
 /*
- * How long a submission is waited for, its completion read every 10 us.  The
- * inverse-gamma tables complete in microseconds and are given 1 ms.  The video
- * pipes' gamut lattice, some 18 times larger, is given as long as the device's
- * own driver waits for a completion -- 20 ms (sde_hw_reg_dma_v1.c, the last
- * command's REG_DMA_WAIT4_COMP).  A transfer that outlives its wait is not
- * stopped -- nothing here resets the queue -- so it may still land.
+ * How long a submission is waited for, its completion read every 10 us with the
+ * CPU SLEEPING in between (read_poll_timeout).  The inverse-gamma tables complete
+ * in microseconds and are given 1 ms.  The video pipes' gamut lattice, some 18
+ * times larger, is given as long as the device's own driver waits for a
+ * completion -- 20 ms (sde_hw_reg_dma_v1.c, the last command's
+ * REG_DMA_WAIT4_COMP).  A transfer that outlives its wait is not stopped --
+ * nothing here resets the queue -- so it may still land.
  */
 #define REG_DMA_DONE_POLL_US		10
 #define REG_DMA_WAIT_US			1000
@@ -454,7 +456,9 @@ static int dpu_reg_dma_kick_off_wait(struct dpu_kms *dpu_kms, struct dpu_reg_dma
 				     struct dpu_hw_ctl *ctl, bool trigger, u32 wait_us)
 {
 	u32 ctl_index, done_mask, cmd1, dwords, err, status;
-	int i, ret = 0;
+	s64 waited_us = 0;
+	ktime_t start;
+	int ret = 0;
 
 	if (!rdma->ready)
 		return -ENODEV;
@@ -522,23 +526,29 @@ static int dpu_reg_dma_kick_off_wait(struct dpu_kms *dpu_kms, struct dpu_reg_dma
 
 	DPU_REG_WRITE(&ctl->hw, REG_DMA_CTL_TRIGGER_OFF, REG_DMA_QUEUE0_TRIGGER);
 
-	/* the engine acknowledges in microseconds; wait as long as the caller says */
-	ret = -ETIMEDOUT;
-	for (i = 0; i < wait_us / REG_DMA_DONE_POLL_US; i++) {
-		status = DPU_REG_READ(&rdma->db, REG_DMA_INTR_STATUS);
-		if (status & done_mask) {
-			ret = 0;
-			break;
-		}
-		udelay(REG_DMA_DONE_POLL_US);
-	}
+	/*
+	 * The engine acknowledges in microseconds; wait as long as the caller
+	 * says, sleeping between reads.  Every caller runs in process context
+	 * with no spinlock held -- the colour flush runs from the CRTC's
+	 * atomic_flush in the commit tail, under the per-CRTC commit mutex -- so
+	 * a 20 ms lattice load need not spin a CPU for its whole length.
+	 * read_poll_timeout() takes a zero bound as "wait for ever", so a zero
+	 * bound is a caller bug: warn and wait one poll interval instead.
+	 */
+	if (WARN_ON_ONCE(!wait_us))
+		wait_us = REG_DMA_DONE_POLL_US;
+	start = ktime_get();
+	ret = read_poll_timeout(DPU_REG_READ, status, status & done_mask,
+				REG_DMA_DONE_POLL_US, wait_us, false,
+				&rdma->db, REG_DMA_INTR_STATUS);
+	waited_us = ktime_us_delta(ktime_get(), start);
 
 	err = DPU_REG_READ(&rdma->db, REG_DMA_INTR_ERR_STATUS);
 
 	DRM_INFO("ctl%u: %u dwords from iova %#llx -> %s (status %#x err %#x after %d us)\n",
 		 ctl_index, dwords, rdma->buf.iova,
 		 ret ? "NO COMPLETION" : "complete",
-		 DPU_REG_READ(&rdma->db, REG_DMA_INTR_STATUS), err, i * REG_DMA_DONE_POLL_US);
+		 DPU_REG_READ(&rdma->db, REG_DMA_INTR_STATUS), err, (int)waited_us);
 
 	if (!ret && (err & REG_DMA_ERROR_MASK))
 		ret = -EIO;
