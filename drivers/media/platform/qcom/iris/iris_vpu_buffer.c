@@ -724,9 +724,53 @@ static u32 iris_vpu_dec_bin_size(struct iris_inst *inst)
 	return 0;
 }
 
+/*
+ * Colocated-MV slots per decoder session.
+ *
+ * The downstream driver for this silicon (msm_vidc_buffer_iris3.c,
+ * msm_vidc_decoder_comv_size_iris3()) sizes COMV from the output (DPB)
+ * minimum count, plus 7 for AV1 (3 above 4096x2176), floored at the
+ * BSE->VPP pipeline delay (2) + 1 -- never at VIDEO_MAX_FRAME. With 32
+ * slots a 4K HEVC COMV is 253 MiB, which the size-aligned IOVA allocator
+ * can only place in a 256 MiB-aligned hole; a second 4K session then
+ * fails with -ENOMEM at CAPTURE streamon.
+ */
+#define DEC_BSE_VPP_DELAY	2
+#define DEC_COMV_MIN_COUNT	(DEC_BSE_VPP_DELAY + 1)
+
+static inline int iris_vpu_dpb_count(struct iris_inst *inst);
+
+static u32 iris_vpu_dec_comv_count(struct iris_inst *inst)
+{
+	struct v4l2_format *f = inst->fmt_src;
+	u32 height = f->fmt.pix_mp.height;
+	u32 width = f->fmt.pix_mp.width;
+	u32 num_comv;
+
+	/*
+	 * fw_min_count is the DPB depth the firmware reported at the last
+	 * port-settings change (MIN_BUFFERS before the first one; that first
+	 * pass is re-sized from iris_process_streamon_output()). Also cover
+	 * the client-visible output count and the internal DPB count, so
+	 * split and non-split mode both get one slot per reference picture.
+	 */
+	num_comv = max(inst->fw_min_count, inst->buffers[BUF_OUTPUT].min_count);
+	num_comv = max_t(u32, num_comv, iris_vpu_dpb_count(inst));
+
+	if (inst->codec == V4L2_PIX_FMT_AV1) {
+		if (NUM_MBS_PER_FRAME(height, width) >
+		    NUM_MBS_PER_FRAME(2176, 4096))
+			num_comv += 3;
+		else
+			num_comv += 7;
+	}
+
+	return max_t(u32, num_comv, DEC_COMV_MIN_COUNT);
+}
+
 static u32 iris_vpu_dec_comv_size(struct iris_inst *inst)
 {
-	u32 num_comv = VIDEO_MAX_FRAME;
+	u32 num_comv = iris_vpu_dec_comv_count(inst);
 	struct v4l2_format *f = inst->fmt_src;
 	u32 height = f->fmt.pix_mp.height;
 	u32 width = f->fmt.pix_mp.width;
