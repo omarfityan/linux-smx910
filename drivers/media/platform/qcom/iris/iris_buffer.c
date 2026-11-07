@@ -548,6 +548,9 @@ static int iris_create_internal_buffer(struct iris_inst *inst,
 	buffer->kvaddr = dma_alloc_attrs(core->dev, buffer->buffer_size,
 					 &buffer->device_addr, GFP_KERNEL, buffer->dma_attrs);
 	if (!buffer->kvaddr) {
+		dev_err(core->dev,
+			"internal buffer allocation failed: type %d index %u size %zu\n",
+			buffer_type, index, (size_t)buffer->buffer_size);
 		kfree(buffer);
 		return -ENOMEM;
 	}

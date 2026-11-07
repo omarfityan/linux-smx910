@@ -452,6 +452,8 @@ int dpu_reg_dma_lutbus_write(struct dpu_reg_dma *rdma, u32 block, u32 table,
  * Returns 0 once the hardware reports the transfer complete, -ETIMEDOUT if it
  * never does, and -EIO if the engine raised an error.
  */
+static bool dpu_colorop_lutdma_kick;	/* defined with the diagnostic switches below */
+
 static int dpu_reg_dma_kick_off_wait(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 				     struct dpu_hw_ctl *ctl, bool trigger, u32 wait_us)
 {
@@ -462,6 +464,11 @@ static int dpu_reg_dma_kick_off_wait(struct dpu_kms *dpu_kms, struct dpu_reg_dma
 
 	if (!rdma->ready)
 		return -ENODEV;
+
+	if (!READ_ONCE(dpu_colorop_lutdma_kick)) {
+		DRM_INFO_ONCE("register DMA: colorop_lutdma_kick=0, submissions are skipped\n");
+		return 0;
+	}
 
 	if (!ctl || ctl->idx < CTL_0 || ctl->idx >= CTL_MAX) {
 		DPU_ERROR("no usable control block\n");
@@ -637,6 +644,30 @@ int dpu_reg_dma_kick_off(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rdma,
 
 /* how many table differences a load's report names before it says "..." */
 #define DPU_VIG_IGC_REPORT_MAX		8
+
+/*
+ * DIAGNOSTIC SWITCHES, both default 1 (the normal behaviour).  They exist to
+ * separate two suspects for silent SoC resets seen at plane colour transitions.
+ *
+ * colorop_port_reads=0 stops every CPU read through a video pipe's
+ * inverse-gamma index/data port: the freshness probe before a load and the
+ * report after it.  The bank shown is then chosen from the per-pipe record
+ * alone, so after a real display power loss the first load can show the other
+ * bank until the next load; the opmode reads stay.
+ *
+ * colorop_lutdma_kick=0 makes every register-DMA submission a no-op that
+ * reports success: the colour pipeline is still offered and selected, but the
+ * engine is never started and no table is written.
+ */
+static bool dpu_colorop_port_reads = true;
+module_param_named(colorop_port_reads, dpu_colorop_port_reads, bool, 0644);
+MODULE_PARM_DESC(colorop_port_reads,
+	"Diagnostic, default 1: 0 skips the CPU read-backs through the video pipes' inverse-gamma table port");
+
+static bool dpu_colorop_lutdma_kick = true;
+module_param_named(colorop_lutdma_kick, dpu_colorop_lutdma_kick, bool, 0644);
+MODULE_PARM_DESC(colorop_lutdma_kick,
+	"Diagnostic, default 1: 0 never starts the register-DMA engine (submissions report success, nothing is written)");
 
 /*
  * 🔴 EVERY CHANNEL'S RUN IS CLOSED BY ITS OWN ENDPOINT WRITE -- or its last word is lost.
@@ -1398,7 +1429,7 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	struct dpu_hw_blk_reg_map *hw = &sspp->hw;
 	u32 before[DPU_VIG_IGC_CHANNELS] = {};
 	u32 blk, cpu_off, dma_off, orig_opmode, enable_val, bank, pipe_bit;
-	bool fresh, known, shown1;
+	bool fresh, known, shown1, port_reads;
 	const char *why;
 	int ch, program, ret;
 
@@ -1467,7 +1498,12 @@ int dpu_reg_dma_program_sspp_igc(struct dpu_kms *dpu_kms, struct dpu_reg_dma *rd
 	 * pointer, so the NEXT load is right even when this one is not.
 	 */
 	pipe_bit = BIT(sspp->idx);
-	fresh = dpu_vig_igc_port_is_fresh(hw, cpu_off, before);
+	port_reads = READ_ONCE(dpu_colorop_port_reads);
+	if (!port_reads) {
+		report = false;
+		DRM_INFO_ONCE("colorop: colorop_port_reads=0, inverse-gamma port reads are skipped; the bank comes from the record\n");
+	}
+	fresh = port_reads && dpu_vig_igc_port_is_fresh(hw, cpu_off, before);
 	if (fresh) {
 		known = true;
 		shown1 = true;		/* as if the pointer were 1: the next write is bank 0 */

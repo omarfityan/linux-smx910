@@ -438,6 +438,9 @@ int iris_vdec_streamon_output(struct iris_inst *inst)
 	return ret;
 
 error:
+	dev_err(inst->core->dev,
+		"capture streamon failed: %d (dpb min_count %u size %u)\n",
+		ret, inst->buffers[BUF_DPB].min_count, inst->buffers[BUF_DPB].size);
 	iris_session_streamoff(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 
 	return ret;

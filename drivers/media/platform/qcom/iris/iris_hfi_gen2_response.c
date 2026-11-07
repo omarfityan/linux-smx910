@@ -266,6 +266,10 @@ static int iris_hfi_gen2_handle_session_error(struct iris_inst *inst,
 	}
 
 	dev_err(core->dev, "session error received %#x: %s\n", pkt->type, error);
+	dev_err(core->dev,
+		"session error detail: size %u flags %#x payload_info %#x port %#x packet_id %#x payload[0] %#x\n",
+		pkt->size, pkt->flags, pkt->payload_info, pkt->port, pkt->packet_id,
+		pkt->size >= sizeof(*pkt) + sizeof(u32) ? pkt->payload[0] : 0);
 	iris_vb2_queue_error(inst);
 	iris_inst_change_state(inst, IRIS_INST_ERROR);
 
