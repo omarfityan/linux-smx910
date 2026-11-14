@@ -8,6 +8,7 @@
 #include "iris_hfi_gen2.h"
 #include "iris_hfi_gen2_defines.h"
 #include "iris_hfi_gen2_packet.h"
+#include "iris_power.h"
 #include "iris_vdec.h"
 #include "iris_vpu_buffer.h"
 #include "iris_vpu_common.h"
@@ -394,6 +395,14 @@ static int iris_hfi_gen2_handle_output_buffer(struct iris_inst *inst,
 	    !(hfi_buffer->flags & HFI_BUF_FW_FLAG_LAST)) {
 		buf->flags |= V4L2_BUF_FLAG_ERROR;
 	}
+
+	/*
+	 * a decoder capture buffer left the firmware (inst->lock held); the
+	 * clock-scaling accounting matches it to its input by timestamp
+	 */
+	if (inst->domain == DECODER && buf->data_size &&
+	    !(buf->flags & V4L2_BUF_FLAG_ERROR))
+		iris_power_capture_done(inst, buf->timestamp);
 
 	return 0;
 }

@@ -197,9 +197,77 @@ struct iris_core_power {
 	u64 icc_bw;
 };
 
+/* downstream msm_vidc_internal.h:75 INPUT_TIMER_LIST_SIZE */
+#define IRIS_INPUT_RATE_WINDOW	30
+/* outstanding input pictures tracked for the utilisation qualifier (bitmap width) */
+#define IRIS_DCVS_PENDING	32
+/* rolling input-arrival ring for the trial step-up rate R */
+#define IRIS_DCVS_ARRIVALS	128
+/* service-time samples per utilisation window */
+#define IRIS_DCVS_SVC_SAMPLES	16
+
 struct iris_inst_power {
 	u64 min_freq;
 	u32 icc_bw;
+	/* decoder clock scaling ported from downstream msm_vidc (iris_power.c) */
+	u32 dcvs_flags;
+	u32 buffer_counter;
+	u32 input_rate;
+	u64 last_input_ns;
+	u32 input_idx;
+	u32 input_count;
+	u32 input_intervals_us[IRIS_INPUT_RATE_WINDOW];
+	/* utilisation qualifier (ours, not downstream; iris_power.c) */
+	u64 base_freq;
+	u32 in_flight;
+	u64 busy_ns;
+	u64 last_close_ns;
+	u64 win_start_ns;
+	u32 win_inputs;
+	u32 up_wins;
+	u32 down_wins;
+	u32 util_pct;
+	bool util_incr;
+	u32 inputs_since_up;
+	/* pictures in flight, matched input -> capture by timestamp */
+	u64 pend_ts_us[IRIS_DCVS_PENDING];
+	u64 pend_ts_ns[IRIS_DCVS_PENDING];
+	u64 pend_qbuf_ns[IRIS_DCVS_PENDING];
+	u32 pend_valid;
+	u32 last_lat_us;
+	u32 unmatched;
+	/* trial step-up state machine (ours; iris_power.c) */
+	bool started;
+	u32 state;
+	u64 row_freq;
+	u64 pre_trial_row;
+	u64 arr_ns[IRIS_DCVS_ARRIVALS];
+	u32 arr_idx;
+	u32 arr_cnt;
+	u32 rate_x10;
+	u64 last_capture_ns;
+	u64 svc_ns[IRIS_DCVS_SVC_SAMPLES];
+	u32 svc_n;
+	u64 l_p75_ns;
+	u32 inputs_since_step;
+	u32 inputs_since_descent;
+	bool descent_done;
+	u32 descent_down_wins;
+	u32 descent_hold_wins;
+	u32 backoff_len;
+	u32 backoff_left;
+	u32 keep_age;
+	bool keep_recent;
+	u32 r_base_x10;
+	u32 trial_skip;
+	u32 trials;
+	u32 keeps;
+	u32 reverts;
+	bool buf_full;
+	u32 unmeasured_wins;
+	bool fallback_logged;
+	/* input (src) queue streaming; set/cleared under this inst->lock */
+	bool src_streaming;
 };
 
 struct icc_vote_data {

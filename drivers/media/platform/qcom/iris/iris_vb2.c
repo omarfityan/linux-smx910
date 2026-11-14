@@ -170,6 +170,7 @@ int iris_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto error;
 	}
 
+	iris_power_streamon(inst, V4L2_TYPE_IS_OUTPUT(q->type));
 	iris_scale_power(inst);
 
 	ret = iris_check_session_supported(inst);
@@ -251,6 +252,11 @@ exit:
 		iris_helper_buffers_done(inst, q->type, VB2_BUF_STATE_ERROR);
 		iris_inst_change_state(inst, IRIS_INST_ERROR);
 	}
+	/*
+	 * input streamoff = seek / flush: clear the windows, hold the row;
+	 * capture streamoff = stream end: full reset
+	 */
+	iris_power_streamoff(inst, V4L2_TYPE_IS_CAPTURE(q->type));
 	mutex_unlock(&inst->lock);
 }
 

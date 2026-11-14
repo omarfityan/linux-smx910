@@ -454,8 +454,10 @@ int iris_vdec_qbuf(struct iris_inst *inst, struct vb2_v4l2_buffer *vbuf)
 	if (ret)
 		return ret;
 
-	if (buf->type == BUF_INPUT)
+	if (buf->type == BUF_INPUT) {
 		iris_set_ts_metadata(inst, vbuf);
+		iris_power_update_input_rate(inst);
+	}
 
 	q = v4l2_m2m_get_vq(inst->m2m_ctx, vb2->type);
 	if (!vb2_is_streaming(q)) {

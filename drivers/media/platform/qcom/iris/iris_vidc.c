@@ -300,6 +300,17 @@ int iris_close(struct file *filp)
 {
 	struct iris_inst *inst = iris_get_inst(filp);
 
+	/*
+	 * Withdraw this instance's clock-scaling vote before its m2m context
+	 * goes: it stays on core->instances until iris_remove_session(), and
+	 * other sessions' iris_set_clocks() read these fields under core->lock.
+	 */
+	mutex_lock(&inst->lock);
+	WRITE_ONCE(inst->power.row_freq, 0);
+	WRITE_ONCE(inst->power.started, false);
+	WRITE_ONCE(inst->power.src_streaming, false);
+	mutex_unlock(&inst->lock);
+
 	v4l2_ctrl_handler_free(&inst->ctrl_handler);
 	v4l2_m2m_ctx_release(inst->m2m_ctx);
 	v4l2_m2m_release(inst->m2m_dev);
