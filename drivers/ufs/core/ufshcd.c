@@ -1435,9 +1435,15 @@ static int ufshcd_clock_scaling_prepare(struct ufs_hba *hba, u64 timeout_us)
 	 * clock scaling is in progress
 	 */
 	mutex_lock(&hba->host->scan_mutex);
-	blk_mq_quiesce_tagset(&hba->host->tag_set);
 	mutex_lock(&hba->wb_mutex);
+	/*
+	 * Device management commands hold clk_scaling_lock in read mode while
+	 * they are submitted through the block layer. Take the lock before
+	 * quiescing so that such a command cannot be inserted into a quiesced
+	 * queue while this function waits for the lock, which would deadlock.
+	 */
 	down_write(&hba->clk_scaling_lock);
+	blk_mq_quiesce_tagset(&hba->host->tag_set);
 
 	if (!hba->clk_scaling.is_allowed ||
 	    ufshcd_wait_for_pending_cmds(hba, timeout_us)) {
