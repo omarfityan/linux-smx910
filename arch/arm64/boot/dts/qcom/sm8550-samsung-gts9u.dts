@@ -345,6 +345,30 @@
 		};
 	};
 
+	/*
+	 * Coin DC vibration motor. Transcribed from this device's own stock DT
+	 * (gts9uwifi_eur_open_w00_r00.dts): dc_vibrator { compatible =
+	 * "samsung,dc_vibrator"; dc_vib,motor_type = "COINDC";
+	 * dc_vib,gpio_en = <&tlmm 0x12 0x00>; } -- __fixups__ resolves the
+	 * phandle to the TLMM, so TLMM gpio 18, flags 0 (active high).
+	 *
+	 * Stock's driver (drivers/vibrator/dc/dc_vibrator.c in the SM-X910
+	 * downstream tree) requests the pin as "mot_ldo_en" -- it switches the
+	 * motor's own LDO -- drives it high to run and low to stop, and enables
+	 * a regulator only when the node names one in dc_vib,regulator_name;
+	 * this node names none, so no supply is described here either. No PWM,
+	 * no overdrive, no timing: mainline gpio-vibrator is the same mechanism.
+	 *
+	 * No pinctrl state: stock declares none for this pin, so drive strength
+	 * and bias are left at their reset values rather than copied from
+	 * another board. gpio18's only other mux user is the i2c_hub_1 group,
+	 * and this board does not enable that hub.
+	 */
+	vibrator {
+		compatible = "gpio-vibrator";
+		enable-gpios = <&tlmm 18 GPIO_ACTIVE_HIGH>;
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 		pinctrl-0 = <&volume_up_n>, <&hall_cover_n>, <&pen_garage>;
