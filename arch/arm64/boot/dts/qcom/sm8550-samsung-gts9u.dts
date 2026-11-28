@@ -2639,7 +2639,7 @@
 					      CS35L45_ASP_TX_HIZ_DISABLED)>;
 
 		#sound-dai-cells = <1>;
-		sound-name-prefix = "SpkrRearLeft";
+		sound-name-prefix = "RL";
 
 		/* factory calibration -- rdc_cal    / vsc_cal    / isc_cal */
 		cirrus,cal-rdc = <8737>;
@@ -2677,7 +2677,7 @@
 					      CS35L45_ASP_TX_HIZ_DISABLED)>;
 
 		#sound-dai-cells = <1>;
-		sound-name-prefix = "SpkrFrontLeft";
+		sound-name-prefix = "FL";
 
 		/* factory calibration -- rdc_cal_b  / vsc_cal_b  / isc_cal_b */
 		cirrus,cal-rdc = <8653>;
@@ -2715,7 +2715,7 @@
 					      CS35L45_ASP_TX_HIZ_DISABLED)>;
 
 		#sound-dai-cells = <1>;
-		sound-name-prefix = "SpkrRearRight";
+		sound-name-prefix = "RR";
 
 		/* factory calibration -- rdc_cal_r  / vsc_cal_r  / isc_cal_r */
 		cirrus,cal-rdc = <8893>;
@@ -2753,7 +2753,7 @@
 					      CS35L45_ASP_TX_HIZ_DISABLED)>;
 
 		#sound-dai-cells = <1>;
-		sound-name-prefix = "SpkrFrontRight";
+		sound-name-prefix = "FR";
 
 		/* factory calibration -- rdc_cal_br / vsc_cal_br / isc_cal_br */
 		cirrus,cal-rdc = <8722>;
